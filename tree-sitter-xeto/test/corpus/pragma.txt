@@ -1,0 +1,50 @@
+==================
+Simple pragma
+==================
+
+pragma: Lib <
+  version: "1.0.0"
+>
+
+---
+
+(source_file
+  (pragma
+    type: (type_ref (identifier))
+    meta: (meta_block
+      (meta_tag
+        key: (identifier)
+        value: (string_literal)))))
+
+==================
+Pragma with depends
+==================
+
+pragma: Lib <
+  version: "1.0.0"
+  depends: {
+    { lib: "sys" }
+    { lib: "ph" }
+  }
+>
+
+---
+
+(source_file
+  (pragma
+    type: (type_ref (identifier))
+    meta: (meta_block
+      (meta_tag
+        key: (identifier)
+        value: (string_literal))
+      (meta_tag
+        key: (identifier)
+        value: (body
+          (dict_literal
+            (dict_entry
+              key: (identifier)
+              value: (string_literal)))
+          (dict_literal
+            (dict_entry
+              key: (identifier)
+              value: (string_literal))))))))

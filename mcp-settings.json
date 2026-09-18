@@ -1,0 +1,51 @@
+{
+  "name": "mcpfantom",
+  "description": "MCP configuration for the Fantom code generation server",
+  "protocolVersion": "2024-11-05",
+  "sdk": "@modelcontextprotocol/sdk@0.5.0",
+  "transport": "stdio",
+  "startCommand": "node build/index.js",
+  "cwd": ".",
+  "validateCommand": "fan -check",
+  "tools": {
+    "whitelist": [
+      "searchFantomDocs",
+      "searchHaxallDocs",
+      "getFantomType",
+      "listFantomPods",
+      "refreshIndex",
+      "migrateSkySpark4x",
+      "generateFantomCode"
+    ]
+  },
+  "examples": [
+    {
+      "description": "Generate a simple class",
+      "request": {
+        "name": "generateFantomCode",
+        "arguments": {
+          "type": "class",
+          "name": "Person",
+          "pod": "myApp",
+          "fields": [
+            { "name": "firstName", "type": "Str" },
+            { "name": "lastName", "type": "Str" }
+          ]
+        }
+      }
+    },
+    {
+      "description": "Generate a pod scaffold",
+      "request": {
+        "name": "generateFantomCode",
+        "arguments": {
+          "type": "pod",
+          "name": "myNewPod",
+          "version": "1.0.0",
+          "depends": ["sys 1.0"]
+        }
+      }
+    }
+  ],
+  "notes": "Start the MCP server with 'node build/index.js' (or 'npm start' if configured). The transport is stdio; the AI assistant should spawn this process and communicate via stdio. Validation uses 'fan -check' if available on PATH."
+}

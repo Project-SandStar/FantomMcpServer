@@ -1,0 +1,36 @@
+================================================================================
+Simple mixin
+================================================================================
+
+mixin Foo {
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (mixin_definition
+    name: (identifier)
+    body: (class_body)))
+
+================================================================================
+Mixin with method
+================================================================================
+
+mixin Foo {
+  abstract Void bar()
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (mixin_definition
+    name: (identifier)
+    body: (class_body
+      (method_def
+        (modifier)
+        return_type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        params: (param_list)))))

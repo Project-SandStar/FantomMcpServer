@@ -1,0 +1,58 @@
+==================
+Compound AND type
+==================
+
+AB: A & B
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    type: (compound_type
+      (type_ref (identifier))
+      (type_ref (identifier)))))
+
+==================
+Compound OR type
+==================
+
+AorB: A | B
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    type: (compound_type
+      (type_ref (identifier))
+      (type_ref (identifier)))))
+
+==================
+Nullable type
+==================
+
+OptStr: Str?
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    type: (nullable_type
+      (type_ref (identifier)))))
+
+==================
+Qualified type ref
+==================
+
+MySite: ph::Site
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    type: (qualified_name
+      lib: (identifier)
+      name: (identifier))))

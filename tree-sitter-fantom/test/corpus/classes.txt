@@ -1,0 +1,98 @@
+================================================================================
+Simple class
+================================================================================
+
+class Foo {
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body)))
+
+================================================================================
+Class with inheritance
+================================================================================
+
+class Foo : Bar, Baz {
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    (type_list
+      (type_ref
+        (simple_type
+          (qualified_type_name
+            (identifier))))
+      (type_ref
+        (simple_type
+          (qualified_type_name
+            (identifier)))))
+    body: (class_body)))
+
+================================================================================
+Abstract class
+================================================================================
+
+abstract class Foo {
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (modifier)
+    name: (identifier)
+    body: (class_body)))
+
+================================================================================
+Class with method
+================================================================================
+
+class Foo {
+  Void bar() {
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (method_def
+        return_type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        params: (param_list)
+        body: (block)))))
+
+================================================================================
+Class with field
+================================================================================
+
+class Foo {
+  Str name := "hello"
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (field_def
+        type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        init: (literal
+          (str_lit))))))

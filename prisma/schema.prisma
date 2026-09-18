@@ -1,0 +1,490 @@
+// Prisma schema for Fantom MCP Server
+// This schema manages Fantom/SkySpark instances, pods, compilation logs,
+// projects, documentation indexes, and usage tracking.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// Instance Management
+// ============================================
+
+// Instance Types: fantom, skyspark, haxall
+model Instance {
+  id               Int       @id @default(autoincrement())
+  name             String    @unique
+  path             String
+  type             String    @default("fantom") // fantom | skyspark | haxall
+  version          String?
+  fanExecutable    String?   @map("fan_executable")
+  description      String?
+  sourcePath       String?   @map("source_path") // For open-source instances (e.g., Haxall: {basePath}/src)
+  fantomVersion    String?   @map("fantom_version") // Fantom version used by this instance (e.g., "1.0.82")
+  fantomSourcePath String?   @map("fantom_source_path") // Path to Fantom source (e.g., "~/fantom/fantom-1.0.82")
+  isValid          Boolean   @default(true) @map("is_valid")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  // Doc source linking: Haxall instances can reference a SkySpark instance for documentation
+  docSourceInstanceId Int?      @map("doc_source_instance_id")
+  docSourceInstance   Instance? @relation("DocSourceLink", fields: [docSourceInstanceId], references: [id], onDelete: SetNull)
+  docDependentInstances Instance[] @relation("DocSourceLink")
+
+  // Relations
+  pods         Pod[]
+  compileLogs  CompileLog[]
+  projects     FantomProject[]
+  docIndexes   DocIndex[]
+
+  @@map("instances")
+}
+
+// ============================================
+// Fantom Build Management
+// ============================================
+
+// Tracks Fantom source installations (e.g., fantom-1.0.80, fantom-1.0.82)
+model FantomBuild {
+  id            Int       @id @default(autoincrement())
+  version       String    @unique                        // e.g., "1.0.82"
+  path          String                                   // e.g., "~/fantom/fantom-1.0.82"
+  hasSource     Boolean   @default(false) @map("has_source")  // true if src/ directory exists
+  podCount      Int       @default(0) @map("pod_count")       // Number of pods indexed
+  functionCount Int       @default(0) @map("function_count")  // Total functions indexed
+  typeCount     Int       @default(0) @map("type_count")      // Total types indexed
+  lastIndexed   DateTime? @map("last_indexed")
+  isActive      Boolean   @default(true) @map("is_active")    // Whether to include in indexing
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  projects FantomProject[] @relation("BuildProjects")
+
+  @@map("fantom_builds")
+}
+
+// ============================================
+// Pod Management
+// ============================================
+
+model Pod {
+  id                Int       @id @default(autoincrement())
+  name              String
+  path              String
+  buildFile         String    @default("build.fan") @map("build_file")
+  description       String?
+  defaultInstanceId Int?      @map("default_instance_id")
+  compatMinVersion  String?   @map("compat_min_version")  // e.g., "3.1.10"
+  compatMaxVersion  String?   @map("compat_max_version")  // e.g., "3.1.12"
+  compatVersions    String?   @map("compat_versions")     // JSON array for specific versions: ["3.1.10", "3.1.11", "3.1.12"]
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  defaultInstance   Instance?    @relation(fields: [defaultInstanceId], references: [id], onDelete: SetNull)
+  compileLogs       CompileLog[]
+
+  @@unique([path, buildFile])
+  @@map("pods")
+}
+
+// ============================================
+// Compilation Tracking
+// ============================================
+
+model CompileLog {
+  id          Int       @id @default(autoincrement())
+  podId       Int       @map("pod_id")
+  instanceId  Int       @map("instance_id")
+  buildFile   String    @map("build_file")
+  status      String    // success | failure | running
+  output      String?
+  error       String?
+  durationMs  Int?      @map("duration_ms")
+  startedAt   DateTime  @default(now()) @map("started_at")
+  completedAt DateTime? @map("completed_at")
+
+  // Relations
+  pod      Pod      @relation(fields: [podId], references: [id], onDelete: Cascade)
+  instance Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@map("compile_logs")
+}
+
+// ============================================
+// Project Management (Code Indexing)
+// ============================================
+
+model FantomProject {
+  id            Int       @id @default(autoincrement())
+  name          String    @unique
+  path          String
+  instanceId    Int?      @map("instance_id")
+  buildId       Int?      @map("build_id")      // Link to Fantom build (for Fantom source pods)
+  podName       String?   @map("pod_name")
+  description   String?
+  functionCount Int       @default(0) @map("function_count")
+  typeCount     Int       @default(0) @map("type_count")
+  lastIndexed   DateTime? @map("last_indexed")
+  autoIndex     Boolean   @default(true) @map("auto_index")
+
+  // Language and parser type for multi-language support
+  language      String    @default("fantom")     // fantom, typescript, javascript, dart, etc.
+  parserType    String    @default("regex")      // regex, tree-sitter-wasm
+
+  // Derived by rebuildProjectDependencies(): third-party library names from
+  // package.json / build.fan that are NOT indexed projects (JSON string[]), and
+  // a one-line summary used by the ask's scope note.
+  libraries     String?                          // JSON array, e.g. ["rete","rete-vue-plugin","vuex"]
+  summary       String?
+
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  instance     Instance?      @relation(fields: [instanceId], references: [id], onDelete: SetNull)
+  build        FantomBuild?   @relation("BuildProjects", fields: [buildId], references: [id], onDelete: SetNull)
+  indexedFiles IndexedFile[]
+  indexRuns    IndexRun[]
+  dependencies ProjectDependency[] @relation("DependencyFrom")
+  dependents   ProjectDependency[] @relation("DependencyTo")
+
+  @@map("fantom_projects")
+}
+
+// ============================================
+// Project dependencies (ask scope)
+// ============================================
+
+// Directed edge "fromProject depends on toProject". Automatic kinds are
+// recomputed by rebuildProjectDependencies() after every index run:
+//   build.fan-depends    — pod listed in <path>/build.fan `depends`, mapped to an indexed project
+//   package.json         — dependencies/devDependencies matched to an indexed project (name or file:/workspace: path)
+//   cross-project-edges  — resolved call edges in cross_project_edges (>= 5 per direction)
+//   workspace-sibling    — sibling project in the same parent directory
+//   manual               — created via the admin API / dashboard; never touched by rebuild
+// `enabled=false` keeps the row (and is preserved across rebuilds) but removes it from the ask scope.
+model ProjectDependency {
+  id            Int      @id @default(autoincrement())
+  fromProjectId Int      @map("from_project_id")
+  toProjectId   Int      @map("to_project_id")
+  kind          String
+  source        String?
+  confidence    Float    @default(1.0)
+  enabled       Boolean  @default(true)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  fromProject FantomProject @relation("DependencyFrom", fields: [fromProjectId], references: [id], onDelete: Cascade)
+  toProject   FantomProject @relation("DependencyTo", fields: [toProjectId], references: [id], onDelete: Cascade)
+
+  @@unique([fromProjectId, toProjectId, kind])
+  @@index([toProjectId])
+  @@map("project_dependencies")
+}
+
+// ============================================
+// Incremental indexing — file-level cache
+// ============================================
+
+// Tracks per-file mtime+content hash so an indexer run can skip
+// files that haven't changed since the last successful index.
+model IndexedFile {
+  id           Int      @id @default(autoincrement())
+  projectId    Int      @map("project_id")
+  filePath     String   @map("file_path")
+  mtimeMs      BigInt   @map("mtime_ms")          // fs.statSync().mtimeMs as integer ms
+  contentSha   String   @map("content_sha256")    // sha256 of file bytes
+  byteSize     Int      @map("byte_size")
+  symbolCount  Int      @default(0) @map("symbol_count") // # symbols last extracted from this file
+  indexedAt    DateTime @default(now()) @map("indexed_at")
+
+  project FantomProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, filePath])
+  @@index([projectId])
+  @@map("indexed_files")
+}
+
+// ============================================
+// Incremental indexing — per-run change history
+// ============================================
+
+// One row per indexProject() invocation. Aggregates added/modified/removed counts.
+model IndexRun {
+  id             Int       @id @default(autoincrement())
+  projectId      Int       @map("project_id")
+  startedAt      DateTime  @map("started_at")
+  finishedAt     DateTime? @map("finished_at")
+  trigger        String                        // "manual" | "auto" | "watch" | "mcp"
+  filesScanned   Int       @default(0) @map("files_scanned")
+  filesParsed    Int       @default(0) @map("files_parsed")  // parsed (not skipped by hash gate)
+  filesSkipped   Int       @default(0) @map("files_skipped") // skipped by hash gate
+  durationMs     Int       @default(0) @map("duration_ms")
+  addedCount     Int       @default(0) @map("added_count")
+  modifiedCount  Int       @default(0) @map("modified_count")
+  removedCount   Int       @default(0) @map("removed_count")
+  isSeedingRun   Boolean   @default(false) @map("is_seeding_run") // first run ever for this project
+  force          Boolean   @default(false)                         // full rebuild flag
+  errorMessage   String?   @map("error_message")
+  gitCommit      String?   @map("git_commit")  // HEAD SHA at run time (P2.4)
+  gitBranch      String?   @map("git_branch")  // current branch at run time
+
+  project FantomProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  changes      ApiChange[]
+  edgeChanges  EdgeChange[]
+
+  @@index([projectId, startedAt])
+  @@map("index_runs")
+}
+
+// One row per symbol-level change recorded during a run.
+// "before"/"after" hold the canonical signature so an assistant can summarize the API delta.
+model ApiChange {
+  id            Int      @id @default(autoincrement())
+  runId         Int      @map("run_id")
+  projectId     Int      @map("project_id")
+  kind          String                        // "function" | "type" | "field"
+  qualifiedName String   @map("qualified_name")
+  changeType    String   @map("change_type")  // "added" | "modified" | "removed"
+  beforeSig     String?  @map("before_sig")
+  afterSig      String?  @map("after_sig")
+  filePath      String   @map("file_path")
+  lineStart     Int?     @map("line_start")
+  lineEnd       Int?     @map("line_end")
+  occurredAt    DateTime @default(now()) @map("occurred_at")
+
+  run IndexRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, occurredAt])
+  @@index([qualifiedName])
+  @@index([runId])
+  @@map("api_changes")
+}
+
+// One row per edge-level change recorded during a run. Lets us reconstruct
+// the call graph at a point in time. Stored as a flat (sourceQn, targetQn)
+// tuple so it survives node-id rewrites.
+model EdgeChange {
+  id           Int      @id @default(autoincrement())
+  runId        Int      @map("run_id")
+  projectId    Int      @map("project_id")
+  sourceQn     String   @map("source_qn")
+  targetQn     String   @map("target_qn")
+  edgeType     String   @map("edge_type") // calls, contains, extends, implements, overrides, returns, parameters, uses
+  changeType   String   @map("change_type") // added | removed
+  occurredAt   DateTime @default(now()) @map("occurred_at")
+
+  run IndexRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, occurredAt])
+  @@index([sourceQn])
+  @@index([targetQn])
+  @@index([runId])
+  @@map("edge_changes")
+}
+
+// ============================================
+// Cross-project code edges (Phase 2 Option 3)
+// ============================================
+// Edges whose source and target live in different Ladybug per-project DBs
+// (Kuzu REL tables can't span DBs). Populated by resolveCrossProjectEdges()
+// using the global name index built from every per-project graph.
+
+model CrossProjectEdge {
+  id              Int      @id @default(autoincrement())
+  sourceId        String   @map("source_id")          // Ladybug CodeNode id in source project
+  sourceProjectId Int      @map("source_project_id")
+  sourceQn        String   @map("source_qn")
+  sourceLanguage  String   @map("source_language")
+  targetId        String   @map("target_id")          // Ladybug CodeNode id in target project
+  targetProjectId Int      @map("target_project_id")
+  targetQn        String   @map("target_qn")
+  targetLanguage  String   @map("target_language")
+  edgeType        String   @map("edge_type")          // calls | extends | implements | uses
+  lineNumber      Int?     @map("line_number")
+  confidence      Float    @default(0.7)
+  resolvedAt      DateTime @default(now()) @map("resolved_at")
+
+  @@unique([sourceId, targetId, edgeType], name: "src_tgt_type")
+  @@index([sourceProjectId])
+  @@index([targetProjectId])
+  @@index([sourceQn])
+  @@index([targetQn])
+  @@index([edgeType])
+  @@map("cross_project_edges")
+}
+
+// ============================================
+// Settings
+// ============================================
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+// ============================================
+// Documentation Index (per instance/version)
+// ============================================
+
+model DocIndex {
+  id          Int      @id @default(autoincrement())
+  instanceId  Int      @map("instance_id")
+  podName     String   @map("pod_name")
+  docPath     String   @map("doc_path")
+  itemCount   Int      @default(0) @map("item_count")
+  version     String?
+  lastIndexed DateTime @default(now()) @map("last_indexed")
+  cacheFile   String?  @map("cache_file")
+
+  // Relations
+  instance Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@unique([instanceId, podName])
+  @@map("doc_indexes")
+}
+
+// ============================================
+// Usage Tracking
+// ============================================
+
+model ToolEvent {
+  id           Int      @id @default(autoincrement())
+  toolName     String   @map("tool_name")
+  timestamp    DateTime @default(now())
+  durationMs   Int?     @map("duration_ms")
+  success      Boolean
+  errorMessage String?  @map("error_message")
+  sessionId    String?  @map("session_id")
+
+  @@index([toolName])
+  @@index([timestamp])
+  @@map("tool_events")
+}
+
+model SearchEvent {
+  id          Int      @id @default(autoincrement())
+  query       String
+  source      String
+  resultCount Int      @map("result_count")
+  timestamp   DateTime @default(now())
+  sessionId   String?  @map("session_id")
+
+  @@index([source])
+  @@index([timestamp])
+  @@map("search_events")
+}
+
+// ============================================
+// OAuth 2.1 with PKCE Support
+// ============================================
+
+// OAuth Clients - Dynamic client registration
+model OAuthClient {
+  id           String   @id @default(uuid())
+  clientId     String   @unique @map("client_id")
+  clientSecret String?  @map("client_secret")
+  clientName   String?  @map("client_name")
+  redirectUris String   @map("redirect_uris") // JSON array of allowed redirect URIs
+  scope        String?                        // Space-separated list of allowed scopes
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  // Relations
+  authCodes     AuthorizationCode[]
+  accessTokens  AccessToken[]
+  refreshTokens RefreshToken[]
+
+  @@map("oauth_clients")
+}
+
+// Authorization Codes - PKCE flow (10 min TTL)
+model AuthorizationCode {
+  id                  String      @id @default(uuid())
+  code                String      @unique
+  clientId            String      @map("client_id")
+  userId              String?     @map("user_id")    // Username from UserStore
+  redirectUri         String      @map("redirect_uri")
+  scope               String?
+  codeChallenge       String      @map("code_challenge")
+  codeChallengeMethod String      @default("S256") @map("code_challenge_method")
+  expiresAt           DateTime    @map("expires_at")
+  used                Boolean     @default(false)
+  createdAt           DateTime    @default(now()) @map("created_at")
+
+  // Relations
+  client OAuthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+
+  @@index([code])
+  @@map("authorization_codes")
+}
+
+// Access Tokens (1 hour TTL by default)
+model AccessToken {
+  id        String    @id @default(uuid())
+  token     String    @unique
+  clientId  String    @map("client_id")
+  userId    String?   @map("user_id")    // Username from UserStore
+  scope     String?
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  client OAuthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+
+  @@index([token])
+  @@map("access_tokens")
+}
+
+// Refresh Tokens (30 day TTL by default)
+model RefreshToken {
+  id        String    @id @default(uuid())
+  token     String    @unique
+  clientId  String    @map("client_id")
+  userId    String?   @map("user_id")    // Username from UserStore
+  scope     String?
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  client OAuthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+
+  @@index([token])
+  @@map("refresh_tokens")
+}
+
+// OAuth Sessions - For tracking active connections and audit
+model OAuthSession {
+  id           String   @id @default(uuid())
+  sessionId    String   @unique @map("session_id")
+  clientId     String   @map("client_id")
+  clientName   String?  @map("client_name")
+  userId       String?  @map("user_id")
+  scope        String?
+  createdAt    DateTime @default(now()) @map("created_at")
+  lastActivity DateTime @default(now()) @map("last_activity")
+  userAgent    String?  @map("user_agent")
+  ipAddress    String?  @map("ip_address")
+
+  @@index([clientId])
+  @@map("oauth_sessions")
+}
+
+// ============================================
+// Code Graph
+// ============================================
+// The code graph (nodes + edges + unresolved refs + build stats) now lives
+// in LadybugDB at .cache/fantom-graph.db. See src/graph/ladybugSchema.ts for
+// the Cypher schema and src/graph/ladybugQueryManager.ts for reads.
+// Pre-cutover SQLite data is preserved at .cache/fantom.db.pre-ladybug-cutover.

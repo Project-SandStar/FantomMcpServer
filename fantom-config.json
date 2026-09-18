@@ -1,0 +1,8 @@
+{
+  "codePath": "./fan",
+  "cacheDir": "./.cache",
+  "searchSettings": {
+    "maxResults": 50,
+    "minScore": 0.3
+  }
+}

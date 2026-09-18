@@ -1,0 +1,135 @@
+================================================================================
+Nullable type
+================================================================================
+
+class Foo {
+  Str? name
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (field_def
+        type: (type_ref
+          (nullable_type
+            (simple_type
+              (qualified_type_name
+                (identifier)))))
+        name: (identifier)))))
+
+================================================================================
+List type
+================================================================================
+
+class Foo {
+  Str[] items
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (field_def
+        type: (type_ref
+          (list_type
+            (simple_type
+              (qualified_type_name
+                (identifier)))))
+        name: (identifier)))))
+
+================================================================================
+Map type
+================================================================================
+
+class Foo {
+  [Str:Int] counts
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (field_def
+        type: (type_ref
+          (map_type
+            key: (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))
+            val: (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))))
+        name: (identifier)))))
+
+================================================================================
+Type literal
+================================================================================
+
+class Foo {
+  Void bar() {
+    t := Str#
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (method_def
+        return_type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        params: (param_list)
+        body: (block
+          (expr_stmt
+            (assign_expr
+              (identifier)
+              (type_literal
+                (qualified_type_name
+                  (identifier))))))))))
+
+================================================================================
+Is operator
+================================================================================
+
+class Foo {
+  Void bar() {
+    x := obj is Str
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (method_def
+        return_type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        params: (param_list)
+        body: (block
+          (expr_stmt
+            (assign_expr
+              (identifier)
+              (type_check_expr
+                (identifier)
+                (type_ref
+                  (simple_type
+                    (qualified_type_name
+                      (identifier))))))))))))

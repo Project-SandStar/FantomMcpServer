@@ -1,0 +1,77 @@
+================================================================================
+Simple closure expression
+================================================================================
+
+class Foo {
+  Void bar() {
+    x := |Int a| a + 1
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (method_def
+        return_type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        params: (param_list)
+        body: (block
+          (expr_stmt
+            (assign_expr
+              (identifier)
+              (closure
+                (closure_param
+                  type: (type_ref
+                    (simple_type
+                      (qualified_type_name
+                        (identifier))))
+                  name: (identifier))
+                (add_expr
+                  (identifier)
+                  (literal
+                    (int_lit)))))))))))
+
+================================================================================
+Closure with untyped param
+================================================================================
+
+class Foo {
+  Void bar() {
+    list.each |item| { echo(item) }
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (method_def
+        return_type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        params: (param_list)
+        body: (block
+          (expr_stmt
+            (postfix_expr
+              (postfix_expr
+                (identifier)
+                (identifier))
+              (closure
+                (closure_param
+                  name: (identifier))
+                (block
+                  (expr_stmt
+                    (postfix_expr
+                      (identifier)
+                      (call_args
+                        (identifier)))))))))))))

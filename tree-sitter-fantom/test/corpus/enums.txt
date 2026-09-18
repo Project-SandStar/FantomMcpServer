@@ -1,0 +1,47 @@
+================================================================================
+Simple enum
+================================================================================
+
+enum class Color {
+  red, green, blue
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (enum_definition
+    name: (identifier)
+    body: (enum_body
+      (enum_vals
+        (enum_val
+          name: (identifier))
+        (enum_val
+          name: (identifier))
+        (enum_val
+          name: (identifier))))))
+
+================================================================================
+Enum with constructor args
+================================================================================
+
+enum class Color {
+  red(0xff0000), green(0x00ff00)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (enum_definition
+    name: (identifier)
+    body: (enum_body
+      (enum_vals
+        (enum_val
+          name: (identifier)
+          (call_args
+            (literal
+              (int_lit))))
+        (enum_val
+          name: (identifier)
+          (call_args
+            (literal
+              (int_lit))))))))

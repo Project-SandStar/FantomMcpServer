@@ -1,0 +1,60 @@
+{
+  "name": "tree-sitter-fantom",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the Fantom programming language",
+  "main": "bindings/node",
+  "types": "bindings/node",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anthropics/tree-sitter-fantom"
+  },
+  "keywords": [
+    "tree-sitter",
+    "fantom",
+    "parser",
+    "lexer"
+  ],
+  "files": [
+    "grammar.js",
+    "binding.gyp",
+    "prebuilds/**",
+    "bindings/node/*",
+    "queries/*",
+    "src/**"
+  ],
+  "author": "Anthropic",
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^7.1.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "peerDependencies": {
+    "tree-sitter": "^0.21.0"
+  },
+  "peerDependenciesMeta": {
+    "tree_sitter": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.22.0",
+    "prebuildify": "^6.0.0"
+  },
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "build": "tree-sitter generate && tree-sitter build --wasm",
+    "test": "tree-sitter test",
+    "parse": "tree-sitter parse",
+    "install": "node-gyp-build",
+    "prebuildify": "prebuildify --napi --strip"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.fantom",
+      "file-types": [
+        "fan"
+      ],
+      "injection-regex": "^fantom$"
+    }
+  ]
+}

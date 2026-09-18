@@ -1,0 +1,22 @@
+==================
+Global slots
+==================
+
+TestGlobals: {
+  *globA
+  *globB: Str
+}
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    body: (body
+      (marker_slot
+        global: (global_prefix)
+        name: (identifier))
+      (slot_def
+        global: (global_prefix)
+        name: (identifier)
+        type: (type_ref (identifier))))))

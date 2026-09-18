@@ -1,0 +1,104 @@
+==================
+Simple spec
+==================
+
+Alpha: Dict {}
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    type: (type_ref (identifier))
+    body: (body)))
+
+==================
+Spec with slots
+==================
+
+Person: Dict {
+  name: Str
+  age: Int
+}
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    type: (type_ref (identifier))
+    body: (body
+      (slot_def
+        name: (identifier)
+        type: (type_ref (identifier)))
+      (slot_def
+        name: (identifier)
+        type: (type_ref (identifier))))))
+
+==================
+Choice spec
+==================
+
+Color: Choice
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    type: (type_ref (identifier))))
+
+==================
+Spec with scalar default
+==================
+
+ScalarA: Scalar "a-default"
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    type: (type_ref (identifier))
+    val: (string_literal)))
+
+==================
+Spec with metadata
+==================
+
+Config: Dict <doc:"Configuration"> {
+  timeout: Duration
+}
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    type: (type_ref (identifier))
+    meta: (meta_block
+      (meta_tag
+        key: (identifier)
+        value: (string_literal)))
+    body: (body
+      (slot_def
+        name: (identifier)
+        type: (type_ref (identifier))))))
+
+==================
+Spec without type
+==================
+
+TestGlobals: {
+  name: Str
+}
+
+---
+
+(source_file
+  (spec_def
+    name: (identifier)
+    body: (body
+      (slot_def
+        name: (identifier)
+        type: (type_ref (identifier))))))

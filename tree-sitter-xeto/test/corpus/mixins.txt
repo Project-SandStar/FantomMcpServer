@@ -1,0 +1,40 @@
+==================
+Simple mixin
+==================
+
++Phase {
+  l1
+}
+
+---
+
+(source_file
+  (mixin_def
+    type: (type_ref (identifier))
+    body: (body
+      (marker_slot
+        name: (identifier)))))
+
+==================
+Qualified mixin with meta
+==================
+
++CurStatus <qux:"_self_"> {
+  ok
+  down
+}
+
+---
+
+(source_file
+  (mixin_def
+    type: (type_ref (identifier))
+    meta: (meta_block
+      (meta_tag
+        key: (identifier)
+        value: (string_literal)))
+    body: (body
+      (marker_slot
+        name: (identifier))
+      (marker_slot
+        name: (identifier)))))

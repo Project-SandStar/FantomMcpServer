@@ -1,0 +1,103 @@
+================================================================================
+Elvis expression
+================================================================================
+
+class Foo {
+  Void bar() {
+    x := a ?: b
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (method_def
+        return_type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        params: (param_list)
+        body: (block
+          (expr_stmt
+            (assign_expr
+              (identifier)
+              (elvis_expr
+                (identifier)
+                (identifier)))))))))
+
+================================================================================
+Safe navigation
+================================================================================
+
+class Foo {
+  Void bar() {
+    x := obj?.name
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (method_def
+        return_type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        params: (param_list)
+        body: (block
+          (expr_stmt
+            (assign_expr
+              (identifier)
+              (postfix_expr
+                (identifier)
+                (identifier)))))))))
+
+================================================================================
+Range expression
+================================================================================
+
+class Foo {
+  Void bar() {
+    x := 1..10
+    y := 0..<5
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    name: (identifier)
+    body: (class_body
+      (method_def
+        return_type: (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        name: (identifier)
+        params: (param_list)
+        body: (block
+          (expr_stmt
+            (assign_expr
+              (identifier)
+              (range_expr
+                (literal
+                  (int_lit))
+                (literal
+                  (int_lit)))))
+          (expr_stmt
+            (assign_expr
+              (identifier)
+              (range_expr
+                (literal
+                  (int_lit))
+                (literal
+                  (int_lit))))))))))

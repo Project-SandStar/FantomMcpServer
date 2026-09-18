@@ -1,0 +1,42 @@
+==================
+Simple instance
+==================
+
+@test-a: {alpha}
+
+---
+
+(source_file
+  (instance_def
+    id: (ref_literal)
+    body: (body
+      (marker_slot
+        name: (identifier)))))
+
+==================
+Instance with nested dicts
+==================
+
+@toolbar1: {
+  save: {text:"Save"}
+  exit: {text:"Exit"}
+}
+
+---
+
+(source_file
+  (instance_def
+    id: (ref_literal)
+    body: (body
+      (slot_def
+        name: (identifier)
+        body: (body
+          (slot_def
+            name: (identifier)
+            val: (string_literal))))
+      (slot_def
+        name: (identifier)
+        body: (body
+          (slot_def
+            name: (identifier)
+            val: (string_literal)))))))

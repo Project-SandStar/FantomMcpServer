@@ -1,0 +1,70 @@
+# ── Dependencies / build output ─────────────────────────────
+node_modules/
+build/
+dist/
+dashboard/.next/
+dashboard/out/
+dashboard/node_modules/
+*.tsbuildinfo
+
+# ── Runtime config (contains credentials, sidecar registry, internal hosts) ──
+# Ship ONLY the templates. The server creates defaults on first start.
+config/*.json
+config/*.json.backup
+!config/*.example.json
+config/backups/
+
+# ── Env files (keep only the example) ──────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Databases / caches (regenerable; may contain indexed customer code) ──
+.cache/
+.test-cache/
+/fantom.db
+prisma/*.db
+prisma/*.db-journal
+prisma/*.db-wal
+prisma/dev.db*
+*.sqlite
+*.sqlite3
+*.lance/
+
+# ── Downloaded / synced SkySpark & Axon sources (never publish) ──
+proj/
+scripts/proj/
+scripts/.cache/
+/fan/**
+!/fan/example.fan
+!/fan/tokens.json
+
+# ── Logs & debug dumps ──────────────────────────────────────
+/logs/
+*.log
+debug-index-state.txt
+scripts/debug-index-state.txt
+
+# ── Local tool state ────────────────────────────────────────
+.claude/settings.local.json
+scripts/.claude/
+.idea/
+.vscode/
+*.swp
+
+# ── Not part of the product ─────────────────────────────────
+marketing/
+tmp/
+temp/
+coverage/
+
+# ── OS ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# Dashboard runtime users (created at first login)
+dashboard/config/*.json
+
+# Editor backups
+*.bak
+*.orig

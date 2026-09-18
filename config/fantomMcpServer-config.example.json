@@ -1,0 +1,89 @@
+{
+  "port": 3848,
+  "docsPath": "https://fantom.org/doc",
+  "codePath": "./fan",
+  "cacheDir": "./.cache",
+  "crawlSettings": {
+    "maxDepth": 3,
+    "delayMs": 100,
+    "timeout": 30000
+  },
+  "searchSettings": {
+    "maxResults": 50,
+    "minScore": 0.3,
+    "useOrLogic": true
+  },
+  "cache": {
+    "enabled": true,
+    "maxAge": 86400000
+  },
+  "auth": {
+    "accessTokenTtl": 3600,
+    "refreshTokenTtl": 2592000,
+    "authCodeTtl": 600
+  },
+  "treeSitter": {
+    "enabled": true,
+    "grammarsPath": "./src/parser/treeSitter/grammars",
+    "defaultLanguages": [
+      "typescript",
+      "javascript",
+      "vue",
+      "json",
+      "html",
+      "css"
+    ],
+    "parseTimeout": 30000,
+    "maxFileSize": 1048576
+  },
+  "semanticSearch": {
+    "minScore": 0.5,
+    "graphWeight": 0.3,
+    "defaultLimit": 10,
+    "includeGraphContext": true,
+    "codeModel": "hf.co/jinaai/jina-code-embeddings-1.5b-GGUF:Q8_0",
+    "codeDimensions": 1536,
+    "docsModel": "qwen3-embedding:0.6b",
+    "docsDimensions": 1024,
+    "embeddingThreads": 2,
+    "embeddingBatchSize": 16,
+    "llmReranker": {
+      "enabled": true,
+      "provider": "groq",
+      "fromSidecar": false
+    },
+    "crossEncoderReranker": {
+      "enabled": true
+    },
+    "codeFromSidecar": true,
+    "docsFromSidecar": true,
+    "parallelProjects": 3,
+    "answerSynthesis": {
+      "enabled": false,
+      "provider": "auto",
+      "heavyModel": "llama-3.3-70b-versatile",
+      "lightModel": "llama-3.1-8b-instant",
+      "topK": 8,
+      "includeHistory": true
+    },
+    "topK": 10
+  },
+  "sidecars": [],
+  "llmProviders": {
+    "defaultProvider": "groq",
+    "groq": {
+      "enabled": false
+    },
+    "anthropic": {
+      "enabled": false,
+      "model": "claude-opus-4-7"
+    },
+    "gemini": {
+      "enabled": false
+    }
+  },
+  "sidecarMasterWsPort": 3003,
+  "rssGuardMb": 4000,
+  "projectEmbeddingOverrides": {},
+  "debug": {}
+}

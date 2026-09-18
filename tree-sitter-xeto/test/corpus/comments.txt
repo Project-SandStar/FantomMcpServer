@@ -1,0 +1,30 @@
+==================
+Line comment
+==================
+
+// this is a comment
+Alpha: Dict {}
+
+---
+
+(source_file
+  (comment)
+  (spec_def
+    name: (identifier)
+    type: (type_ref (identifier))
+    body: (body)))
+
+==================
+Block comment
+==================
+
+/* block comment */
+Beta: Str
+
+---
+
+(source_file
+  (block_comment)
+  (spec_def
+    name: (identifier)
+    type: (type_ref (identifier))))

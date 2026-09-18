@@ -1,0 +1,22 @@
+{
+  "grammars": [
+    {
+      "name": "xeto",
+      "camelCase": "xeto",
+      "scope": "source.xeto",
+      "path": ".",
+      "file-types": ["xeto"],
+      "highlights": "queries/highlights.scm",
+      "external-scanner": {
+        "path": "src/scanner.c"
+      }
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "links": {
+      "repository": "https://github.com/nickalarm/tree-sitter-xeto"
+    },
+    "authors": []
+  }
+}
