@@ -291,6 +291,23 @@ const axonMappings: NodeTypeMappings = {
   bodyField: 'body'
 };
 
+// Trio record files (tree-sitter-trio). Records are the only "type"; tags are
+// its members. `.trio` files are routed to TrioParser by the indexer, so these
+// mappings only matter for generic AST walks.
+const trioMappings: NodeTypeMappings = {
+  functionTypes: [],
+  classTypes: ['record'],
+  interfaceTypes: [],
+  variableTypes: ['tag', 'block_tag'],
+  importTypes: [],
+  exportTypes: [],
+  commentTypes: ['comment'],
+  callTypes: [],
+  nameField: 'name',
+  parametersField: 'params',
+  bodyField: 'value'
+};
+
 const htmlMappings: NodeTypeMappings = {
   functionTypes: [],
   classTypes: [],
@@ -485,6 +502,12 @@ const defaultLanguageConfigs: Record<SupportedLanguage, Omit<LanguageConfig, 'lo
     name: 'Axon',
     extensions: ['axon'],
     nodeMappings: axonMappings
+  },
+  trio: {
+    id: 'trio',
+    name: 'Trio',
+    extensions: ['trio'],
+    nodeMappings: trioMappings
   },
   html: {
     id: 'html',

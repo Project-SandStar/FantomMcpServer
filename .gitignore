@@ -68,3 +68,6 @@ dashboard/config/*.json
 # Editor backups
 *.bak
 *.orig
+
+# ast-grep parser libraries built by scripts/build-ast-grep-parsers.sh
+.ast-grep/parsers/

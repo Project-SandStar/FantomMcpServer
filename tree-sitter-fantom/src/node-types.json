@@ -810,11 +810,55 @@
           "named": true
         },
         {
+          "type": "break_stmt",
+          "named": true
+        },
+        {
+          "type": "continue_stmt",
+          "named": true
+        },
+        {
+          "type": "expr_stmt",
+          "named": true
+        },
+        {
+          "type": "for_stmt",
+          "named": true
+        },
+        {
           "type": "identifier",
           "named": true
         },
         {
+          "type": "if_stmt",
+          "named": true
+        },
+        {
+          "type": "local_def",
+          "named": true
+        },
+        {
+          "type": "return_stmt",
+          "named": true
+        },
+        {
+          "type": "switch_stmt",
+          "named": true
+        },
+        {
+          "type": "throw_stmt",
+          "named": true
+        },
+        {
+          "type": "try_stmt",
+          "named": true
+        },
+        {
           "type": "type_ref",
+          "named": true
+        },
+        {
+          "type": "while_stmt",
           "named": true
         }
       ]
@@ -2135,6 +2179,50 @@
       "types": [
         {
           "type": "block",
+          "named": true
+        },
+        {
+          "type": "break_stmt",
+          "named": true
+        },
+        {
+          "type": "continue_stmt",
+          "named": true
+        },
+        {
+          "type": "expr_stmt",
+          "named": true
+        },
+        {
+          "type": "for_stmt",
+          "named": true
+        },
+        {
+          "type": "if_stmt",
+          "named": true
+        },
+        {
+          "type": "local_def",
+          "named": true
+        },
+        {
+          "type": "return_stmt",
+          "named": true
+        },
+        {
+          "type": "switch_stmt",
+          "named": true
+        },
+        {
+          "type": "throw_stmt",
+          "named": true
+        },
+        {
+          "type": "try_stmt",
+          "named": true
+        },
+        {
+          "type": "while_stmt",
           "named": true
         }
       ]
@@ -4261,6 +4349,7 @@
   {
     "type": "source_file",
     "named": true,
+    "root": true,
     "fields": {},
     "children": {
       "multiple": true,
@@ -4718,11 +4807,55 @@
           "named": true
         },
         {
+          "type": "break_stmt",
+          "named": true
+        },
+        {
           "type": "catch_block",
           "named": true
         },
         {
+          "type": "continue_stmt",
+          "named": true
+        },
+        {
+          "type": "expr_stmt",
+          "named": true
+        },
+        {
           "type": "finally_block",
+          "named": true
+        },
+        {
+          "type": "for_stmt",
+          "named": true
+        },
+        {
+          "type": "if_stmt",
+          "named": true
+        },
+        {
+          "type": "local_def",
+          "named": true
+        },
+        {
+          "type": "return_stmt",
+          "named": true
+        },
+        {
+          "type": "switch_stmt",
+          "named": true
+        },
+        {
+          "type": "throw_stmt",
+          "named": true
+        },
+        {
+          "type": "try_stmt",
+          "named": true
+        },
+        {
+          "type": "while_stmt",
           "named": true
         }
       ]
@@ -5468,7 +5601,8 @@
   },
   {
     "type": "comment",
-    "named": true
+    "named": true,
+    "extra": true
   },
   {
     "type": "const",
@@ -5488,7 +5622,8 @@
   },
   {
     "type": "doc_comment",
-    "named": true
+    "named": true,
+    "extra": true
   },
   {
     "type": "duration_lit",

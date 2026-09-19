@@ -52,6 +52,7 @@ export interface RunIndexResult {
     typesIndexed: number;
     filesProcessed: number;
     errors: number;
+    warnings: number;
     duration: number;
   };
 }
@@ -180,8 +181,12 @@ export async function runIndex(
     })();
   }
 
+  // Warnings (e.g. a key=value file named .trio that the trio grammar
+  // flags line by line) do not fail the run; only severity 'error' does.
+  const hardErrors = result.errors.filter(e => e.severity === 'error').length;
+
   return {
-    success: result.errors.length === 0,
+    success: hardErrors === 0,
     project: { id: project.id, name: project.name, path: project.path },
     // Surface `noChange` so the dashboard can distinguish "hash-gate skipped
     // re-parse — index is up to date" from "parser produced 0 results — bug".
@@ -191,7 +196,8 @@ export async function runIndex(
       functionsIndexed: result.functionsIndexed,
       typesIndexed: result.typesIndexed,
       filesProcessed: result.filesProcessed,
-      errors: result.errors.length,
+      errors: hardErrors,
+      warnings: result.errors.length - hardErrors,
       duration: result.duration,
     },
   };

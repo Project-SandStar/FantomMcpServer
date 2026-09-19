@@ -1,0 +1,285 @@
+[
+  {
+    "type": "block_tag",
+    "named": true,
+    "fields": {
+      "kind": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "dict_block",
+            "named": true
+          },
+          {
+            "type": "list_block",
+            "named": true
+          },
+          {
+            "type": "trio_block",
+            "named": true
+          },
+          {
+            "type": "zinc_block",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "name",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "indented_text",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "bool",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "record",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "block_tag",
+          "named": true
+        },
+        {
+          "type": "tag",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "source_file",
+    "named": true,
+    "root": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "record",
+          "named": true
+        },
+        {
+          "type": "separator",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "tag",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "name",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "bool",
+            "named": true
+          },
+          {
+            "type": "date",
+            "named": true
+          },
+          {
+            "type": "date_time",
+            "named": true
+          },
+          {
+            "type": "dict",
+            "named": true
+          },
+          {
+            "type": "list",
+            "named": true
+          },
+          {
+            "type": "na",
+            "named": true
+          },
+          {
+            "type": "number",
+            "named": true
+          },
+          {
+            "type": "raw",
+            "named": true
+          },
+          {
+            "type": "ref",
+            "named": true
+          },
+          {
+            "type": "remove",
+            "named": true
+          },
+          {
+            "type": "str",
+            "named": true
+          },
+          {
+            "type": "symbol",
+            "named": true
+          },
+          {
+            "type": "time",
+            "named": true
+          },
+          {
+            "type": "uri",
+            "named": true
+          },
+          {
+            "type": "xstr",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": ":",
+    "named": false
+  },
+  {
+    "type": "F",
+    "named": false
+  },
+  {
+    "type": "T",
+    "named": false
+  },
+  {
+    "type": "comment",
+    "named": true,
+    "extra": true
+  },
+  {
+    "type": "date",
+    "named": true
+  },
+  {
+    "type": "date_time",
+    "named": true
+  },
+  {
+    "type": "dict",
+    "named": true
+  },
+  {
+    "type": "dict_block",
+    "named": true
+  },
+  {
+    "type": "false",
+    "named": false
+  },
+  {
+    "type": "indented_text",
+    "named": true
+  },
+  {
+    "type": "list",
+    "named": true
+  },
+  {
+    "type": "list_block",
+    "named": true
+  },
+  {
+    "type": "na",
+    "named": true
+  },
+  {
+    "type": "name",
+    "named": true
+  },
+  {
+    "type": "number",
+    "named": true
+  },
+  {
+    "type": "raw",
+    "named": true
+  },
+  {
+    "type": "ref",
+    "named": true
+  },
+  {
+    "type": "remove",
+    "named": true
+  },
+  {
+    "type": "separator",
+    "named": true
+  },
+  {
+    "type": "str",
+    "named": true
+  },
+  {
+    "type": "symbol",
+    "named": true
+  },
+  {
+    "type": "time",
+    "named": true
+  },
+  {
+    "type": "trio_block",
+    "named": true
+  },
+  {
+    "type": "true",
+    "named": false
+  },
+  {
+    "type": "uri",
+    "named": true
+  },
+  {
+    "type": "xstr",
+    "named": true
+  },
+  {
+    "type": "zinc_block",
+    "named": true
+  }
+]

@@ -160,7 +160,7 @@ class AxonMcpClient {
       logger.info(`Spawning Axon MCP server: ${s.command} ${s.args.join(' ')} (cwd ${s.projectPath})`);
     }
 
-    const client = new Client({ name: 'mcp-fantom', version: '1.0.0' }, { capabilities: {} });
+    const client = new Client({ name: 'mcp-fantom', version: '1.0.1' }, { capabilities: {} });
     transport.onclose = () => this.onDropped('transport closed');
     transport.onerror = (err: Error) => { this.lastError = err.message; logger.warn(`Axon transport error: ${err.message}`); };
 

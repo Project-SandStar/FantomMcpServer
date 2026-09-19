@@ -1,0 +1,46 @@
+# ast-grep project config. Run from repo root: `ast-grep run -p '<pattern>' -l ts`
+# Rules live in .ast-grep/rules; tests in .ast-grep/tests.
+ruleDirs:
+  - .ast-grep/rules
+testConfigs:
+  - testDir: .ast-grep/tests
+languageGlobs:
+  typescript: ["*.ts", "*.mts", "*.cts"]
+  tsx: ["*.tsx"]
+  javascript: ["*.js", "*.mjs", "*.cjs"]
+
+# Custom tree-sitter languages, built from the in-repo tree-sitter-* grammars into
+# .ast-grep/parsers/ (gitignored) by scripts/build-ast-grep-parsers.sh. Paths are
+# relative to this file. On Linux the script produces .so files; change the
+# extension below to match.
+customLanguages:
+  fantom:
+    libraryPath: .ast-grep/parsers/fantom.dylib
+    extensions: [fan, fwt]
+    expandoChar: _
+  axon:
+    libraryPath: .ast-grep/parsers/axon.dylib
+    extensions: [axon]
+    expandoChar: _
+  trio:
+    libraryPath: .ast-grep/parsers/trio.dylib
+    extensions: [trio]
+    expandoChar: _
+  xeto:
+    libraryPath: .ast-grep/parsers/xeto.dylib
+    extensions: [xeto]
+    expandoChar: _
+
+# Axon source inside the `src:` block of a Trio function record.
+# `ast-grep run -l axon ...` then also searches *.trio files.
+languageInjections:
+  - hostLanguage: trio
+    rule:
+      kind: indented_text
+      pattern: $CONTENT
+      inside:
+        kind: block_tag
+        has:
+          field: name
+          regex: '^src$'
+    injected: axon

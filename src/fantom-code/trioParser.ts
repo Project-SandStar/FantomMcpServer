@@ -1,12 +1,17 @@
 /**
  * Trio Parser - parses SkySpark .trio files containing Axon functions and view definitions
  *
- * Ported from the official SkySpark TrioReader.fan:
- * - Records separated by lines starting with "-"
- * - name:value tag pairs; no colon = marker tag
- * - Empty value after colon = indented multi-line text block
- * - Trio: prefix = recursively parsed nested trio record
- * - Supports both single-record files and multi-record files (--- separated)
+ * Records are split with the vendored `tree-sitter-trio` grammar
+ * (`src/parser/treeSitter/trioGrammar.ts`), which follows haxall's
+ * TrioReader.fan: `-` lines end a record, `name` alone is a marker,
+ * `name: value` is a Zinc scalar, `name:` takes the indented text that follows,
+ * and `Zinc:` / `Trio:` / `[` / `{` introduce indented blocks. The grammar gives
+ * exact line numbers per record and per tag, so function and call line numbers
+ * are real rather than estimated.
+ *
+ * The `src` body of a function record is handed to the Axon tree-sitter parser
+ * for parameters and calls. A hand-written port of TrioReader remains as the
+ * fallback when the trio wasm cannot be loaded.
  */
 
 import * as fs from 'fs';
@@ -30,6 +35,8 @@ import {
   FantomCategory
 } from './types.js';
 import type { TreeSitterCodeParser } from './treeSitterAdapter.js';
+import { initTrioGrammar, parseTrio, TRIO_MARKER } from '../parser/treeSitter/trioGrammar.js';
+import type { ParsedTrioRecord, TrioRecord, TrioValue } from '../parser/treeSitter/trioGrammar.js';
 
 const logger = createLogger('trio-parser');
 
@@ -38,19 +45,18 @@ const logger = createLogger('trio-parser');
 // ============================================
 
 /** Marker value for tags with no value (e.g., "func" on its own line) */
-const MARKER = Symbol('marker');
+const MARKER: typeof TRIO_MARKER = TRIO_MARKER;
 
-type TrioValue = string | boolean | number | typeof MARKER | TrioRecord | null;
-
-interface TrioRecord {
-  [key: string]: TrioValue;
-}
 
 // ============================================
-// Trio Reader - port of TrioReader.fan
+// Legacy Trio Reader - port of TrioReader.fan
 // ============================================
 
-class TrioReader {
+/**
+ * Fallback record splitter, used only when the trio grammar is unavailable.
+ * Line numbers from this path are estimates.
+ */
+class LegacyTrioReader {
   private lines: string[];
   private cursor: number = 0;
   private pushback: string | null = null;
@@ -173,7 +179,7 @@ class TrioReader {
     // Trio: prefix = nested trio record
     if (s === 'Trio:') {
       const text = this.readIndentedText();
-      const reader = new TrioReader(text);
+      const reader = new LegacyTrioReader(text);
       const rec = reader.readAllRecords();
       return rec.length > 0 ? rec[0] : null;
     }
@@ -199,6 +205,22 @@ class TrioReader {
     if (this.cursor >= this.lines.length) return null;
     return this.lines[this.cursor++];
   }
+}
+
+/** Split records with the legacy reader and estimate line numbers, as the old parser did. */
+function legacyRecords(content: string): ParsedTrioRecord[] {
+  const out: ParsedTrioRecord[] = [];
+  let lineOffset = 1;
+  for (const tags of new LegacyTrioReader(content).readAllRecords()) {
+    const tagLines: Record<string, number> = {};
+    let i = 0;
+    for (const k of Object.keys(tags)) tagLines[k] = lineOffset + i++;
+    const src = tags['src'];
+    const size = (typeof src === 'string' ? src.split('\n').length : 0) + Object.keys(tags).length + 1;
+    out.push({ tags, line: lineOffset, endLine: lineOffset + size - 1, tagLines, tagKinds: {} });
+    lineOffset += size;
+  }
+  return out;
 }
 
 // ============================================
@@ -338,11 +360,13 @@ function extractSubViewMethods(
   filePath: string,
   projectId: number,
   viewQualifiedName: string,
-  lineNumber: number
+  srcBodyLine: number
 ): FantomFunction[] {
   const methods: FantomFunction[] = [];
   const src = rec['src'];
   if (typeof src !== 'string') return methods;
+  // subLineIdx below is 1-based within src, so line = srcBodyLine - 1 + subLineIdx
+  const lineNumber = srcBodyLine - 1;
 
   // Match subView definitions: subViewN: Trio:
   const subViewPattern = /^(\w+):\s*Trio:$/gm;
@@ -431,28 +455,26 @@ export class TrioParser {
     const types: FantomTypeDef[] = [];
 
     try {
-      const reader = new TrioReader(content);
-      const records = reader.readAllRecords();
+      const records = await this.readRecords(content, filePath, errors);
 
-      let lineOffset = 1;
-      for (const rec of records) {
+      for (const parsed of records) {
+        const rec = parsed.tags as TrioRecord;
+        const lineNumber = parsed.line;
+        // First line of the src text: the line after `src:`. Falls back to the
+        // record line when src is inline or absent.
+        const srcBodyLine = parsed.tagKinds['src'] && parsed.tagKinds['src'] !== 'scalar'
+          ? parsed.tagLines['src'] + 1
+          : (parsed.tagLines['src'] ?? lineNumber);
+
         if (this.isFunctionRecord(rec)) {
-          const func = await this.recordToFunction(rec, filePath, lineOffset);
+          const func = await this.recordToFunction(rec, filePath, lineNumber, srcBodyLine);
           if (func) functions.push(func);
         } else if (this.isViewRecord(rec)) {
-          const view = this.recordToView(rec, filePath, lineOffset);
+          const view = this.recordToView(rec, filePath, lineNumber, srcBodyLine);
           if (view) types.push(view);
         } else if (this.isAppRecord(rec)) {
-          const app = this.recordToApp(rec, filePath, lineOffset);
+          const app = this.recordToApp(rec, filePath, lineNumber);
           if (app) types.push(app);
-        }
-
-        // Estimate line offset for next record (count lines in src + tags)
-        const src = rec['src'];
-        if (typeof src === 'string') {
-          lineOffset += src.split('\n').length + Object.keys(rec).length + 1;
-        } else {
-          lineOffset += Object.keys(rec).length + 1;
         }
       }
 
@@ -466,6 +488,25 @@ export class TrioParser {
     }
 
     return { filePath, types, functions, imports: [], usings: [], errors };
+  }
+
+  /**
+   * Split the file into records. Uses the trio grammar when it loads; ERROR
+   * nodes become warnings so a malformed file is visible in the parse report
+   * instead of silently shifting every later record.
+   */
+  private async readRecords(content: string, filePath: string, errors: ParseError[]): Promise<ParsedTrioRecord[]> {
+    if (await initTrioGrammar()) {
+      const result = parseTrio(content);
+      if (result) {
+        for (const issue of result.issues) {
+          errors.push({ file: filePath, line: issue.line, message: `Trio syntax: ${issue.message}`, severity: 'warning' });
+        }
+        return result.records;
+      }
+    }
+    logger.debug(`Trio grammar unavailable, using legacy reader for ${filePath}`);
+    return legacyRecords(content);
   }
 
   // ============================================
@@ -496,7 +537,7 @@ export class TrioParser {
   // ============================================
 
   /** Convert a function trio record to FantomFunction */
-  private async recordToFunction(rec: TrioRecord, filePath: string, lineNumber: number): Promise<FantomFunction | null> {
+  private async recordToFunction(rec: TrioRecord, filePath: string, lineNumber: number, srcBodyLine: number): Promise<FantomFunction | null> {
     const nameVal = rec['name'];
     if (typeof nameVal !== 'string') return null;
 
@@ -518,22 +559,26 @@ export class TrioParser {
         const tsFunc = tsResult.functions[0];
         if (tsFunc) {
           params = tsFunc.parameters.length > 0 ? tsFunc.parameters : extractAxonParams(src);
-          calls = tsFunc.calls || extractAxonCalls(src, lineNumber);
+          // The axon parser saw only the src body, so its line numbers are
+          // 1-based within src. Shift them to file lines.
+          calls = tsFunc.calls
+            ? tsFunc.calls.map(c => ({ ...c, lineNumber: c.lineNumber + srcBodyLine - 1 }))
+            : extractAxonCalls(src, srcBodyLine);
           description = tsFunc.documentation || tsFunc.description || this.extractDescription(src);
         } else {
           params = extractAxonParams(src);
-          calls = extractAxonCalls(src, lineNumber);
+          calls = extractAxonCalls(src, srcBodyLine);
           description = this.extractDescription(src);
         }
       } catch {
         // Fall back to regex on tree-sitter failure
         params = extractAxonParams(src);
-        calls = extractAxonCalls(src, lineNumber);
+        calls = extractAxonCalls(src, srcBodyLine);
         description = this.extractDescription(src);
       }
     } else {
       params = extractAxonParams(src);
-      calls = extractAxonCalls(src, lineNumber);
+      calls = extractAxonCalls(src, srcBodyLine);
       description = this.extractDescription(src);
     }
 
@@ -566,7 +611,7 @@ export class TrioParser {
   }
 
   /** Convert a view trio record to FantomTypeDef */
-  private recordToView(rec: TrioRecord, filePath: string, lineNumber: number): FantomTypeDef | null {
+  private recordToView(rec: TrioRecord, filePath: string, lineNumber: number, srcBodyLine: number): FantomTypeDef | null {
     const viewName = rec['view'] as string;
     if (!viewName) return null;
 
@@ -577,7 +622,7 @@ export class TrioParser {
     const description = buildViewDescription(rec);
 
     // Extract subview methods for graph building
-    const methods = extractSubViewMethods(rec, filePath, this.projectId, qualifiedName, lineNumber);
+    const methods = extractSubViewMethods(rec, filePath, this.projectId, qualifiedName, srcBodyLine);
 
     const view: FantomTypeDef = {
       id: generateTypeId(filePath, qualifiedName, lineNumber),

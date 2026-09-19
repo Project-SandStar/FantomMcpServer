@@ -12251,6 +12251,39 @@ export function createAdminRouter(context: AdminContext): Router {
     }
   });
 
+  /**
+   * POST /admin/sidecars/:id/ws-probe
+   * Does a SMALL frame make it back over this sidecar's WS tunnel?
+   * Sends `virtual-key-info` (a few hundred bytes each way) and reports the
+   * outcome. Built for BASWS34: its register frame arrives and then every
+   * socket closes 1006 after ~25s with nothing else received. Whether a tiny
+   * result frame returns separates "large frames are dropped on this path"
+   * from "nothing after the register ever arrives" — two different fixes.
+   */
+  router.post('/sidecars/:id/ws-probe', async (req: Request, res: Response): Promise<void> => {
+    const { getSidecar } = await import('../sidecars/registry.js');
+    const sc = getSidecar(String(req.params.id));
+    if (!sc) { res.status(404).json({ error: 'unknown sidecar' }); return; }
+    const { sendCommandToSidecar, isSoundSuiteSidecarConnected, getMasterWsListenerStatus, agentUrlForSidecarId, socketStatsForSidecarId } = await import('../sidecars/soundsuiteMaster.js');
+    const socketBefore = socketStatsForSidecarId(sc.id);
+    const agentUrl = agentUrlForSidecarId(sc.id);
+    const timeoutMs = Math.min(30_000, Math.max(1_000, Number(req.body?.timeoutMs) || 8_000));
+    const connected = isSoundSuiteSidecarConnected(sc.id);
+    const t0 = Date.now();
+    let ok = false; let bytes = 0; let error: string | null = null;
+    try {
+      const raw = await sendCommandToSidecar(sc.id, 'virtual-key-info', {}, timeoutMs);
+      ok = raw !== null && raw !== undefined;
+      bytes = raw ? JSON.stringify(raw).length : 0;
+    } catch (err) {
+      error = (err as Error).message;
+    }
+    const diag = (getMasterWsListenerStatus().diagnostics as { closesByAgent?: Map<string, unknown> }).closesByAgent;
+    const churn = (agentUrl && diag?.get(agentUrl)) ?? null;
+    const socketAfter = socketStatsForSidecarId(sc.id);
+    res.json({ sidecar: sc.name, agentUrl, connected, ok, ms: Date.now() - t0, resultBytes: bytes, error, churn, socketBefore, socketAfter });
+  });
+
   router.post('/sidecars/:id/health', async (req: Request, res: Response): Promise<void> => {
     const id = req.params.id as string;
     if (!getSidecar(id)) {

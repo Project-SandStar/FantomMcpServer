@@ -1,0 +1,55 @@
+================================================================================
+Try/catch/finally without braces
+================================================================================
+
+class C
+{
+  Void m()
+  {
+    try
+      echo("a")
+    catch (Err e)
+      e.trace
+    finally
+      echo("b")
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (try_stmt
+            (expr_stmt
+              (postfix_expr
+                (identifier)
+                (call_args
+                  (literal
+                    (str_lit)))))
+            (catch_block
+              (type_ref
+                (simple_type
+                  (qualified_type_name
+                    (identifier))))
+              (identifier)
+              (expr_stmt
+                (postfix_expr
+                  (identifier)
+                  (identifier))))
+            (finally_block
+              (expr_stmt
+                (postfix_expr
+                  (identifier)
+                  (call_args
+                    (literal
+                      (str_lit))))))))))))

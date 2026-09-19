@@ -28,6 +28,7 @@ export type SupportedLanguage =
   | 'fantom'
   | 'xeto'
   | 'axon'
+  | 'trio'
   | 'html'
   | 'css'
   | 'json'

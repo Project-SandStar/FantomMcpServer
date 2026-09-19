@@ -1,0 +1,51 @@
+================================================================================
+Indented src block with blank line
+================================================================================
+
+name: add
+src:
+  (a, b) => do
+    x: a + b
+
+    x
+  end
+---
+dis: "next"
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (record
+    (tag (name) (raw))
+    (block_tag (name) (indented_text)))
+  (separator)
+  (record
+    (tag (name) (str))))
+
+================================================================================
+Zinc, Trio, list and dict blocks
+================================================================================
+
+grid: Zinc:
+  ver:"3.0"
+  a,b
+  1,2
+items: [
+  1,
+  2
+]
+nested: Trio:
+  x: 1
+  y
+params:{
+  a: "b"
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (record
+    (block_tag (name) (zinc_block) (indented_text))
+    (block_tag (name) (list_block) (indented_text))
+    (block_tag (name) (trio_block) (indented_text))
+    (block_tag (name) (dict_block) (indented_text))))

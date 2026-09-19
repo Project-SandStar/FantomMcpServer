@@ -1,0 +1,34 @@
+================================================================================
+Indented block at end of file without trailing newline
+================================================================================
+name:"poppyDemo_action3"
+src:
+  () => poppyDemo_actionN(3)
+--------------------------------------------------------------------------------
+
+(source_file
+  (record
+    (tag (name) (str))
+    (block_tag (name) (indented_text))))
+
+================================================================================
+Quoted string spanning lines (project export leniency)
+================================================================================
+dis:"ashraeFC7"
+help:"AHU SAT Too Low
+second line */
+"
+src:"(a) => a"
+---
+dis: "next"
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (record
+    (tag (name) (str))
+    (tag (name) (str))
+    (tag (name) (str)))
+  (separator)
+  (record
+    (tag (name) (str))))

@@ -1,0 +1,20 @@
+{
+  "grammars": [
+    {
+      "name": "trio",
+      "camelCase": "trio",
+      "scope": "source.trio",
+      "path": ".",
+      "file-types": ["trio"],
+      "highlights": "queries/highlights.scm",
+      "injections": "queries/injections.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "links": {
+      "repository": "https://github.com/nickalarm/tree-sitter-trio"
+    },
+    "authors": []
+  }
+}

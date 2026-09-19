@@ -1,0 +1,417 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/grammar.schema.json",
+  "name": "trio",
+  "rules": {
+    "source_file": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "_newline"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "separator"
+              }
+            ]
+          }
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "record"
+              },
+              {
+                "type": "REPEAT",
+                "content": {
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "SYMBOL",
+                      "name": "_newline"
+                    },
+                    {
+                      "type": "SYMBOL",
+                      "name": "separator"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "record": {
+      "type": "PREC_RIGHT",
+      "value": 0,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "SYMBOL",
+            "name": "_line"
+          },
+          {
+            "type": "REPEAT",
+            "content": {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "_line"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "_newline"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "_line": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "tag"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_newline"
+            }
+          ]
+        },
+        {
+          "type": "SYMBOL",
+          "name": "block_tag"
+        }
+      ]
+    },
+    "tag": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "name"
+          }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": ":"
+                },
+                {
+                  "type": "FIELD",
+                  "name": "value",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_scalar"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        }
+      ]
+    },
+    "block_tag": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "name"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ":"
+        },
+        {
+          "type": "FIELD",
+          "name": "kind",
+          "content": {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "CHOICE",
+                "members": [
+                  {
+                    "type": "SYMBOL",
+                    "name": "zinc_block"
+                  },
+                  {
+                    "type": "SYMBOL",
+                    "name": "trio_block"
+                  },
+                  {
+                    "type": "SYMBOL",
+                    "name": "list_block"
+                  },
+                  {
+                    "type": "SYMBOL",
+                    "name": "dict_block"
+                  }
+                ]
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "value",
+          "content": {
+            "type": "SYMBOL",
+            "name": "indented_text"
+          }
+        }
+      ]
+    },
+    "zinc_block": {
+      "type": "STRING",
+      "value": "Zinc:"
+    },
+    "trio_block": {
+      "type": "STRING",
+      "value": "Trio:"
+    },
+    "list_block": {
+      "type": "STRING",
+      "value": "["
+    },
+    "dict_block": {
+      "type": "STRING",
+      "value": "{"
+    },
+    "separator": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "PATTERN",
+          "value": "-[^\\r\\n]*"
+        }
+      }
+    },
+    "name": {
+      "type": "PATTERN",
+      "value": "[a-z_][a-zA-Z0-9_]*"
+    },
+    "_scalar": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "ref"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "symbol"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "str"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "uri"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "date_time"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "date"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "time"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "number"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "bool"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "na"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "remove"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "list"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "dict"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "xstr"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "raw"
+        }
+      ]
+    },
+    "ref": {
+      "type": "PATTERN",
+      "value": "@[a-zA-Z0-9_:.~-]+([ \\t]+\"([^\"\\\\\\n]|\\\\.)*\")?"
+    },
+    "symbol": {
+      "type": "PATTERN",
+      "value": "\\^[a-zA-Z0-9_:.~-]+"
+    },
+    "str": {
+      "type": "PATTERN",
+      "value": "\"([^\"\\\\]|\\\\.)*\""
+    },
+    "uri": {
+      "type": "PATTERN",
+      "value": "`[^`\\n]*`"
+    },
+    "date_time": {
+      "type": "PATTERN",
+      "value": "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(:\\d{2}(\\.\\d+)?)?(Z|[+-]\\d{2}:\\d{2})?([ \\t]+[A-Za-z_][A-Za-z0-9_+-]*)?"
+    },
+    "date": {
+      "type": "PATTERN",
+      "value": "\\d{4}-\\d{2}-\\d{2}"
+    },
+    "time": {
+      "type": "PATTERN",
+      "value": "\\d{1,2}:\\d{2}(:\\d{2}(\\.\\d+)?)?"
+    },
+    "number": {
+      "type": "PATTERN",
+      "value": "-?(0x[0-9a-fA-F_]+|\\d[\\d_]*(\\.\\d+)?([eE][+-]?\\d+)?)(_?[a-zA-Z%$\\/°-￿][a-zA-Z0-9%$\\/_°-￿]*)?|NaN|INF|-INF"
+    },
+    "bool": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "true"
+        },
+        {
+          "type": "STRING",
+          "value": "false"
+        },
+        {
+          "type": "STRING",
+          "value": "T"
+        },
+        {
+          "type": "STRING",
+          "value": "F"
+        }
+      ]
+    },
+    "na": {
+      "type": "STRING",
+      "value": "NA"
+    },
+    "remove": {
+      "type": "STRING",
+      "value": "R"
+    },
+    "list": {
+      "type": "PATTERN",
+      "value": "\\[[^\\r\\n]*\\]"
+    },
+    "dict": {
+      "type": "PATTERN",
+      "value": "\\{[^\\r\\n]*\\}"
+    },
+    "xstr": {
+      "type": "PATTERN",
+      "value": "[A-Z][a-zA-Z0-9_]*\\([^\\r\\n]*\\)"
+    },
+    "raw": {
+      "type": "PATTERN",
+      "value": "[^\\s\\[{\"`@^-][^\\r\\n]*"
+    },
+    "indented_text": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "PATTERN",
+          "value": "\\r?\\n((?:[ \\t]+[^\\n]*|[^\\s])?\\r?\\n)*([ \\t]+[^\\n]*)?"
+        }
+      }
+    },
+    "comment": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "PATTERN",
+          "value": "\\/\\/[^\\r\\n]*"
+        }
+      }
+    },
+    "_newline": {
+      "type": "PATTERN",
+      "value": "\\r?\\n"
+    }
+  },
+  "extras": [
+    {
+      "type": "PATTERN",
+      "value": "[ \\t\\r]"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "comment"
+    }
+  ],
+  "conflicts": [],
+  "precedences": [],
+  "externals": [],
+  "inline": [],
+  "supertypes": [],
+  "reserved": {}
+}

@@ -390,6 +390,31 @@ export function pushConfigToSidecar(sidecarId: string, payload: Record<string, u
 }
 
 /** Whether we currently hold an open WS tunnel to this sidecar. */
+/** TCP-level view of a sidecar's live socket — which direction is stalling.
+ *  bytesRead = what the sidecar has delivered to us on this socket;
+ *  writableLength = what we have written that the kernel could not yet send
+ *  (grows when the peer's ACKs never come back). */
+export function socketStatsForSidecarId(sidecarId: string): { readyState: number; bufferedAmount: number; bytesRead: number; bytesWritten: number; writableLength: number; extensions: string } | null {
+  const url = agentUrlForSidecarId(sidecarId);
+  const ws = url ? liveByAgentUrl.get(url) : undefined;
+  if (!ws) return null;
+  const sock = (ws as unknown as { _socket?: { bytesRead?: number; bytesWritten?: number; writableLength?: number } })._socket;
+  return {
+    readyState: ws.readyState,
+    bufferedAmount: ws.bufferedAmount,
+    bytesRead: sock?.bytesRead ?? -1,
+    bytesWritten: sock?.bytesWritten ?? -1,
+    writableLength: sock?.writableLength ?? -1,
+    extensions: ws.extensions || '',
+  };
+}
+
+/** The agentUrl a registry id last registered under (null if never seen on the WS). */
+export function agentUrlForSidecarId(sidecarId: string): string | null {
+  for (const [url, id] of sidecarIdByAgentUrl) if (id === sidecarId) return url;
+  return null;
+}
+
 export function isSoundSuiteSidecarConnected(sidecarId: string): boolean {
   for (const [url, id] of sidecarIdByAgentUrl) {
     if (id !== sidecarId) continue;
@@ -480,7 +505,11 @@ const silentWarnedAt = new Map<string, number>();
 // How long after a register we expect the first heartbeat (client sends every 5 s).
 const FIRST_HEARTBEAT_DEADLINE_MS = 30_000;
 // Diagnostic counters surfaced by getMasterWsListenerStatus().
-const wsDiag = { silentRegistrations: 0, supersedeWarnings: 0, wsPortCorrections: 0 };
+const wsDiag = {
+  silentRegistrations: 0, supersedeWarnings: 0, wsPortCorrections: 0,
+  /** Per agentUrl: how often its socket closed, the last close code, its lifetime and heartbeats delivered. */
+  closesByAgent: new Map<string, { closes: number; lastCode: number; lastLifeS: number; heartbeatsLast: number }>(),
+};
 
 /**
  * A sidecar that registers but never heartbeats is a specific, recognisable
@@ -545,7 +574,25 @@ function bindDedicatedListener(port: number, attachConnection: (wss: WebSocketSe
   }
   dedicatedError = null;
 
-  const wss = new WebSocketServer({ noServer: true });
+  // permessage-deflate: the sidecar's heartbeat carries `buildFullStatus()`
+  // every 5s — a multi-KB JSON. BASWS34's NetBird path delivered the small
+  // register frame and then NONE of those heartbeats (0 of 36 in a 3-minute
+  // baseline; BASWS35 on the same config delivered 36/36), so the sidecar's
+  // own "heartbeat send failed 3× → terminate → reconnect" fired every ~30s —
+  // 1,199 reconnects in a day. The `ws` client offers the extension by
+  // default; accepting it here compresses that JSON ~10× so it fits the path.
+  // Threshold keeps register/pong/small results raw; no context takeover
+  // keeps per-socket zlib memory bounded across five long-lived tunnels.
+  const wss = new WebSocketServer({
+    noServer: true,
+    perMessageDeflate: {
+      threshold: 512,
+      serverNoContextTakeover: true,
+      clientNoContextTakeover: true,
+      zlibDeflateOptions: { level: 3 },
+      concurrencyLimit: 8,
+    },
+  });
   attachConnection(wss);
 
   // Standard ws liveness sweep: mark alive on pong, ping on each tick, and
@@ -606,7 +653,9 @@ function bindDedicatedListener(port: number, attachConnection: (wss: WebSocketSe
 function attachConnectionHandlers(wss: WebSocketServer): void {
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     const remote = req.socket.remoteAddress;
-    console.log(`[soundsuite-master] WS connect from ${remote} url=${req.url}`);
+    const connectedAt = Date.now();
+    const seen = { frames: 0, heartbeats: 0 };
+    console.log(`[soundsuite-master] WS connect from ${remote} url=${req.url} ext=${ws.extensions || 'none'}`);
     const agentUrlRef: { url: string | null } = { url: null };
     (ws as WebSocket & LivenessState).isAlive = true;
     ws.on('pong', () => { (ws as WebSocket & LivenessState).isAlive = true; });
@@ -624,11 +673,22 @@ function attachConnectionHandlers(wss: WebSocketServer): void {
     ws.on('message', data => {
       const text = typeof data === 'string' ? data : data.toString('utf-8');
       const peek = text.slice(0, 120);
+      seen.frames++;
+      if (peek.startsWith('{"type":"heartbeat"')) seen.heartbeats++;
       console.log(`[soundsuite-master] frame from ${agentUrlRef.url ?? remote}: ${peek}`);
       try { handleFrame(ws, agentUrlRef, text); }
       catch (err) { console.error('[soundsuite-master] frame error:', err); }
     });
-    ws.on('close', () => {
+    ws.on('close', (code: number, reason: Buffer) => {
+      // Who closed, after how long, having delivered what. Until this line
+      // existed the master had no record of a sidecar socket ending at all,
+      // and BASWS34's reconnect loop was invisible from this side.
+      const who = agentUrlRef.url ?? remote ?? 'unknown';
+      const life = ((Date.now() - connectedAt) / 1000).toFixed(0);
+      const churn = wsDiag.closesByAgent.get(who) ?? { closes: 0, lastCode: 0, lastLifeS: 0, heartbeatsLast: 0 };
+      churn.closes++; churn.lastCode = code; churn.lastLifeS = Number(life); churn.heartbeatsLast = seen.heartbeats;
+      wsDiag.closesByAgent.set(who, churn);
+      console.log(`[soundsuite-master] WS closed ${who} code=${code}${reason?.length ? ` reason=${reason.toString('utf-8').slice(0, 60)}` : ''} after ${life}s frames=${seen.frames} heartbeats=${seen.heartbeats} closes=${churn.closes}`);
       if (agentUrlRef.url) {
         const cur = liveByAgentUrl.get(agentUrlRef.url);
         if (cur === ws) liveByAgentUrl.delete(agentUrlRef.url);
@@ -688,7 +748,7 @@ export function restartMasterWsListener(port: number): { port: number; ok: boole
   return { port, ok: !dedicatedError, error: dedicatedError ?? undefined };
 }
 
-export function getMasterWsListenerStatus(): { port: number | null; listening: boolean; error: string | null; clients: number; registered: number; peers: Array<{ agentUrl: string; lastHeartbeatAgoMs: number | null; supersedesLast10m: number }>; diagnostics: typeof wsDiag } {
+export function getMasterWsListenerStatus(): { port: number | null; listening: boolean; error: string | null; clients: number; registered: number; peers: Array<{ agentUrl: string; lastHeartbeatAgoMs: number | null; supersedesLast10m: number }>; diagnostics: Omit<typeof wsDiag, 'closesByAgent'> & { closes: Record<string, { closes: number; lastCode: number; lastLifeS: number; heartbeatsLast: number; tunnelFault: boolean }> } } {
   return {
     port: dedicatedPort,
     listening: !!dedicatedHttp && (dedicatedHttp as any).listening === true,
@@ -703,7 +763,16 @@ export function getMasterWsListenerStatus(): { port: number | null; listening: b
       lastHeartbeatAgoMs: lastHeartbeatAt.has(u) ? Date.now() - (lastHeartbeatAt.get(u) as number) : null,
       supersedesLast10m: (supersedesByAgentUrl.get(u) ?? []).filter(t => Date.now() - t < SUPERSEDE_WINDOW_MS).length,
     })),
-    diagnostics: { ...wsDiag },
+    diagnostics: (() => {
+      const { closesByAgent, ...rest } = wsDiag;
+      // Per agent: repeated short-lived sockets that never delivered a
+      // heartbeat = the tunnel carries the register frame and nothing else
+      // (BASWS34, 2026-09-18: 1,200+ closes, code 1006 at ~25s, 0 heartbeats).
+      const closes = Object.fromEntries([...closesByAgent].map(([url, c]) => [url, {
+        ...c, tunnelFault: c.closes >= 3 && c.heartbeatsLast === 0 && c.lastLifeS < 120,
+      }]));
+      return { ...rest, closes };
+    })(),
   };
 }
 

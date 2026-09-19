@@ -445,20 +445,25 @@ module.exports = grammar({
       ),
     ),
 
-    try_stmt: $ => seq(
+    // Fantom allows a single statement in place of a braced block after
+    // try / catch / finally.
+    _try_body: $ => choice($.block, $._stmt),
+
+    // prec.right binds catch/finally to the nearest try (dangling-else style).
+    try_stmt: $ => prec.right(seq(
       'try',
-      $.block,
+      $._try_body,
       repeat($.catch_block),
       optional($.finally_block),
-    ),
+    )),
 
     catch_block: $ => seq(
       'catch',
       optional(seq('(', $.type_ref, $.identifier, ')')),
-      $.block,
+      $._try_body,
     ),
 
-    finally_block: $ => seq('finally', $.block),
+    finally_block: $ => seq('finally', $._try_body),
 
     // ============================================
     // Expressions

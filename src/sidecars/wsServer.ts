@@ -89,7 +89,7 @@ function replaceLive(sidecarId: string, ws: WebSocket): void {
 }
 
 export function attachSidecarWsServer(httpServer: HttpServer): WebSocketServer {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, perMessageDeflate: { threshold: 512, serverNoContextTakeover: true, clientNoContextTakeover: true, zlibDeflateOptions: { level: 3 }, concurrencyLimit: 8 } });
 
   // Single shared upgrade dispatcher across all WS endpoints on this server.
   // Other WS attachers (soundsuiteMaster) register additional paths via the

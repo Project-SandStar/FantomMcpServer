@@ -104,6 +104,11 @@ const grammarSources: Record<SupportedLanguage, GrammarSource> = {
     // WASM needs to be built with: cd tree-sitter-axon && npx tree-sitter build --wasm
     filename: 'tree-sitter-axon.wasm'
   },
+  trio: {
+    // Trio uses our custom tree-sitter-trio grammar
+    // WASM needs to be built with: cd tree-sitter-trio && npx tree-sitter build --wasm
+    filename: 'tree-sitter-trio.wasm'
+  },
   html: {
     url: 'https://cdn.jsdelivr.net/npm/tree-sitter-html@0.23.2/tree-sitter-html.wasm',
     filename: 'tree-sitter-html.wasm'
@@ -207,8 +212,8 @@ export class GrammarDownloader {
     const toDownload = languages || (Object.keys(grammarSources) as SupportedLanguage[]);
 
     for (const lang of toDownload) {
-      // Skip fantom, xeto, and axon - use custom local grammars
-      if (lang === 'fantom' || lang === 'xeto' || lang === 'axon') {
+      // Skip fantom, xeto, axon, and trio - use custom local grammars
+      if (lang === 'fantom' || lang === 'xeto' || lang === 'axon' || lang === 'trio') {
         results.set(lang, false);
         continue;
       }
@@ -268,7 +273,7 @@ export class GrammarDownloader {
     const missing: SupportedLanguage[] = [];
 
     for (const lang of Object.keys(grammarSources) as SupportedLanguage[]) {
-      if (lang === 'fantom' || lang === 'xeto' || lang === 'axon') continue; // Skip custom grammars
+      if (lang === 'fantom' || lang === 'xeto' || lang === 'axon' || lang === 'trio') continue; // Skip custom grammars
       const path = resolve(this.grammarsPath, `tree-sitter-${lang}.wasm`);
       if (!existsSync(path)) {
         missing.push(lang);

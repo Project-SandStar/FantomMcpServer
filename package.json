@@ -1,6 +1,6 @@
 {
   "name": "mcp-fantom",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server providing AI assistants access to Fantom language documentation, code examples, and validation tools",
   "main": "build/index.js",
   "type": "module",
