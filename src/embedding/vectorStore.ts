@@ -15,9 +15,9 @@ import { createLogger } from '../utils/index.js';
 import { crashWrite } from '../utils/logSink.js';
 import { EmbeddingService } from './embeddingService.js';
 import { selectEmbeddingProvider, type EmbeddingProvider } from './providers/embeddingProvider.js';
-import { getLanceTable, getActiveCodeTableName, codeTableHasV3Columns, openCodeSlotReadonly } from './lanceConnection.js';
+import { getLanceTable, getActiveCodeTableName, codeTableHasV3Columns, codeTableHasV4Columns, openCodeSlotReadonly } from './lanceConnection.js';
 import { ladybugQuery } from '../graph/ladybugConnection.js';
-import { EMBED_TEXT_VERSION, EMBED_TEXT_V3 } from './embeddingText.js';
+import { EMBED_TEXT_VERSION, EMBED_TEXT_V3, EMBED_TEXT_V4 } from './embeddingText.js';
 
 /** Partitions probed when a project/type filter narrows an IVF_PQ search.
  *  ~460 partitions on the 212k-row code table; 20 (the default) misses whole
@@ -68,10 +68,14 @@ export interface StoreEmbeddingItem {
   nodeType?: string;
   qualifiedName?: string;
   filePath?: string;
+  /** The embedded text itself (v4): stored for BM25. */
+  text?: string;
 }
 
 export interface VectorSearchOptions {
   projectId?: number;
+  /** Restrict to these projects (a version group). Ignored when projectId is set. */
+  projectIds?: number[];
   nodeType?: string;
   limit?: number;
   minScore?: number;
@@ -198,8 +202,11 @@ export class VectorStore {
     // shows it stale until a full re-embed builds a fresh table.
     const v3 = EMBED_TEXT_V3 && await codeTableHasV3Columns(table, v3CacheKey);
     if (EMBED_TEXT_V3 && !v3) items = items.filter(i => !i.chunkIndex);
+    // v4 (`text` column) likewise only on a table created by a v4 build; an
+    // older table takes v3-shaped rows and the project is recorded at 3.
+    const v4 = EMBED_TEXT_V4 && v3 && await codeTableHasV4Columns(table, v3CacheKey);
     // Text-layout bookkeeping for /admin/vectors/model-status (see embedTextVersions.ts).
-    if (items.length) recordEmbedTextVersion(projectId, v3 ? EMBED_TEXT_VERSION : Math.min(EMBED_TEXT_VERSION, 2));
+    if (items.length) recordEmbedTextVersion(projectId, v4 ? EMBED_TEXT_VERSION : v3 ? Math.min(EMBED_TEXT_VERSION, 3) : Math.min(EMBED_TEXT_VERSION, 2));
 
     // Look up denormalized fields for nodes that did not bring their own
     // (Ladybug-authoritative). Items with `nodeType` (built by
@@ -273,6 +280,7 @@ export class VectorStore {
             file_path: item.filePath ?? '',
           });
         }
+        if (v4) rec.text = item.text ?? '';
         records.push(rec);
       }
 
@@ -354,6 +362,11 @@ export class VectorStore {
     // options.minScore (per request) still wins over the config knob.
     const minScore = options.minScore ?? readMinScore() ?? 0;
     const { projectId, nodeType, limit = 10 } = options;
+    // A version group is a list of project ids; integers only, so it can go
+    // straight into the SQL filter.
+    const projectIds = !projectId && options.projectIds?.length
+      ? options.projectIds.filter((n) => Number.isInteger(n))
+      : null;
 
     const table = await getLanceTable();
 
@@ -379,6 +392,7 @@ export class VectorStore {
     // Apply filters
     const filters: string[] = [];
     if (projectId) filters.push(`project_id = ${projectId}`);
+    else if (projectIds?.length) filters.push(`project_id IN (${projectIds.join(', ')})`);
     if (nodeType) filters.push(`node_type = '${escSql(nodeType)}'`);
 
     if (filters.length > 0) {
@@ -444,6 +458,63 @@ export class VectorStore {
       logger.info(`[vector-search] filter="${filters.join(' AND ')}" raw=${rawResults.length} belowFloor(${minScore})=${belowFloor} kept=${results.length} best=${best}`);
     }
     return results.slice(0, limit);
+  }
+
+  /**
+   * BM25 over the stored embed text (v4 tables). Same scope filters as the
+   * vector search; rows collapse to one per node like the vector path. Empty
+   * on a pre-v4 table or when the FTS index is missing — the caller fuses
+   * whatever lists it has.
+   */
+  async textSearch(query: string, options: VectorSearchOptions = {}): Promise<VectorSearchResult[]> {
+    const { projectId, nodeType, limit = 10 } = options;
+    const table = await getLanceTable();
+    if (!(EMBED_TEXT_V4 && await codeTableHasV4Columns(table, getActiveCodeTableName()))) return [];
+    const q = query.replace(/[\s"'`(){}\[\]]+/g, ' ').trim();
+    if (!q) return [];
+    const projectIds = !projectId && options.projectIds?.length
+      ? options.projectIds.filter((n) => Number.isInteger(n))
+      : null;
+    const filters: string[] = [];
+    if (projectId) filters.push(`project_id = ${projectId}`);
+    else if (projectIds?.length) filters.push(`project_id IN (${projectIds.join(', ')})`);
+    if (nodeType) filters.push(`node_type = '${escSql(nodeType)}'`);
+    const columns = ['node_id', 'project_id', 'node_type', 'chunk_index', 'chunk_count', 'line_start', 'line_end', 'qualified_name', 'file_path'];
+    let rows: Array<Record<string, unknown>>;
+    try {
+      let fq = table.query().fullTextSearch(q, { columns: 'text' }).select(columns).limit(limit * 4);
+      if (filters.length) fq = fq.where(filters.join(' AND '));
+      rows = await fq.toArray() as Array<Record<string, unknown>>;
+    } catch (err) {
+      const msg = (err as Error).message;
+      // No FTS index yet (a table built before ensureCodeTextIndex ran) → the
+      // leg is off, not broken. Everything else is worth a warning.
+      if (!/index|fts|full.?text/i.test(msg)) logger.warn(`[text-search] failed: ${msg.split('\n')[0].slice(0, 200)}`);
+      return [];
+    }
+    const out: VectorSearchResult[] = [];
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const id = String(row.node_id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const score = typeof row._score === 'number' ? row._score : 0;
+      out.push({
+        nodeId: id,
+        score,
+        distance: 0,
+        projectId: typeof row.project_id === 'number' ? row.project_id : (typeof row.project_id === 'bigint' ? Number(row.project_id) : undefined),
+        nodeType: (row.node_type as string) ?? undefined,
+        chunkIndex: row.chunk_index != null ? Number(row.chunk_index) : undefined,
+        chunkCount: row.chunk_count != null ? Number(row.chunk_count) : undefined,
+        lineStart: row.line_start != null && Number(row.line_start) > 0 ? Number(row.line_start) : undefined,
+        lineEnd: row.line_end != null && Number(row.line_end) > 0 ? Number(row.line_end) : undefined,
+        qualifiedName: (row.qualified_name as string) || undefined,
+        filePath: (row.file_path as string) || undefined,
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 
   /**

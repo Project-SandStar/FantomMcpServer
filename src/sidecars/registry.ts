@@ -184,7 +184,11 @@ export interface HealthResult {
 export async function pingSidecar(id: string, timeoutMs = 5000): Promise<HealthResult | null> {
   const sc = getSidecar(id);
   if (!sc) return null;
-  const url = `${sidecarUrl(sc)}/health`;
+  // The current (Next.js) sidecar answers `/api/health`; `/health` is its
+  // framework 404 page, which made every Ping on the dashboard read
+  // "unhealthy · HTTP 404" for hosts that were fine. Older builds only have
+  // `/health`. Try the current path first, fall back on a 404.
+  const paths = ['/api/health', '/health'] as const;
   const started = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -194,17 +198,21 @@ export async function pingSidecar(id: string, timeoutMs = 5000): Promise<HealthR
   try {
     const headers: Record<string, string> = {};
     if (sc.authToken) headers['Authorization'] = `Bearer ${sc.authToken}`;
-    const res = await fetch(url, { method: 'GET', headers, signal: controller.signal });
-    if (res.ok) {
-      status = 'healthy';
-      try {
-        const body = await res.json() as any;
-        if (body && typeof body === 'object' && body.capabilities) {
-          capabilities = body.capabilities;
-        }
-      } catch { /* not JSON; still healthy */ }
-    } else {
+    for (const p of paths) {
+      const res = await fetch(`${sidecarUrl(sc)}${p}`, { method: 'GET', headers, signal: controller.signal });
+      if (res.ok) {
+        status = 'healthy';
+        error = undefined;
+        try {
+          const body = await res.json() as any;
+          if (body && typeof body === 'object' && body.capabilities) {
+            capabilities = body.capabilities;
+          }
+        } catch { /* not JSON; still healthy */ }
+        break;
+      }
       error = `HTTP ${res.status}`;
+      if (res.status !== 404) break;
     }
   } catch (e: any) {
     error = e?.message ?? String(e);

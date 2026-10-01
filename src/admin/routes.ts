@@ -1709,6 +1709,7 @@ export function createAdminRouter(context: AdminContext): Router {
         fantomSourcePath,
         docSourceInstanceId
       });
+      (await import('../projects/versionGroup.js')).invalidateVersionGroupCache();
       res.status(201).json(instance);
     } catch (error) {
       console.error('[Admin] Failed to create instance:', error);
@@ -1743,6 +1744,8 @@ export function createAdminRouter(context: AdminContext): Router {
         res.status(404).json({ error: 'Instance not found' });
         return;
       }
+      // Instance type/version feed the project version groups.
+      (await import('../projects/versionGroup.js')).invalidateVersionGroupCache();
       res.json(instance);
     } catch (error) {
       console.error('[Admin] Failed to update instance:', error);
@@ -1764,6 +1767,7 @@ export function createAdminRouter(context: AdminContext): Router {
         res.status(404).json({ error: 'Instance not found' });
         return;
       }
+      (await import('../projects/versionGroup.js')).invalidateVersionGroupCache();
       res.json({ success: true, message: 'Instance deleted' });
     } catch (error) {
       console.error('[Admin] Failed to delete instance:', error);
@@ -3077,7 +3081,16 @@ export function createAdminRouter(context: AdminContext): Router {
       }
       const db = await context.getFantomDatabase();
       const projects = await db.getAllProjects();
-      res.json({ count: projects.length, projects });
+      // Product/version line per project for the sidebar tree (cached map).
+      const { getProjectVersionGroups } = await import('../projects/versionGroup.js');
+      const groups = await getProjectVersionGroups().catch(() => new Map());
+      res.json({
+        count: projects.length,
+        projects: projects.map((p) => {
+          const g = groups.get(p.id);
+          return { ...p, group: g ? { key: g.key, label: g.label, product: g.product, version: g.version } : null };
+        }),
+      });
     } catch (error) {
       console.error('[Admin] Failed to get code projects:', error);
       res.status(500).json({ error: 'Failed to get code projects' });
@@ -8203,12 +8216,33 @@ export function createAdminRouter(context: AdminContext): Router {
   // ============================================
 
   /**
+   * GET /admin/projects/version-groups
+   * Every product/version line with its member projects — what the sidebar
+   * tree and the `versionGroup` filter are built from.
+   */
+  router.get('/projects/version-groups', async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const { listVersionGroups } = await import('../projects/versionGroup.js');
+      const groups = await listVersionGroups();
+      res.json({
+        count: groups.length,
+        groups: groups.map((g) => ({
+          key: g.key, label: g.label, product: g.product, version: g.version, line: g.line,
+          projectCount: g.projectCount, projectIds: g.projectIds,
+        })),
+      });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to list version groups' });
+    }
+  });
+
+  /**
    * POST /admin/vectors/search
    * Perform semantic search using embeddings
    */
   router.post('/vectors/search', async (req: Request, res: Response): Promise<void> => {
     try {
-      const { query, projectId, nodeType, limit = 20, includeGraphContext = true } = req.body;
+      const { query, projectId, versionGroup, nodeType, limit = 20, includeGraphContext = true } = req.body;
 
       if (!query || typeof query !== 'string') {
         res.status(400).json({ error: 'Query is required' });
@@ -8220,8 +8254,31 @@ export function createAdminRouter(context: AdminContext): Router {
       const prisma = getPrismaClient();
       const searchService = getSemanticSearchService(prisma);
 
+      // Version group ("haxall 4.0.6", "skyspark 3.1") → project id list. A
+      // bad selector or a projectId outside the group is a 400, not [].
+      const pid = projectId ? parseInt(String(projectId), 10) : undefined;
+      let scope: import('../projects/versionGroup.js').ResolvedVersionScope | null = null;
+      let projectIds: number[] | undefined;
+      // One selector, several, or a comma-separated string (multi-select in
+      // the sidebar sends an array).
+      const vgOk = typeof versionGroup === 'string' || (Array.isArray(versionGroup) && versionGroup.every((v: unknown) => typeof v === 'string'));
+      if (versionGroup !== undefined && versionGroup !== null && !vgOk) {
+        res.status(400).json({ error: 'versionGroup must be a string or an array of strings' });
+        return;
+      }
+      if (vgOk) {
+        const { scopeForRequest } = await import('../projects/versionGroup.js');
+        try {
+          ({ scope, projectIds } = await scopeForRequest({ projectId: pid, versionGroup }));
+        } catch (err) {
+          res.status(400).json({ error: (err as Error).message });
+          return;
+        }
+      }
+
       const results = await searchService.search(query, {
-        projectId: projectId ? parseInt(projectId, 10) : undefined,
+        projectId: pid,
+        projectIds,
         nodeType,
         limit: Math.min(limit, 50),
         includeGraphContext
@@ -8230,7 +8287,8 @@ export function createAdminRouter(context: AdminContext): Router {
       res.json({
         query,
         count: results.length,
-        results
+        results,
+        ...(scope ? { scope: { versionGroup: scope.raw, groups: scope.groups, projectCount: scope.projectIds.length, projectId: pid ?? null } } : {}),
       });
     } catch (error) {
       console.error('[Admin] Semantic search error:', error);
@@ -8247,9 +8305,15 @@ export function createAdminRouter(context: AdminContext): Router {
    */
   router.post('/vectors/ask', async (req: Request, res: Response): Promise<void> => {
     try {
-      const { query, projectId, provider, model, topK, fast, rlm, rerank, askId } = req.body || {};
+      const { query, projectId, versionGroup, provider, model, topK, fast, rlm, rerank, askId } = req.body || {};
       if (!query || typeof query !== 'string') {
         res.status(400).json({ error: 'query is required' });
+        return;
+      }
+      const vgOk = versionGroup === undefined || versionGroup === null || typeof versionGroup === 'string'
+        || (Array.isArray(versionGroup) && versionGroup.every((v: unknown) => typeof v === 'string'));
+      if (!vgOk) {
+        res.status(400).json({ error: 'versionGroup must be a string such as "haxall 4.0.6" or an array of them' });
         return;
       }
       const { answerCodeQuestion } = await import('../embedding/answerSynthesis.js');
@@ -8261,6 +8325,7 @@ export function createAdminRouter(context: AdminContext): Router {
       const result = await answerCodeQuestion(query, {
         askId: feedId,
         projectId: projectId !== undefined ? parseInt(String(projectId), 10) : undefined,
+        versionGroup: versionGroup ?? undefined,
         provider,
         model,
         topK: topK !== undefined ? parseInt(String(topK), 10) : undefined,
@@ -8572,10 +8637,19 @@ export function createAdminRouter(context: AdminContext): Router {
       // stale: every finished project still reads as 0 vectors and no progress
       // bar fills. Count the shadow slot instead so partial/complete projects
       // show real progress; `activeVectors` keeps reporting what search serves.
-      const { isShadowReembedActive } = await import('../embedding/embedGate.js');
+      const { isShadowSlotBuilding } = await import('../embedding/embedGate.js');
       const { getActiveCodeTableName, getInactiveCodeTableName, openCodeSlotReadonly } =
         await import('../embedding/lanceConnection.js');
-      const shadowBuilding = isShadowReembedActive();
+      // "Building" = a SHADOW rebuild is in progress OR one is banked in the
+      // inactive slot and NOT promoted. A restart kills the job but not the
+      // slot; with only the job flag, the page fell back to the live table on
+      // every restart — its counts and dates from before the rebuild ("13d
+      // ago") — until someone resumed. The slot on disk is the truth, the job
+      // is not. A LIVE rebuild writes the active slot and is counted there.
+      const jobRunning = isShadowSlotBuilding();
+      const { getPendingShadowCodeTable } = await import('../embedding/lanceConnection.js');
+      const banked = jobRunning ? null : await getPendingShadowCodeTable().catch(() => null);
+      const shadowBuilding = jobRunning || !!banked;
       const shadowSlot = shadowBuilding ? getInactiveCodeTableName() : null;
 
       // ALWAYS read what the inactive slot holds, building or not.
@@ -8598,7 +8672,8 @@ export function createAdminRouter(context: AdminContext): Router {
         const t = await openCodeSlotReadonly(inactiveSlotName);
         if (t) inactiveRows = await t.countRows();
       } catch { /* best effort — never fail stats over this */ }
-      const pendingSlot: string | null = !shadowBuilding && inactiveRows > 0 ? inactiveSlotName : null;
+      // `pending` = banked and promotable: a slot with rows and no job writing it.
+      const pendingSlot: string | null = !jobRunning && inactiveRows > 0 ? inactiveSlotName : null;
       const pendingRows = pendingSlot ? inactiveRows : 0;
 
       const [totalVectors, projects, vectorsByProject, docsCount, docsByPod, lanceStats] = await Promise.all([
@@ -8607,6 +8682,7 @@ export function createAdminRouter(context: AdminContext): Router {
           select: {
             id: true,
             name: true,
+            instanceId: true,
             functionCount: true,
             typeCount: true
           }
@@ -8635,6 +8711,15 @@ export function createAdminRouter(context: AdminContext): Router {
       const { findPausedJob, findActiveJob } = await import('./reembedJobs.js');
       const pausedJob = findPausedJob();
       const activeJob = findActiveJob();
+      // A resumed job continues an older one; the shadow's own first row is
+      // the honest start of the rebuild, and any meta date before it is stale.
+      // With no job (banked shadow after a restart) the jobs list is empty;
+      // the slot itself is the rebuild, so every live-meta date is stale.
+      const rebuildStartedAt = shadowBuilding
+        ? (activeJob
+          ? Math.min(Date.parse(activeJob.startedAt), Date.parse(pausedJob?.startedAt ?? activeJob.startedAt))
+          : Number.POSITIVE_INFINITY)
+        : null;
       // Live per-project node count from the in-memory FantomCodeIndexer — used
       // ONLY as a fallback when a project's graph db reports 0 nodes.
       // LAZY: walking the whole in-memory index allocates a Map over every
@@ -8663,8 +8748,13 @@ export function createAdminRouter(context: AdminContext): Router {
           liveCounts.set(pid, cur);
         }
       } catch { /* fall back to Prisma */ }
-      const projectRows = projects.map((p: { id: number; name: string; functionCount: number; typeCount: number }) => {
+      // Version group per project (product/version line) — the sidebar tree
+      // and the search scope filter are built from this. Cached map, no I/O.
+      const { getProjectVersionGroups } = await import('../projects/versionGroup.js');
+      const versionGroups = await getProjectVersionGroups().catch(() => new Map());
+      const projectRows = projects.map((p: { id: number; name: string; instanceId: number | null; functionCount: number; typeCount: number }) => {
         const vc = vectorsByProject.get(p.id) || 0;
+        const vg = versionGroups.get(p.id);
         const m = meta[String(p.id)];
         const live = liveCounts?.get(p.id);
         const prismaTotal = (p.functionCount ?? 0) + (p.typeCount ?? 0);
@@ -8676,6 +8766,8 @@ export function createAdminRouter(context: AdminContext): Router {
         return {
           id: p.id,
           name: p.name,
+          instanceId: p.instanceId ?? null,
+          group: vg ? { key: vg.key, label: vg.label, product: vg.product, version: vg.version } : null,
           nodeCount,
           vectorCount: vc,
           embeddingModel: vc > 0 ? (lanceStats.code.model ?? null) : null,
@@ -8694,7 +8786,16 @@ export function createAdminRouter(context: AdminContext): Router {
           embeddingSelectedSidecarName: vc > 0 ? (m?.selectedSidecarName ?? null) : null,
           embeddingServedBy: vc > 0 ? (m?.servedBy ?? null) : null,
           embeddedInProcess: vc > 0 ? (m?.inProcess ?? null) : null,
-          embeddedAt: vc > 0 ? (m?.embeddedAt ?? null) : null,
+          // "Last run" follows the slot whose rows are being counted. While a
+          // shadow rebuild is running the row counts come from the SHADOW,
+          // but the meta record is only written when a project's shadow rows
+          // are complete — so a project still being written showed its old
+          // live-table date ("13d ago") next to its new shadow count, and the
+          // date flipped on every restart as counting switched slot. A
+          // record older than the running rebuild is not this run's date.
+          embeddedAt: vc > 0 && m?.embeddedAt && !(shadowBuilding && rebuildStartedAt && Date.parse(m.embeddedAt) < rebuildStartedAt)
+            ? m.embeddedAt
+            : null,
         };
       });
       // Headline reconciles with the rows BY CONSTRUCTION (sum of the same
@@ -9106,7 +9207,9 @@ export function createAdminRouter(context: AdminContext): Router {
           `MATCH (n:CodeNode) WHERE n.project_id = ${pid} RETURN n.id AS id, n.name AS name, n.qualified_name AS qualifiedName, n.signature AS signature, n.documentation AS documentation, n.node_type AS nodeType, n.file_path AS filePath, n.line_start AS lineStart, n.line_end AS lineEnd`
         );
         // v3: context pre-pass (paged, per project) → chunk items → file/project rows.
-        const context = await buildEmbeddingContext(pid, allNodes);
+        // v4: LLM `about:` context per node in front of the graph line.
+        const { withLlmContext } = await import('../embedding/semanticSearchService.js');
+        const context = await withLlmContext(pid, allNodes, await buildEmbeddingContext(pid, allNodes));
         const workItems = [
           ...buildEmbeddingItems(allNodes, context),
           ...await buildSyntheticItems(prisma, pid, allNodes).catch(() => []),
@@ -9202,6 +9305,30 @@ export function createAdminRouter(context: AdminContext): Router {
       }
       throw e;
     }
+    // Under "OpenRouter only" the job dies at its first project when no cloud
+    // lane has passed the gate — which is the state right after a boot, when
+    // the lanes re-verify in the background. Three resumes in a row died that
+    // way on 2026-09-29. Run the gate pass NOW (single-flight, ~30 s) and
+    // refuse with a clear 425 instead of starting a job that cannot run.
+    try {
+      const { embeddingRoutingPolicy } = await import('../embedding/providers/embeddingProvider.js');
+      if (!(await embeddingRoutingPolicy('code')).localServes) {
+        const { runReverify } = await import('../embedding/providers/cloudReverify.js');
+        const { listVerifications } = await import('../embedding/providers/vectorCompatibility.js');
+        const cleared = () => listVerifications().filter(v => v.ok && /CodeEmbedding/.test(v.providerName)).length;
+        if (cleared() === 0) await runReverify('re-embed start');
+        if (cleared() === 0) {
+          releaseHeavy?.();
+          res.status(425).json({
+            error: '[openrouter-only] no OpenRouter-backed code-embedding provider has passed the vector-compatibility '
+              + 'gate yet — see /admin/sidecars/virtual/verification. Retry once a lane is verified.',
+          });
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn(`[reembed-job] pre-start gate check skipped: ${(e as Error).message}`);
+    }
     // A resume supersedes the paused job it continues, so the UI stops
     // offering Resume against a slot this run now owns.
     const pausedJob = findPausedJob();
@@ -9214,6 +9341,8 @@ export function createAdminRouter(context: AdminContext): Router {
     queueMicrotask(async () => {
       const { setShadowReembedActive } = await import('../embedding/embedGate.js');
       const isAll = job.scope === 'all';
+      // Hoisted: the finally block clears the right flag (live vs shadow).
+      const liveAll = isAll && req.body?.live === true;
       let shadowName: string | null = null;
       let promoted = false;
       // Set only when finalizeHalt has already DISCARDED the slot, so the
@@ -9291,7 +9420,6 @@ export function createAdminRouter(context: AdminContext): Router {
         // gone or unusable (model changed), search improves as rows land
         // instead of only at the end. Requires the active slot to be at the new
         // dims (it is recreated empty when the dims differ).
-        const liveAll = isAll && req.body?.live === true;
         // { resume: true } — reuse a shadow left behind by an interrupted run
         // (restart/deploy) and skip the projects already embedded into it.
         const wantResume = isAll && !liveAll && req.body?.resume === true;
@@ -9304,7 +9432,7 @@ export function createAdminRouter(context: AdminContext): Router {
           resumedShadow = shadow.resumed;
           updateJob(job.id, { resumed: shadow.resumed, shadowTable: shadow.name });
         } else if (liveAll) {
-          setShadowReembedActive(true); // keep the watchdog out of the way
+          setShadowReembedActive(true, 'live'); // keep the watchdog out of the way; stats count the ACTIVE slot
           if (storedDims && storedDims !== newDims) {
             await dropCodeVectorsTable();
             if (typeof resetVectorStore === 'function') resetVectorStore();
@@ -9354,6 +9482,26 @@ export function createAdminRouter(context: AdminContext): Router {
             resumeCounts = null;
             resumeNodes = null;
           }
+        } else if (liveAll && !(storedDims && storedDims !== newDims)) {
+          // LIVE fill of the active slot at the SAME width: the same survey
+          // against the live table. Without it every restart of the fill
+          // deleted and rewrote projects that were already complete — five
+          // workers busy on 100%-covered rows (the dashboard showed them
+          // "embedding" at 100%) while the real gaps waited (2026-09-29).
+          // A width change is excluded: the table was just dropped, nothing
+          // in it is complete.
+          try {
+            const { getProjectNodeCounts } = await import('../graph/projectNodeCounts.js');
+            resumeCounts = await vectorStore.countByProject();
+            resumeNodes = await getProjectNodeCounts(projectIds);
+            const complete = projectIds.filter(id =>
+              (resumeNodes!.get(id) ?? 0) > 0 && (resumeCounts!.get(id) ?? 0) >= (resumeNodes!.get(id) ?? 0)).length;
+            console.log(`[reembed-job] live fill: ${complete}/${projectIds.length} projects already complete in the active table — skipping them`);
+          } catch (e) {
+            console.warn(`[reembed-job] live survey failed, embedding everything: ${(e as Error).message}`);
+            resumeCounts = null;
+            resumeNodes = null;
+          }
         }
 
         // ── Project-level work queue ───────────────────────────────────────
@@ -9382,7 +9530,10 @@ export function createAdminRouter(context: AdminContext): Router {
           let storedVectors = 0;
           const halt = haltRequested(job.id);
           if (halt) { halted = halt; return; }
-          updateJob(job.id, { currentProjectId: pid });
+          updateJob(job.id, {
+            currentProjectId: pid,
+            activeProjectIds: [...(getJob(job.id)?.activeProjectIds ?? []), pid],
+          });
 
           // RESUME: skip a project the surviving shadow already covers, and
           // clear a half-written one so it is rebuilt cleanly.
@@ -9478,7 +9629,9 @@ export function createAdminRouter(context: AdminContext): Router {
             // chunk expansion (long symbols → several rows), plus one `kind: file`
             // row per file and one `kind: project` row. This is the path that
             // builds a FRESH table (shadow), so the v3 columns are present here.
-            const context = await buildEmbeddingContext(pid, allNodes);
+            // v4: LLM `about:` context per node in front of the graph line.
+            const { withLlmContext } = await import('../embedding/semanticSearchService.js');
+            const context = await withLlmContext(pid, allNodes, await buildEmbeddingContext(pid, allNodes));
             const workItems = [
               ...buildEmbeddingItems(allNodes, context),
               ...await buildSyntheticItems(prisma, pid, allNodes).catch(() => []),
@@ -9660,7 +9813,11 @@ export function createAdminRouter(context: AdminContext): Router {
             // round-robin permits BETWEEN projects: without this every waiter
             // lands in one FIFO and the largest project starves the rest.
             try { await runWithCloudBudgetProject(pid, () => runProject(pid)); }
-            finally { queue.release(pid); }   // released on success AND failure
+            finally {
+              queue.release(pid);   // released on success AND failure
+              const cur = getJob(job.id);
+              updateJob(job.id, { activeProjectIds: (cur?.activeProjectIds ?? []).filter(id => id !== pid) });
+            }
           }
         }));
 
@@ -9688,6 +9845,17 @@ export function createAdminRouter(context: AdminContext): Router {
           const rows = await writeTable.countRows().catch(() => 0);
           const decision = decidePromotion(done, projectIds.length, rows);
           if (decision.promote) {
+            // Indexes are a property of the table: build both on the shadow
+            // BEFORE the flip so the first query after promotion is served by
+            // the ANN and the BM25 leg, not by scans.
+            try {
+              const { ensureCodeVectorIndex, ensureCodeTextIndex } = await import('../embedding/lanceConnection.js');
+              const ann = await ensureCodeVectorIndex(writeTable, { label: shadowName, rows });
+              const fts = await ensureCodeTextIndex(writeTable, { label: shadowName });
+              console.log(`[reembed-job] shadow '${shadowName}' indexes: ann=${ann.reason}; fts=${fts.reason}`);
+            } catch (e) {
+              console.warn(`[reembed-job] index build on shadow failed (promoting anyway): ${(e as Error).message}`);
+            }
             await promoteCodeTable(shadowName);
             promoted = true;
           } else {
@@ -9717,7 +9885,7 @@ export function createAdminRouter(context: AdminContext): Router {
             console.log(`[reembed-job] shadow '${shadowName}' kept with ${rows} row(s) — restart with {projectId:0, resume:true} to continue`);
           } catch { /* best effort */ }
         }
-        if (isAll) setShadowReembedActive(false);
+        if (isAll) setShadowReembedActive(false, liveAll ? 'live' : 'shadow');
         releaseHeavy?.();
       }
     });
@@ -9769,19 +9937,25 @@ export function createAdminRouter(context: AdminContext): Router {
       const { listJobs } = await import('./reembedJobs.js');
       const job = listJobs().find(j => j.status === 'running' || j.status === 'queued');
       if (job) {
-        let currentProjectName: string | undefined;
-        if (typeof job.currentProjectId === 'number') {
+        // Names for EVERY in-flight project. The pool runs several at once and
+        // `currentProjectId` is only the last one claimed, so the page named a
+        // project that was often already finished while others ran unseen.
+        const activeIds = job.activeProjectIds?.length ? job.activeProjectIds : (typeof job.currentProjectId === 'number' ? [job.currentProjectId] : []);
+        let activeProjects: Array<{ id: number; name: string }> = activeIds.map(id => ({ id, name: `#${id}` }));
+        if (activeIds.length) {
           try {
             const { getPrismaClient } = await import('../db/prisma.js');
-            const p = await getPrismaClient().fantomProject.findUnique({ where: { id: job.currentProjectId }, select: { name: true } });
-            currentProjectName = p?.name;
-          } catch { /* name is cosmetic */ }
+            const rows = await getPrismaClient().fantomProject.findMany({ where: { id: { in: activeIds } }, select: { id: true, name: true } });
+            const byId = new Map(rows.map(r => [r.id, r.name]));
+            activeProjects = activeIds.map(id => ({ id, name: byId.get(id) ?? `#${id}` }));
+          } catch { /* names are cosmetic */ }
         }
+        const currentProjectName = activeProjects.find(p => p.id === job.currentProjectId)?.name ?? activeProjects[0]?.name;
         const scopeLabel = job.scope === 'all' ? 'full' : `project ${job.scope.projectId}`;
         status.reembedJob = {
           id: job.id, scope: job.scope, status: job.status, startedAt: job.startedAt,
           totalProjects: job.totalProjects, doneProjects: job.doneProjects,
-          currentProjectId: job.currentProjectId, currentProjectName,
+          currentProjectId: job.currentProjectId, currentProjectName, activeProjects,
           generated: job.generated, deleted: job.deleted, errors: job.errors.length,
           model: job.model, dimensions: job.dimensions, cancelRequested: job.cancelRequested,
         };
@@ -10307,8 +10481,20 @@ export function createAdminRouter(context: AdminContext): Router {
     const vectorsByProject = await vectorStore.countByProject();
     reCrash(`VECTORS_COUNT_OK projects=${vectorsByProject.size} ms=${Date.now() - t1}`);
 
+    // Denominator = the per-project GRAPH node count, the same source the
+    // dashboard and the re-embed survey use. Prisma's function+type counts
+    // run high (project 27: Prisma 957, graph 632, vectors 632), so against
+    // Prisma every project looked short and a "fill 6 gaps" pass walked all
+    // 318 projects, each finding nothing (2026-09-29). Fall back to Prisma
+    // only for a project whose graph reports nothing.
+    const { getProjectNodeCountsNonBlocking } = await import('../graph/projectNodeCounts.js');
+    const { counts: graphCounts } = getProjectNodeCountsNonBlocking(projects.map(p => p.id));
     const incomplete = projects
-      .map(p => ({ id: p.id, nodes: (p.functionCount ?? 0) + (p.typeCount ?? 0), vectors: vectorsByProject.get(p.id) ?? 0 }))
+      .map(p => {
+        const graphN = graphCounts.get(p.id) ?? 0;
+        const nodes = graphN > 0 ? graphN : (p.functionCount ?? 0) + (p.typeCount ?? 0);
+        return { id: p.id, nodes, vectors: vectorsByProject.get(p.id) ?? 0 };
+      })
       .filter(p => p.nodes > 0 && p.vectors < p.nodes)
       .map(p => p.id);
     reCrash(`INCOMPLETE_PROJECTS count=${incomplete.length} ids=[${incomplete.slice(0, 20).join(',')}${incomplete.length > 20 ? `,…+${incomplete.length - 20}` : ''}]`);
@@ -10482,7 +10668,10 @@ export function createAdminRouter(context: AdminContext): Router {
         label: getActiveCodeTableName(),
         force: req.body?.force === true,
       });
-      res.json({ table: getActiveCodeTableName(), ...out });
+      // v4: the BM25 index rides along; a no-op on a pre-v4 table.
+      const { ensureCodeTextIndex } = await import('../embedding/lanceConnection.js');
+      const fts = await ensureCodeTextIndex(table, { label: getActiveCodeTableName(), force: req.body?.force === true });
+      res.json({ table: getActiveCodeTableName(), ...out, fts });
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'index build failed' });
     }
@@ -11629,7 +11818,7 @@ export function createAdminRouter(context: AdminContext): Router {
 
     const { catalogueFor, modelHint, optionLabel, ROLE_LOCAL, CODE_TABLE_DIMS,
       RLM_CATALOGUE, RLM_FALLBACK_MODES, DEFAULT_RLM_SANDBOX_MODEL, DEFAULT_RLM_FALLBACK_MODE,
-      rlmOptionLabel, isRlmCapable } =
+      rlmOptionLabel, isRlmCapable, availableDirectRlmModels, directRlmOptionLabel } =
       await import('../sidecars/openRouterModels.js');
     const { allActivity, spendTodayTotal, getDailyCaps } = await import('../sidecars/openRouterActivity.js');
     const {
@@ -11645,7 +11834,7 @@ export function createAdminRouter(context: AdminContext): Router {
       isDefault: !hasAny,
       keyPushed: stored.keyPushed === true,
       keyLast4: stored.keyLast4 ?? null,
-      issues: validateOpenRouterSettings(settings, { hasKey: false }),
+      issues: validateOpenRouterSettings(settings, { hasKey: false, codeDimensions: context.getSettings()?.semanticSearch?.codeDimensions }),
       masterWsPort: readMasterWsPort(),
       masterServerUrl: getVirtualContainersConfig().masterServerUrl ?? null,
       slots: getSlotStatus(),
@@ -11703,7 +11892,18 @@ export function createAdminRouter(context: AdminContext): Router {
         // "<Label> · <dims>d [· drop-in] [· text-only]" — no provider name.
         // `dims` rides along unrendered so the panel can compare the chosen
         // model against the table's locked width without parsing the label.
-        options: catalogueFor(role).map(m => ({ id: m.id, label: optionLabel(role, m), dims: m.dims })),
+        options: [
+          ...catalogueFor(role).map(m => ({ id: m.id, label: optionLabel(role, m), dims: m.dims })),
+          // The chat roles also offer provider-direct models — the provider's
+          // own API with the key from the LLM Providers page, no sidecar and
+          // no OpenRouter. Listed only while that key is present, so the
+          // dropdown never shows a choice that fails at call time. This is
+          // the list the panel RENDERS (it maps `catalogue[].options`, not
+          // `rlm.options`), so the entries must be here.
+          ...(role === 'rlm' || role === 'code-assistant'
+            ? availableDirectRlmModels().map(m => ({ id: m.id, label: directRlmOptionLabel(m), dims: undefined }))
+            : []),
+        ],
         hint: modelHint(role),
         // A role the sidecar can be CONFIGURED for but cannot yet SERVE. The
         // setting pushes and reports like any other; nothing issues the
@@ -11738,6 +11938,8 @@ export function createAdminRouter(context: AdminContext): Router {
             ? [{ id: stored.rlmSandboxModel, label: `${stored.rlmSandboxModel} — currently saved, not in the tools+reasoning list` }]
             : []),
           ...RLM_CATALOGUE.map(m => ({ id: m.id, label: rlmOptionLabel(m) })),
+          // Provider-direct models — same entries the catalogue carries.
+          ...availableDirectRlmModels().map(m => ({ id: m.id, label: directRlmOptionLabel(m) })),
         ],
         modeOptions: RLM_FALLBACK_MODES,
         hint: `The RLM loop plans, calls a tool, reads the result and decides what to ask next over several `
@@ -11879,7 +12081,7 @@ export function createAdminRouter(context: AdminContext): Router {
       }
     }
 
-    const issues = validateOpenRouterSettings(settings, { hasKey: !!apiKey });
+    const issues = validateOpenRouterSettings(settings, { hasKey: !!apiKey, codeDimensions: context.getSettings()?.semanticSearch?.codeDimensions });
     if (issues.length > 0 && body.force !== true) {
       res.status(400).json({
         error: 'Configuration would not work as written. Fix the issues, or re-send with {"force":true} to push anyway.',
@@ -12035,7 +12237,7 @@ export function createAdminRouter(context: AdminContext): Router {
       const { listVirtualContainers } = await import('../sidecars/virtualContainers.js');
       const { selectAllEmbeddingProviders, embeddingRoutingPolicy } =
         await import('../embedding/providers/embeddingProvider.js');
-      const { verifyVectorCompatibility, localReference, cloudReference, selectCloudReference } =
+      const { verifyVectorCompatibility, localReference, cloudReference, selectCloudReferences } =
         await import('../embedding/providers/vectorCompatibility.js');
       const settings = context.getSettings();
       const expectedDims = settings.semanticSearch?.codeDimensions ?? 2560;
@@ -12051,9 +12253,10 @@ export function createAdminRouter(context: AdminContext): Router {
         // Anchor order, so this reports the same pairing the fan-out will use.
         const ordered = [...rows].sort((a, b) => a.providerName.localeCompare(b.providerName));
         for (const vc of ordered) {
-          const peer = selectCloudReference(vc, ordered);
+          const [peer, ...rest] = selectCloudReferences(vc, ordered);
           reports.push(await verifyVectorCompatibility(
-            vc, peer ? cloudReference(peer) : null, expectedDims, { regime: 'cloud-ref' },
+            vc, peer ? cloudReference(peer) : null, expectedDims,
+            { regime: 'cloud-ref', fallbackReferences: rest.map(cloudReference) },
           ));
         }
         res.json({
@@ -12361,6 +12564,14 @@ export function createAdminRouter(context: AdminContext): Router {
         apiKey: maskKey(process.env.GEMINI_API_KEY),
         hasKey: !!process.env.GEMINI_API_KEY,
       },
+      // TypeSafe Jev routes work (RLM on/off per question); it never writes the
+      // answer, so it is not a `defaultProvider` candidate.
+      typesafe: {
+        enabled: cfg.typesafe?.enabled ?? false,
+        model: cfg.typesafe?.model ?? null,
+        apiKey: maskKey(process.env.TYPESAFE_API_KEY),
+        hasKey: !!process.env.TYPESAFE_API_KEY,
+      },
     });
   });
 
@@ -12382,6 +12593,22 @@ export function createAdminRouter(context: AdminContext): Router {
     if (body.groq?.apiKey) setEnvVar('GROQ_API_KEY', body.groq.apiKey);
     if (body.anthropic?.apiKey) setEnvVar('ANTHROPIC_API_KEY', body.anthropic.apiKey);
     if (body.gemini?.apiKey) setEnvVar('GEMINI_API_KEY', body.gemini.apiKey);
+    if (body.typesafe?.apiKey) setEnvVar('TYPESAFE_API_KEY', body.typesafe.apiKey);
+    // A key the process only has from the launching shell (~/.zshrc) is lost
+    // on the next launchd/PM2 start. Saving with a provider ENABLED and no key
+    // typed persists the env value into .env so the setting survives a
+    // restart from any launcher. Never overwrites a key already in .env.
+    for (const [name, on] of [
+      ['GROQ_API_KEY', !!body.groq?.enabled],
+      ['ANTHROPIC_API_KEY', !!body.anthropic?.enabled],
+      ['GEMINI_API_KEY', !!body.gemini?.enabled],
+      ['TYPESAFE_API_KEY', !!body.typesafe?.enabled],
+    ] as const) {
+      if (!on || !process.env[name]) continue;
+      if (new RegExp(`^${name}=.+$`, 'm').test(envContent)) continue;
+      setEnvVar(name, process.env[name]);
+      console.log(`[llm-providers] ${name} came from the process environment only — persisted to .env`);
+    }
     fs.writeFileSync(envPath, envContent);
 
     const llmProviders: any = {
@@ -12389,6 +12616,7 @@ export function createAdminRouter(context: AdminContext): Router {
       groq: { enabled: !!body.groq?.enabled, model: body.groq?.model },
       anthropic: { enabled: !!body.anthropic?.enabled, model: body.anthropic?.model },
       gemini: { enabled: !!body.gemini?.enabled, model: body.gemini?.model },
+      typesafe: { enabled: !!body.typesafe?.enabled, model: body.typesafe?.model },
     };
     await context.updateSettings({ llmProviders } as any);
     res.json({ success: true, restartRequired: false });

@@ -132,6 +132,64 @@ describe('embedTextsPipelined', () => {
     expect(res.errors.length).toBeGreaterThan(0);
   });
 
+  test('a lane parked by one bad first sample is re-probed and rejoins', async () => {
+    // A fast lane, plus a lane whose FIRST request is very slow (a timed-out
+    // probe) but which is healthy after that. Without the re-probe, the slow
+    // memo (≪ 5% of best) parks it for the whole run.
+    const texts = Array.from({ length: 3000 }, (_, i) => `t${i}`);
+    const fast = new MockProvider({ name: 'fast', overhead: 5, perText: 1, serialize: false });
+    const healed = new MockProvider({ name: 'healed', overhead: 5, perText: 1, serialize: false });
+    let first = true;
+    const orig = healed.embedBatch.bind(healed);
+    healed.embedBatch = async (chunk: string[]) => {
+      if (first) { first = false; await sleep(400); } // one awful sample
+      return orig(chunk);
+    };
+    const logs: string[] = [];
+    const res = await embedTextsPipelined([fast, healed], texts, {
+      depth: 2, targetChunkMs: 100, probeChunk: 4, reprobeEvery: 5, log: m => logs.push(m),
+    });
+    expect(res.failed).toBe(0);
+    expect(logs.some(l => /healed re-probed with/.test(l))).toBe(true);
+    // After the re-probe the healed lane does real work — well beyond its
+    // two 4-text probes — because the fresh sample replaces the bad one.
+    expect(res.servedBy.healed).toBeGreaterThan(100);
+  }, 30_000);
+
+  test('a 429 from upstream re-queues the chunk but never drops the lane', async () => {
+    const texts = Array.from({ length: 200 }, (_, i) => `t${i}`);
+    const busy = new MockProvider({ name: 'busy', overhead: 5, perText: 1, serialize: false });
+    const good = new MockProvider({ name: 'good', overhead: 5, perText: 1, serialize: false });
+    let n = 0;
+    const orig = busy.embedBatch.bind(busy);
+    busy.embedBatch = async (chunk: string[]) => {
+      n++;
+      if (n <= 3) throw new Error('OpenRouter /embeddings failed: 429 {"error":{"message":"Model busy, retry later"}}');
+      return orig(chunk);
+    };
+    const logs: string[] = [];
+    const res = await embedTextsPipelined([busy, good], texts, { depth: 2, targetChunkMs: 100, probeChunk: 4, log: m => logs.push(m) });
+    expect(res.failed).toBe(0);
+    expect(logs.some(l => /busy dropped/.test(l))).toBe(false);
+    expect(logs.filter(l => /busy chunk of \d+ rate-limited upstream/.test(l)).length).toBe(3);
+    expect(res.servedBy.busy).toBeGreaterThan(0);
+  }, 20_000);
+
+  test('a gate refusal that quotes a 429 still drops the lane', async () => {
+    const texts = Array.from({ length: 40 }, (_, i) => `t${i}`);
+    const refused = new MockProvider({ name: 'refused', overhead: 5, perText: 1, serialize: false });
+    const good = new MockProvider({ name: 'good', overhead: 5, perText: 1, serialize: false });
+    refused.embedBatch = async () => {
+      throw new Error('[vector-gate] refused-OR-CodeEmbedding is not cleared to embed (probe-failed: OpenRouter /embeddings failed: 429 {"error":{"message":"Model busy"}})');
+    };
+    const logs: string[] = [];
+    const res = await embedTextsPipelined([refused, good], texts, { depth: 2, targetChunkMs: 100, probeChunk: 4, log: m => logs.push(m) });
+    expect(res.failed).toBe(0);
+    expect(logs.some(l => /refused dropped after/.test(l))).toBe(true);
+    expect(logs.filter(l => /rate-limited upstream/.test(l)).length).toBe(0);
+    expect(res.servedBy.good).toBe(texts.length);
+  });
+
   test('reports texts as failed when every provider is gone', async () => {
     const bad = new MockProvider({ name: 'bad', overhead: 1, perText: 1, serialize: false, failEvery: 1 });
     const res = await embedTextsPipelined([bad], ['a', 'b', 'c'], { maxConsecutiveFailures: 1 });

@@ -557,7 +557,7 @@ async function selectVerifiedCloudProviders(
   const { listVirtualContainers, getVirtualContainersConfig } =
     await import('../../sidecars/virtualContainers.js');
   const { VirtualEmbeddingProvider } = await import('./virtualEmbeddingProvider.js');
-  const { ensureVerified, cloudReference, selectCloudReference } = await import('./vectorCompatibility.js');
+  const { ensureVerified, cloudReference, selectCloudReferences } = await import('./vectorCompatibility.js');
 
   if (getVirtualContainersConfig().enabled !== true) {
     return { providers: [], failure: 'openrouter-disabled' };
@@ -599,8 +599,8 @@ async function selectVerifiedCloudProviders(
   // verified yet — first boot — do we wait, or there would be no encoder.
   const anyCleared = ordered.some(vc => isClearedToEmbed(keyOf(vc)));
   const verify = (vc: VirtualContainer): Promise<boolean> => {
-    const peer = selectCloudReference(vc, ordered);
-    return ensureVerified(vc, peer ? cloudReference(peer) : null, expectedDims, 'cloud-ref');
+    const [peer, ...rest] = selectCloudReferences(vc, ordered);
+    return ensureVerified(vc, peer ? cloudReference(peer) : null, expectedDims, 'cloud-ref', rest.map(cloudReference));
   };
   const checked = await Promise.all(ordered.map(async vc => {
     try {

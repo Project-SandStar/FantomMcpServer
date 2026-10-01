@@ -51,10 +51,19 @@ import * as path from 'path';
  *       Requires a FULL re-embed: the chunk/line columns only exist on a
  *       freshly created LanceDB table (the shadow-swap path creates one).
  */
-export const EMBED_TEXT_VERSION = 3;
+/**
+ * 4 (2026-09-29): contextual retrieval. Each row also stores its embed `text`
+ * (BM25 over it via a LanceDB FTS index, fused as a third list), and the
+ * context line may open with an LLM-written `about:` sentence
+ * (embedContextualizer.ts). Same chunking as v3; a v3 table keeps working
+ * (no `text` column → no BM25 leg) until the full shadow re-embed builds a v4 one.
+ */
+export const EMBED_TEXT_VERSION = 4;
 
 /** True when the v3 layout (chunks, context, kind label, file/project rows) is active. */
 export const EMBED_TEXT_V3 = EMBED_TEXT_VERSION >= 3;
+/** True when rows carry their embed text (BM25 column) and may carry LLM context. */
+export const EMBED_TEXT_V4 = EMBED_TEXT_VERSION >= 4;
 
 export interface EmbeddingTextNode {
   qualifiedName: string;

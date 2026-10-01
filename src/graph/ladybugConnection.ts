@@ -188,7 +188,10 @@ export async function getLadybugConnection(): Promise<InstanceType<typeof Connec
     const mainBufMiB = Number(process.env.FANTOM_LADYBUG_BUFFER_MIB);
     const MAIN_BUFFER_SIZE = (Number.isFinite(mainBufMiB) && mainBufMiB > 0 ? mainBufMiB : 512) * 1024 * 1024;
     const MAIN_DB_MAX_SIZE = 8 * 1024 * 1024 * 1024; // 8 GiB sparse mmap cap
-    database = new Database(dbPath, MAIN_BUFFER_SIZE, true, false, MAIN_DB_MAX_SIZE);
+    // autoCheckpoint off for the same reason as the per-project stores: the
+    // engine's in-query checkpoint is the writer in every SIGSEGV stack; we
+    // CHECKPOINT explicitly before close.
+    database = new Database(dbPath, MAIN_BUFFER_SIZE, true, false, MAIN_DB_MAX_SIZE, false);
     await database.init();
     connection = new Connection(database);
     await connection.init();

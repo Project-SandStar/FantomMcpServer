@@ -58,6 +58,14 @@ export interface PipelineOptions {
   maxConsecutiveFailures?: number;
   /** Multiplier on the pool's remaining ETA above which a slow provider declines a chunk (default 1.5). */
   endgameFactor?: number;
+  /**
+   * A provider parked as "too slow" gets one fresh probe chunk after this many
+   * chunks were dispatched to the others (default 20). Its memo is the only
+   * thing that can rehabilitate it, and only a completed chunk updates the
+   * memo — without this, one timed-out first sample (the Mac lanes, 0.7 t/s
+   * from a 15 s probe) parked a healthy lane for the whole 262k-row run.
+   */
+  reprobeEvery?: number;
   now?: () => number;
   log?: (msg: string) => void;
 }
@@ -133,7 +141,12 @@ export async function embedTextsPipelined(
   const minRateRatio = opts.minRateRatio ?? 0.05;
   const maxFailures = Math.max(1, opts.maxConsecutiveFailures ?? 2);
   const endgameFactor = opts.endgameFactor ?? 1.5;
+  const reprobeEvery = Math.max(1, Math.floor(opts.reprobeEvery ?? 20));
   const log = opts.log ?? (() => {});
+  // Chunks dispatched to anyone, and per-provider the count at which it was
+  // last skipped as too slow — the gap between them is its wait.
+  let dispatched = 0;
+  const parkedAt = new Map<string, number>();
 
   const result: PipelineResult = {
     vectors: new Array<Float32Array | undefined>(texts.length).fill(undefined),
@@ -244,11 +257,26 @@ export async function embedTextsPipelined(
         s.activeSince = null;
       }
       if (err) {
-        s.consecutiveFailures++;
         const msg = err instanceof Error ? err.message : String(err);
+        // A 429 is the UPSTREAM saying busy (DeepInfra: "Model busy, retry
+        // later"), not this lane being broken — every lane reaches the same
+        // upstream. Counting it toward the drop threshold banned the Mac
+        // lane five times in two projects on 2026-09-29 while the other
+        // lanes carried on against the same host. Re-queue the chunk, do
+        // not advance the failure count; the cloud budget already backs off.
+        // NOT a gate refusal: "[vector-gate] X is not cleared to embed (probe-failed: …429…)"
+        // quotes the 429 that failed its probe, but the lane itself is
+        // refused and will keep failing — counting that as rate-limited
+        // re-queued the same chunk forever, and the log lines from that loop
+        // took the process to the V8 heap limit (2026-09-29, 13:25).
+        const gateRefused = /not cleared to embed|\[vector-gate\]/i.test(msg);
+        const rateLimited = !gateRefused && /\b429\b|rate.?limit|Model busy|engine_overloaded/i.test(msg);
+        if (!rateLimited) s.consecutiveFailures++;
         result.errors.push(`${s.name}: ${msg.split('\n')[0].slice(0, 200)}`);
         queue.unshift(...indices);
-        if (s.consecutiveFailures >= maxFailures) {
+        if (rateLimited) {
+          log(`provider ${s.name} chunk of ${chunk.length} rate-limited upstream, re-queued (${msg.split('\n')[0].slice(0, 120)})`);
+        } else if (s.consecutiveFailures >= maxFailures) {
           s.dropped = true;
           log(`provider ${s.name} dropped after ${s.consecutiveFailures} consecutive failures (${msg.split('\n')[0].slice(0, 120)})`);
         } else {
@@ -298,23 +326,46 @@ export async function embedTextsPipelined(
         // Depth: unknown-rate providers probe with one request; only providers
         // close to the best may pipeline.
         let allowed = 1;
+        let reprobe = false;
         if (thr !== undefined && best !== undefined) {
-          if (thr < best * minRateRatio && live.length > 1) continue; // too slow to be worth a chunk
-          allowed = thr >= best * slowDepthRatio ? depth : 1;
+          if (thr < best * minRateRatio && live.length > 1) {
+            // Too slow to be worth a chunk — unless it has waited long enough
+            // for a fresh sample. One probe-sized chunk, depth 1; a good
+            // completion lifts its memo and it rejoins on merit.
+            const since = parkedAt.get(s.key);
+            if (since === undefined) { parkedAt.set(s.key, dispatched); continue; }
+            if (dispatched - since < reprobeEvery || s.inFlight > 0) continue;
+            reprobe = true;
+          } else {
+            allowed = thr >= best * slowDepthRatio ? depth : 1;
+          }
         }
         if (s.inFlight >= allowed) continue;
-        let k = rr ? clamp(Math.round(rr * targetChunkMs / 1000), minChunk, maxChunk) : probeChunk;
+        let k = reprobe
+          ? probeChunk
+          : rr ? clamp(Math.round(rr * targetChunkMs / 1000), minChunk, maxChunk) : probeChunk;
         k = Math.min(k, queue.length);
         // End-game: do not let a slow provider take a chunk that would outlast
         // what the pool needs for everything that is left (plus the chunk the
-        // best provider would take).
-        if (thr !== undefined && best !== undefined && thr < best && poolRate) {
+        // best provider would take). A re-probe is exempt: its whole point is
+        // a sample, and it is one small chunk.
+        if (!reprobe && thr !== undefined && best !== undefined && thr < best && poolRate) {
           const remaining = queue.length + totalInFlight();
           const poolEtaS = remaining / poolRate;
           const myEtaS = k / thr;
           if (myEtaS > endgameFactor * poolEtaS + 0.5) continue;
         }
+        if (reprobe) {
+          parkedAt.set(s.key, dispatched);
+          // A fresh sample, not an average with the bad one: the in-run rate
+          // is done/busy, and one 15 s timeout in `busy` would keep the lane
+          // under the floor for dozens more probes.
+          s.done = 0;
+          s.busyMs = 0;
+          log(`provider ${s.name} re-probed with ${k} text(s) after ${reprobeEvery} chunks parked (memo ${(thr ?? 0).toFixed(1)}/s vs best ${(best ?? 0).toFixed(1)}/s)`);
+        }
         const indices = queue.splice(0, k);
+        dispatched++;
         dispatch(s, indices);
         progressed = true;
       }

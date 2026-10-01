@@ -10,8 +10,9 @@ export interface ModelOption {
 export const PROVIDER_MODELS: Record<LLMProviderName, ModelOption[]> = {
   anthropic: [
     { id: 'claude-fable-5-1', label: 'Claude Fable 5.1', family: 'fable', recommended: true },
-    { id: 'claude-opus-5', label: 'Claude Opus 5', family: 'opus' },
-    { id: 'claude-sonnet-5', label: 'Claude Sonnet 5', family: 'sonnet' },
+    { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', family: 'opus' },
+    { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', family: 'sonnet' },
+    { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', family: 'haiku' },
   ],
   groq: [
     { id: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B Versatile', family: 'llama', recommended: true },
@@ -25,7 +26,9 @@ export const PROVIDER_MODELS: Record<LLMProviderName, ModelOption[]> = {
   gemini: [
     { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', family: 'gemini-3.8', recommended: true },
     { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash', family: 'gemini-3.7' },
+    { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash', family: 'gemini-3.6' },
     { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', family: 'gemini-3.5' },
+    { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite', family: 'gemini-3.5' },
     { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro (preview)', family: 'gemini-3.1' },
   ],
 };

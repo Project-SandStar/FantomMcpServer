@@ -702,6 +702,8 @@ export class FantomDatabase {
    */
   async createProject(input: CreateProjectInput): Promise<FantomProjectRecord> {
     const prisma = getPrismaClient();
+    // A new project changes the version-group map (src/projects/versionGroup.ts).
+    void import('../projects/versionGroup.js').then((m) => m.invalidateVersionGroupCache()).catch(() => {});
 
     const existing = await prisma.fantomProject.findFirst({
       where: { path: input.path },
@@ -843,6 +845,7 @@ export class FantomDatabase {
    */
   async deleteProject(id: number): Promise<boolean> {
     const prisma = getPrismaClient();
+    void import('../projects/versionGroup.js').then((m) => m.invalidateVersionGroupCache()).catch(() => {});
 
     try {
       await prisma.fantomProject.delete({

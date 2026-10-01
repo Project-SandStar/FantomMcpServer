@@ -88,9 +88,30 @@ myExt/
     lib.trio       (metadata: dis, version, depends)
     lib.xeto       (xeto spec definitions)
     funcs.xeto     (axon function specs)
+    apps.trio      (KEEP: Haystack 4 defs, apps)
+    views.trio     (KEEP: Haystack 4 defs, views)
   fan/
     MyExtFuncs.fan (extends ExtObj, @Api funcs)
 ```
+
+**A 4.0 pod carries two libs:**
+- **Xeto lib** (e.g. `hx.hvac`): functions and specs. Functions must live here now.
+- **Haystack 4 defs lib** (e.g. `hvac`): apps, views and templates. The Fresco UI
+  still reads these from defs in 4.0.
+
+Keep the defs lib in the pod. The `build.fan` index binds the two libs (see section 7).
+
+### 3a. Apps, Views and Templates
+
+- Apps, views and templates stay as Haystack 4 defs (`apps.trio`, `views.trio` etc.).
+  There is no Xeto form for them yet.
+- `convert4` converts `funcs.trio` to `funcs.xeto` only. It does not touch
+  `apps.trio` or `views.trio`. Leave those files in place.
+- Do not rewrite Axon views as Fantom views. It is not needed.
+- The app shows in the App chooser only when the system can link the Xeto lib to the
+  defs lib. Enabling the Xeto lib then also loads the defs lib.
+
+Source: SkyFoundry forum #9090 "3.1 POD Views in 4.0" (Brian Frank, 2026-09-15).
 
 ### 4. Class Naming Conventions
 
@@ -217,12 +238,24 @@ class Build : BuildPod {
     resDirs = [`lib/`]
     
     index = [
-      "ph.lib": "myPrefix.myExt",
-      "xeto.bindings": "myPrefix.myExt"
+      "ph.lib": "myExt",                // Haystack 4 defs lib name
+      "xeto.bindings": "myPrefix.myExt" // Xeto lib name
     ]
   }
 }
 ```
+
+**The two index keys name different libs:**
+- `ph.lib` = defs lib name (apps, views, templates).
+- `xeto.bindings` = Xeto lib name (functions, specs).
+
+Together they tell the system: when the Xeto lib is enabled, include the defs lib.
+Real example from the `hxHvac` pod:
+```fantom
+index = ["ph.lib":"hvac", "xeto.bindings":"hx.hvac"]
+```
+Enabling `hx.hvac` also loads the defs lib `hvac`. Without both keys, apps and views
+from the defs lib do not appear.
 
 **lib.trio (metadata):**
 ```trio
@@ -307,9 +340,9 @@ Must use `hxConn` framework (introduced in 3.1.3).
 
 ### Phase 3: Convert Extension Structure
 
-1. **Ensure using `ph.lib` indexed property:**
+1. **Keep the `ph.lib` indexed property (defs lib name):**
    ```fantom
-   index = ["ph.lib": "myco.myExt"]
+   index = ["ph.lib": "myExt"]
    ```
 
 2. **Rename main class:**
@@ -347,13 +380,15 @@ This generates:
 - `lib/funcs.xeto` - Axon function specs
 - `lib/lib.trio` - Metadata
 
+It does **not** convert `apps.trio` or `views.trio`. Keep them as defs (section 3a).
+
 ### Phase 5: Update Build File
 
 Add to `build.fan`:
 ```fantom
 index = [
-  "ph.lib": "myco.myExt",
-  "xeto.bindings": "myco.myExt"
+  "ph.lib": "myExt",              // defs lib: apps, views, templates
+  "xeto.bindings": "myco.myExt"   // xeto lib: functions
 ]
 
 resDirs = [`lib/`]  // Include lib/ resources
@@ -496,10 +531,23 @@ class MyConnExt : ConnExt {
 **Solution**:
 ```fantom
 index = [
-  "ph.lib": "myco.myExt",
+  "ph.lib": "myExt",
   "xeto.bindings": "myco.myExt"  // Add this
 ]
 ```
+
+### Issue: App or views missing after migration
+
+**Symptom**: Functions work, but the app is not in the App chooser and its views do
+not show.
+
+**Cause**: `convert4` did not move `apps.trio` / `views.trio`, and the pod does not
+bind the Xeto lib to the defs lib.
+
+**Solution**:
+1. Keep `apps.trio` and `views.trio` in the pod as Haystack 4 defs.
+2. Set both index keys: `"ph.lib": "<defs lib>"` and `"xeto.bindings": "<xeto lib>"`.
+3. Rebuild the pod and enable the Xeto lib. The defs lib loads with it.
 
 ### Issue: Can't find old extension
 
@@ -527,12 +575,54 @@ index = [
 - **docHaxall::Exts**: Extension documentation
 - **docHaxall::Namespace**: Namespace documentation
 
+## Haxall 4.0.4 → 4.0.6 Changes That Affect Migration
+
+From a source diff of `haxall-4.0.4/src` vs `haxall-4.0.6/src` (687 file-level changes).
+
+**Axon body in `funcs.xeto` changed shape (4.0.5+):**
+```xeto
+// 4.0.4: full lambda in the axon tag
+add1: Func { a: Number, b: Number, returns: Number
+  <axon:"(a, b) => a + b">
+}
+
+// 4.0.6: params live in the spec; the axon tag holds only the body
+add1: Func { a: Number, b: Number, returns: Number
+  <axon:"a + b">
+}
+```
+Multi-line bodies use the `<axon:--- ... --->` heredoc. Funcs are grouped under a
+`+Funcs { ... }` block. `convert4 fix-axon-specs <dirs>` strips the params from
+4.0.4-style specs, but does not move param defaults into the spec. Rerun
+`convert4 ext` from the original `funcs.trio` when you can.
+
+**`convert4 ext` gained options:**
+- `-types`: writes `specs.xeto` from the ext's defs (entity types, enums, slots).
+- `-doc`: converts `pod.fandoc` to `doc.md`.
+- `-all`: everything (`lib.xeto`, `funcs.xeto`, `specs.xeto`, `doc.md`).
+- Conn exts get `<connFeatures: {...}>` on the ext spec and a `hx.conn` depend.
+- Still does **not** convert `apps.trio` / `views.trio` (skips `view`, `lib:`,
+  `command:` defs on purpose).
+
+**Pod/lib layout in 4.0.6 core libs:**
+- `pod.fandoc` removed from every conn pod; `doc.md` in the xeto lib dir instead.
+- New per-lib files: `specs.xeto` (types), `skills.xeto` + `skills/` (agent skills).
+- `hxTools stub` templates: `funcs.trio`, `lib.trio`, `lib.fan`, `pod.fandoc`,
+  `skyarc.trio` templates are gone; `funcs.xeto`, `lib.xeto`, `ext.fan`,
+  `extConn.fan`, `doc.md` templates replace them. Use `hx stub` on 4.0.6 for a
+  fresh ext skeleton.
+- New exts: `hxComps`, `hxFile`, `hxRepo`, `hxSession`; `hx.hxd.file` lib is gone.
+- Axon: `AxonExpr`, `TopFn`, `AxonRpc`, `AxonCompFunc` added; `ast/Comp*`,
+  `comp/`, `template/` dirs removed from `core/axon`.
+- Xeto: `XetoIO`, JSON reader/writer, JSON Schema and OpenAPI exporters,
+  `CompanionCompiler`/`CompanionRecs`, remote repos (`xetoTools install/remote`).
+
 ## Alpha Period Notes
 
 During alpha (before full UI/rules engine):
 
-1. **Still need 3.1 defs** for:
-   - Current UI
+1. **Still need 3.1 defs** for (UI part still true in 4.0.6, see section 3a):
+   - Current UI (Fresco: apps, views, templates)
    - hxConn framework
    - Linting/validation
    - Docgen
@@ -555,8 +645,9 @@ During alpha (before full UI/rules engine):
 | `FooLib` | `FooExt` or `FooFuncs` |
 | `addExt("modbus")` | `libAdd("hx.modbus")` |
 | `libs.get("task")` | `exts.get("hx.task")` |
-| `ext.name` index | `ph.lib` index |
+| `ext.name` index | `ph.lib` (defs lib) + `xeto.bindings` (xeto lib) |
 | Funcs in database | Funcs in lib/funcs.xeto |
+| `apps.trio` / `views.trio` | Unchanged: stay as defs |
 | Settings in database | Settings in ns/settings.trio |
 | `@Axon` facet | `@Api` facet |
 | `ProjTest` | `HxTest` |

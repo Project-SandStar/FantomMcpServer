@@ -13,7 +13,7 @@ import * as path from 'node:path';
 import { createLogger } from '../utils/index.js';
 import { DEFAULT_DIMENSIONS } from './embeddingService.js';
 import { getCachePath } from '../utils/installRoot.js';
-import { EMBED_TEXT_V3 } from './embeddingText.js';
+import { EMBED_TEXT_V3, EMBED_TEXT_V4 } from './embeddingText.js';
 
 const logger = createLogger('lance-connection');
 
@@ -115,8 +115,61 @@ function writeActiveCodeTableName(name: string): void {
  *                              can be turned into search results
  */
 export const CODE_TABLE_V3_COLUMNS = ['row_id', 'chunk_index', 'chunk_count', 'line_start', 'line_end', 'qualified_name', 'file_path'] as const;
+/** v4 adds the embed text itself, so BM25 (LanceDB FTS) can run over the same
+ *  words the vector was built from. Only tables created by a v4 build have it. */
+export const CODE_TABLE_V4_COLUMNS = [...CODE_TABLE_V3_COLUMNS, 'text'] as const;
 
 const v3ColumnCache = new Map<string, boolean>();
+const v4ColumnCache = new Map<string, boolean>();
+
+/** Whether `table` carries the v4 `text` column (cached per table name). */
+export async function codeTableHasV4Columns(table: Table, cacheKey?: string): Promise<boolean> {
+  const key = cacheKey ?? (table as unknown as { name?: string }).name ?? '';
+  if (key && v4ColumnCache.has(key)) return v4ColumnCache.get(key)!;
+  let has = false;
+  try {
+    const schema = await table.schema();
+    const names = new Set(schema.fields.map((f: { name: string }) => f.name));
+    has = CODE_TABLE_V4_COLUMNS.every((c) => names.has(c));
+  } catch { has = false; }
+  if (key) v4ColumnCache.set(key, has);
+  return has;
+}
+
+/**
+ * Build (or rebuild) the BM25 full-text index on `text`. A property of the
+ * table like the ANN index; idempotent. Skipped on tables without the column.
+ */
+export async function ensureCodeTextIndex(
+  table: Table,
+  opts: { label?: string; force?: boolean } = {},
+): Promise<{ built: boolean; reason: string }> {
+  const label = opts.label ?? 'code';
+  try {
+    if (!(await codeTableHasV4Columns(table, opts.label))) return { built: false, reason: 'no text column (pre-v4 table)' };
+    const existing = await table.listIndices();
+    if (!opts.force && existing.some(i => i.columns.includes('text'))) {
+      return { built: false, reason: `already indexed (${existing.filter(i => i.columns.includes('text')).map(i => i.name).join(', ')})` };
+    }
+    const t0 = Date.now();
+    logger.info(`[lance] building FTS (BM25) on ${label}.text…`);
+    const { Index } = await import('@lancedb/lancedb');
+    const { enqueueTableWrite } = await import('./vectorWriteQueue.js');
+    await enqueueTableWrite(table, () => table.createIndex('text', {
+      // Positions are only for phrase queries; the fused leg uses term matches.
+      // Stemming off: identifiers (`onStart`, `ph.lib`) must match as typed.
+      config: Index.fts({ withPosition: false, stem: false, lowercase: true, baseTokenizer: 'simple' }),
+      replace: true,
+    }));
+    const ms = Date.now() - t0;
+    logger.info(`[lance] FTS on ${label}.text built in ${(ms / 1000).toFixed(1)}s`);
+    return { built: true, reason: `FTS in ${(ms / 1000).toFixed(1)}s` };
+  } catch (err) {
+    const message = (err as Error).message;
+    logger.warn(`[lance] FTS build on ${label} failed (BM25 leg stays off): ${message}`);
+    return { built: false, reason: `failed: ${message}` };
+  }
+}
 
 /** Whether `table` carries the v3 columns (cached per table name). */
 export async function codeTableHasV3Columns(table: Table, cacheKey?: string): Promise<boolean> {
@@ -145,9 +198,11 @@ async function createEmptyCodeTable(conn: Connection, name: string, dims: number
       qualified_name: '__init__', file_path: '__init__',
     });
   }
+  if (EMBED_TEXT_V4) Object.assign(seed, { text: '__init__' });
   const t = await conn.createTable(name, [seed]);
   await t.delete("node_id = '__init__'");
   v3ColumnCache.set(name, EMBED_TEXT_V3);
+  v4ColumnCache.set(name, EMBED_TEXT_V4);
   return t;
 }
 
@@ -208,12 +263,15 @@ export async function openShadowCodeTable(resume = false): Promise<{ table: Tabl
         { type?: { listSize?: number } } | undefined;
       const width = vec?.type?.listSize;
       const hasV3 = await codeTableHasV3Columns(existing, name);
-      if (width === dims && hasV3) {
+      // A v4 build must not resume into a v3-shaped shadow: its rows would
+      // have no `text`, and the BM25 leg would silently miss them.
+      const hasV4 = !EMBED_TEXT_V4 || await codeTableHasV4Columns(existing, name);
+      if (width === dims && hasV3 && hasV4) {
         const rows = await existing.countRows().catch(() => 0);
         logger.info(`Resuming shadow slot '${name}' at ${dims}d with ${rows} existing rows`);
         return { table: existing, name, resumed: true };
       }
-      logger.warn(`Shadow slot '${name}' not resumable (width=${width} want=${dims}, v3=${hasV3}) — rebuilding empty`);
+      logger.warn(`Shadow slot '${name}' not resumable (width=${width} want=${dims}, v3=${hasV3}, v4=${hasV4}) — rebuilding empty`);
       try { existing.close(); } catch { /* ignore */ }
     } catch (e) {
       logger.warn(`Shadow slot '${name}' could not be opened for resume: ${(e as Error).message} — rebuilding empty`);
@@ -436,8 +494,16 @@ export async function getDocsLanceTable(): Promise<Table> {
         docsTable = null;
         // Fall through to create below
       }
+      // A READ probe, not just the schema. After `dropDocsVectorsTable()` the
+      // connection kept a stale catalogue entry: `openTable` succeeded on the
+      // cached manifest (countRows still said 13,895) while every scan died
+      // with "Not found …/docs_vectors.lance/data/…" — the 2026-09-29 docs
+      // re-embed embedded 0 of 45,123 items that way. Open means readable.
+      if (docsTable) {
+        await docsTable.query().select(['doc_id']).limit(1).toArray();
+      }
     } catch (e) {
-      logger.warn(`Schema check failed, recreating docs_vectors: ${e}`);
+      logger.warn(`Schema/read check failed, recreating docs_vectors: ${e}`);
       try { docsTable?.close(); } catch { /* ignore */ }
       try { await conn.dropTable(DOCS_TABLE_NAME); } catch { /* ignore */ }
       docsTable = null;

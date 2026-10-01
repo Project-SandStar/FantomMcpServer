@@ -194,7 +194,10 @@ export class FantomFunctionSearchIndex {
     // like "rete", "state" are dominated by other projects), so a scoped query
     // came back empty. Pull a much deeper candidate pool whenever a filter is
     // in play; the post-filter + scoring below trims it back to `limit`.
-    const hasFilter = options?.projectId !== undefined || options?.instanceId !== undefined
+    const projectIdSet = options?.projectId === undefined && options?.projectIds?.length
+      ? new Set(options.projectIds.map(Number))
+      : null;
+    const hasFilter = options?.projectId !== undefined || projectIdSet !== null || options?.instanceId !== undefined
       || options?.podId !== undefined || options?.category !== undefined || options?.type !== undefined
       || options?.className !== undefined || options?.isPublic !== undefined || !!options?.compatibleWith;
     const innerLimit = hasFilter ? Math.max(limit * 3, 2000) : limit * 3;
@@ -272,6 +275,7 @@ export class FantomFunctionSearchIndex {
       // projectIds — see round-6 report.
       const fnPid = Number((func as any).projectId);
       if (options?.projectId !== undefined && fnPid !== Number(options.projectId)) continue;
+      if (projectIdSet && !projectIdSet.has(fnPid)) continue;
       if (options?.category && func.category !== options.category) continue;
       if (options?.type && func.type !== options.type) continue;
       if (options?.className && func.className !== options.className) continue;

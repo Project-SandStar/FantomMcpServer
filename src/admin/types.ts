@@ -308,6 +308,9 @@ export interface FantomSettings {
     groq?: LLMProviderConfig;
     anthropic?: LLMProviderConfig;
     gemini?: LLMProviderConfig;
+    /** TypeSafe Jev: typed routing judgments (RLM on/off, identifier queries),
+     *  not a text generator. Key in TYPESAFE_API_KEY. */
+    typesafe?: LLMProviderConfig;
   };
   /** Axon MCP server integration (src/axon/axonSettings.ts holds the defaults).
    *  The embedding model is NOT configurable here — Axon vectors always use

@@ -164,10 +164,20 @@ function snapshotToCapabilities(snap: HeartbeatStatusData): Sidecar['capabilitie
 
 /**
  * Find or create a sidecar entry for the agentUrl the sidecar reported.
- * Match by host:port; if not found, auto-register a new entry so the sidecar
- * appears in the dashboard immediately.
+ * Match by host:port, then by the hostname the sidecar registers under; if
+ * neither hits, auto-register a new entry so the sidecar appears in the
+ * dashboard immediately.
+ *
+ * The hostname match is what keeps an entry whose `host` the operator
+ * re-pointed (a Mac reached over NetBird because this process cannot reach
+ * the LAN, 2026-09-29) from being duplicated on the next register: the frame
+ * still says `agentUrl=http://<lan-ip>:8098`, and a host:port match
+ * alone created a second "Alpers-Mac-mini.local" next to the one on its
+ * overlay address. The entry's `host` is left as the operator set it.
  */
-function resolveOrCreateSidecar(agentUrl: string, hostname?: string): Sidecar {
+function resolveOrCreateSidecar(agentUrl: string, hostname: string | undefined, opts: { create: false }): Sidecar | null;
+function resolveOrCreateSidecar(agentUrl: string, hostname?: string, opts?: { create?: boolean }): Sidecar;
+function resolveOrCreateSidecar(agentUrl: string, hostname?: string, opts: { create?: boolean } = {}): Sidecar | null {
   const cached = sidecarIdByAgentUrl.get(agentUrl);
   if (cached) {
     const sc = getSidecar(cached);
@@ -178,11 +188,14 @@ function resolveOrCreateSidecar(agentUrl: string, hostname?: string): Sidecar {
   const host = url.hostname;
   const port = url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : 80);
   const protocol: 'http' | 'https' = url.protocol === 'https:' ? 'https' : 'http';
-  const match = listSidecars().find(s => s.host === host && s.port === port);
+  const all = listSidecars();
+  const match = all.find(s => s.host === host && s.port === port)
+    ?? (hostname ? all.find(s => s.port === port && sameHostname(s.name, hostname)) : undefined);
   if (match) {
     sidecarIdByAgentUrl.set(agentUrl, match.id);
     return match;
   }
+  if (opts.create === false) return null;
   const sc = createSidecar({
     name: hostname || `${host}:${port}`,
     host, port, protocol,
@@ -195,6 +208,16 @@ function resolveOrCreateSidecar(agentUrl: string, hostname?: string): Sidecar {
   return sc;
 }
 
+/** `Alpers-Mac-mini.local` ≡ `alpers-mac-mini` ≡ `Alpers-Mac-mini.local (…)`: the
+ *  registered name may carry an operator suffix; the frame's hostname does not. */
+export function sameHostname(registeredName: string, frameHostname: string): boolean {
+  const norm = (s: string) => s.trim().toLowerCase().replace(/\.local$/, '');
+  const a = norm(registeredName);
+  const b = norm(frameHostname);
+  if (!a || !b) return false;
+  return a === b || a.startsWith(`${b} `) || a.startsWith(`${b}-`) || a.startsWith(`${b}(`);
+}
+
 function send(ws: WebSocket, payload: unknown): void {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
 }
@@ -202,7 +225,14 @@ function send(ws: WebSocket, payload: unknown): void {
 function applyHeartbeatToRegistry(agentUrl: string, frame: HeartbeatFrame): void {
   const snap = frame.statusData ?? {};
   if (snap) snapshotByAgentUrl.set(agentUrl, snap);
-  const sc = resolveOrCreateSidecar(agentUrl, snap.hostname);
+  // The HTTP-fallback heartbeat arrives BEFORE the WS register frame on every
+  // boot and carries no hostname, so an entry whose `host` the operator
+  // re-pointed (Macs on NetBird) missed the hostname match and a bare
+  // "<lan-ip>:8098" duplicate was created each restart. A heartbeat
+  // from an agentUrl nothing matches is not evidence of a new host — only a
+  // register frame (which names itself) may create an entry.
+  const sc = resolveOrCreateSidecar(agentUrl, snap.hostname, { create: false });
+  if (!sc) return;
   const capabilities = snapshotToCapabilities(snap);
   mergeCapabilities(sc.id, capabilities, 'ws-heartbeat');
   if (typeof frame.activeRequests === 'number') {
@@ -740,6 +770,22 @@ export function attachSoundSuiteMaster(_httpServer: HttpServer, app: Express): v
   });
 
   console.log(`[soundsuite-master] HTTP fallback on app /api/admin/gpu/sidecars/{heartbeat,poll,result,snapshot}`);
+}
+
+/**
+ * Milliseconds since this sidecar's last WS heartbeat, or null when it has
+ * never sent one over the live socket (registered only, or no socket at all).
+ * A host that registers but never heartbeats has a path that drops large
+ * frames — the same path a chat completion travels — so callers use this to
+ * order hosts, not to disable them.
+ */
+export function getSidecarHeartbeatAgeMs(sidecarId: string): number | null {
+  for (const [url, id] of sidecarIdByAgentUrl) {
+    if (id !== sidecarId) continue;
+    const hb = lastHeartbeatAt.get(url);
+    return hb === undefined ? null : Date.now() - hb;
+  }
+  return null;
 }
 
 /** Restart the dedicated WS listener on a new port. Returns status info. */

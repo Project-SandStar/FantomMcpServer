@@ -9,7 +9,7 @@ import remarkGfm from 'remark-gfm';
 import { SearchableComboBox } from '@/components/ui/SearchableComboBox';
 import { AxonSearchResults } from '@/components/AxonSearchResults';
 import { ProjectDependenciesPanel } from '@/components/ProjectDependenciesPanel';
-import { ProjectsSidebar, ProjectsSidebarEntry } from '@/components/ProjectsSidebar';
+import { ProjectsSidebar, ProjectsSidebarEntry, ProjectsSidebarGroup } from '@/components/ProjectsSidebar';
 
 // Dynamically import VectorScatter to avoid SSR issues with D3
 const VectorScatter = dynamic(
@@ -61,9 +61,25 @@ interface VectorStats {
   projects: Array<{
     id: number;
     name: string;
+    instanceId?: number | null;
+    /** Product/version line the project belongs to (server-derived). */
+    group?: { key: string; label: string; product: string; version: string | null } | null;
     nodeCount: number;
     vectorCount: number;
   }>;
+}
+
+// Sidebar order for the version tree; newest version first inside a product.
+const PRODUCT_ORDER = ['skyspark', 'haxall', 'fantom', 'other'];
+const PRODUCT_LABEL: Record<string, string> = { skyspark: 'SkySpark', haxall: 'Haxall', fantom: 'Fantom SDK', other: 'Other' };
+function versionTuple(v: string | null | undefined): number[] {
+  const m = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(v ?? '');
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3] ?? 0)] : [-1, -1, -1];
+}
+function compareVersionDesc(a: string | null | undefined, b: string | null | undefined): number {
+  const ta = versionTuple(a), tb = versionTuple(b);
+  for (let i = 0; i < 3; i++) if (ta[i] !== tb[i]) return tb[i] - ta[i];
+  return 0;
 }
 
 // ============================================
@@ -90,6 +106,7 @@ async function performSemanticSearch(
   projectId?: number,
   limit: number = 20,
   rerank: boolean = true,
+  versionGroup?: string[],
 ): Promise<{ results: SemanticSearchResult[] }> {
   const apiBase = typeof window !== 'undefined' ? localStorage.getItem('server_url') || '' : '';
   const username = typeof window !== 'undefined' ? localStorage.getItem('admin_user') || 'admin' : 'admin';
@@ -104,7 +121,7 @@ async function performSemanticSearch(
     },
     // rerank 'on' forces the cross-encoder pass (local GPU or OpenRouter per
     // policy); 'off' keeps the fused vector+keyword order.
-    body: JSON.stringify({ query, projectId, limit, rerank: rerank ? 'on' : 'off' })
+    body: JSON.stringify({ query, projectId, versionGroup, limit, rerank: rerank ? 'on' : 'off' })
   });
 
   if (!response.ok) {
@@ -202,6 +219,10 @@ export default function VectorViewerPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedProject, setSelectedProject] = useState<number | null>(null);
   const [selectedProjectName, setSelectedProjectName] = useState<string>('');
+  // Version groups ("haxall/4.0.6", …) as the search scope instead of one
+  // project. Mutually exclusive with selectedProject; sent as `versionGroup`
+  // (an array — the server unions them). Empty = no group scope.
+  const [selectedGroups, setSelectedGroups] = useState<string[]>([]);
   const [selectedResult, setSelectedResult] = useState<SemanticSearchResult | null>(null);
   const [colorBy, setColorBy] = useState<'nodeType' | 'score'>('nodeType');
   const [viewMode, setViewMode] = useState<'search' | 'project'>('search');
@@ -223,11 +244,50 @@ export default function VectorViewerPage() {
   const [source, setSource] = useState<'fantom' | 'axon'>('fantom');
   const [axonProject, setAxonProject] = useState<string>('');
 
+  // Every filter on this page, remembered per browser (`vv_filters`) so a
+  // refresh lands on the same selection. Restored once the project list is
+  // known (the project/group scope needs it); a `?projectId=` / `?vg=` in the
+  // URL still wins, because a shared link must open what it names. "Reset
+  // filters" in the header clears the lot. `rerankOn` / `rlmDeep` keep their
+  // own keys above — they predate this and other pages read them.
+  const filtersRestored = useRef(false);
+  const restoredScope = useRef<{ projectId: number | null; groups: string[] } | null>(null);
+  useEffect(() => {
+    if (filtersRestored.current) return;
+    filtersRestored.current = true;
+    try {
+      const raw = localStorage.getItem('vv_filters');
+      if (!raw) return;
+      const f = JSON.parse(raw) as Partial<{
+        source: 'fantom' | 'axon'; viewMode: 'search' | 'project'; mode: 'vector' | 'rerank' | 'rlm';
+        colorBy: 'nodeType' | 'score'; axonProject: string; projectId: number | null; groups: string[];
+      }>;
+      if (f.source === 'fantom' || f.source === 'axon') setSource(f.source);
+      if (f.viewMode === 'search' || f.viewMode === 'project') setViewMode(f.viewMode);
+      if (f.mode === 'vector' || f.mode === 'rerank' || f.mode === 'rlm') setMode(f.mode);
+      if (f.colorBy === 'nodeType' || f.colorBy === 'score') setColorBy(f.colorBy);
+      if (typeof f.axonProject === 'string') setAxonProject(f.axonProject);
+      restoredScope.current = {
+        projectId: typeof f.projectId === 'number' ? f.projectId : null,
+        groups: Array.isArray(f.groups) ? f.groups.filter((k): k is string => typeof k === 'string') : [],
+      };
+    } catch { /* storage unavailable or stale shape — defaults stand */ }
+  }, []);
+  useEffect(() => {
+    if (!filtersRestored.current) return;
+    try {
+      localStorage.setItem('vv_filters', JSON.stringify({
+        source, viewMode, mode, colorBy, axonProject, projectId: selectedProject, groups: selectedGroups,
+      }));
+    } catch { /* ignore */ }
+  }, [source, viewMode, mode, colorBy, axonProject, selectedProject, selectedGroups]);
+
   // Axon projects for the project selector (only fetched when the Axon source is active).
   const { data: axonProjects } = useQuery({
     queryKey: ['axon-projects'],
     queryFn: api.axonProjects,
     enabled: source === 'axon',
+    refetchInterval: false,
   });
   const axonProjectOptions = useMemo(() => (axonProjects?.projects ?? []).map(p => ({
     value: p.projectId,
@@ -253,9 +313,10 @@ export default function VectorViewerPage() {
     queryFn: fetchVectorStats,
   });
 
-  // Left-column project list, same component as /graph-3d and /fantom-pods.
+  // Left-column project tree, same component as /graph-3d and /fantom-pods.
   // Fed from the stats payload the page already polls — no extra request.
-  // `id: 0` is the synthetic "All projects" row (search supports it).
+  // `id: 0` is the synthetic "All projects" row (search supports it); it stays
+  // pinned above the product → version → project tree.
   const sidebarEntries = useMemo<ProjectsSidebarEntry<number>[]>(() => {
     const rows = [...(vectorStats?.projects ?? [])].sort((a, b) => a.name.localeCompare(b.name));
     const all: ProjectsSidebarEntry<number> = {
@@ -266,9 +327,12 @@ export default function VectorViewerPage() {
     };
     return [all, ...rows.map((p): ProjectsSidebarEntry<number> => {
       const pct = p.nodeCount > 0 ? Math.round((p.vectorCount / p.nodeCount) * 100) : 0;
+      // Inside a version group the instance prefix ("Haxall 4.0.6:") repeats
+      // the header; show the pod path only.
+      const label = p.group && p.group.key !== 'other' && p.name.includes(':') ? p.name.slice(p.name.indexOf(':') + 1) : p.name;
       return {
         id: p.id,
-        label: p.name,
+        label,
         count: p.vectorCount,
         sublabel: p.vectorCount === 0
           ? (p.nodeCount > 0 ? `no vectors · ${p.nodeCount.toLocaleString()} nodes` : 'no vectors')
@@ -277,6 +341,42 @@ export default function VectorViewerPage() {
       };
     })];
   }, [vectorStats]);
+  // Version groups present in the stats rows, in sidebar order. The server
+  // names the group per project (`group`); this only aggregates.
+  const { sidebarGroups, groupKeyById } = useMemo(() => {
+    const acc = new Map<string, ProjectsSidebarGroup & { product: string; version: string | null; projects: number }>();
+    const byId = new Map<number, string>();
+    for (const p of vectorStats?.projects ?? []) {
+      const g = p.group ?? { key: 'other', label: 'Other', product: 'other', version: null };
+      byId.set(p.id, g.key);
+      let row = acc.get(g.key);
+      if (!row) {
+        row = { key: g.key, label: g.label, product: g.product, productLabel: PRODUCT_LABEL[g.product] ?? g.product, version: g.version, count: 0, projects: 0 };
+        acc.set(g.key, row);
+      }
+      row.count = (row.count ?? 0) + p.vectorCount;
+      row.projects++;
+    }
+    const groups = [...acc.values()].sort((a, b) => {
+      const pa = PRODUCT_ORDER.indexOf(a.product), pb = PRODUCT_ORDER.indexOf(b.product);
+      if (pa !== pb) return (pa === -1 ? 99 : pa) - (pb === -1 ? 99 : pb);
+      return compareVersionDesc(a.version, b.version);
+    });
+    return { sidebarGroups: groups as ProjectsSidebarGroup[], groupKeyById: byId };
+  }, [vectorStats]);
+  // What the header line says about the current group scope.
+  const selectedGroupInfo = useMemo(() => {
+    if (selectedGroups.length === 0) return null;
+    const rows = selectedGroups
+      .map((k) => sidebarGroups.find((g) => g.key === k) as (ProjectsSidebarGroup & { projects?: number }) | undefined)
+      .filter((g): g is ProjectsSidebarGroup & { projects?: number } => !!g);
+    return {
+      keys: selectedGroups,
+      label: rows.map((g) => g.label).join(' + '),
+      projects: rows.reduce((s, g) => s + (g.projects ?? 0), 0),
+      vectors: rows.reduce((s, g) => s + (g.count ?? 0), 0),
+    };
+  }, [selectedGroups, sidebarGroups]);
 
   // Shareable selection: ?projectId= in the URL, read once the project list
   // is known, written on every select (replaceState — no navigation, no
@@ -309,8 +409,8 @@ export default function VectorViewerPage() {
 
   // Semantic search mutation
   const searchMutation = useMutation({
-    mutationFn: ({ query, projectId, rerank }: { query: string; projectId?: number; rerank: boolean }) =>
-      performSemanticSearch(query, projectId, 30, rerank),
+    mutationFn: ({ query, projectId, rerank, versionGroup }: { query: string; projectId?: number; rerank: boolean; versionGroup?: string[] }) =>
+      performSemanticSearch(query, projectId, 30, rerank, versionGroup),
   });
 
   // RLM Answer (synthesized, cited answer) mutation
@@ -320,8 +420,8 @@ export default function VectorViewerPage() {
     // "RLM search" off: fast retrieval-only answer (~20–40s). On: the same
     // full-budget RLM investigation the MCP tool runs (~60–120s); the ticker
     // and stage timings make the wait legible.
-    mutationFn: ({ query, projectId, rlm, rerank, askId }: { query: string; projectId?: number; rlm: boolean; rerank: boolean; askId: string }) =>
-      api.ask({ query, projectId, fast: !rlm, rlm, rerank, askId }),
+    mutationFn: ({ query, projectId, versionGroup, rlm, rerank, askId }: { query: string; projectId?: number; versionGroup?: string[]; rlm: boolean; rerank: boolean; askId: string }) =>
+      api.ask({ query, projectId, versionGroup, fast: !rlm, rlm, rerank, askId }),
     onMutate: (vars) => {
       askStartedAt.current = performance.now(); setAskElapsedMs(0);
       setAskFeedId(vars.askId); setAskEvents([]); setThinkingOpen(true);
@@ -333,9 +433,12 @@ export default function VectorViewerPage() {
   const [askEvents, setAskEvents] = useState<AskEvent[]>([]);
   const [thinkingOpen, setThinkingOpen] = useState(true);
   const askEventsSeq = useRef(0);
+  useEffect(() => { askEventsSeq.current = 0; }, [askFeedId]);
   useEffect(() => {
-    if (!askFeedId) return;
-    askEventsSeq.current = 0;
+    // Poll only while the ask runs; the effect below does the final read. The
+    // poll used to outlive the ask and hit a 404 once a second for as long as
+    // the tab stayed open.
+    if (!askFeedId || !askMutation.isPending) return;
     let stopped = false;
     let inFlight = false;
     const pull = async () => {
@@ -354,7 +457,7 @@ export default function VectorViewerPage() {
     void pull();
     const id = setInterval(pull, 1000);
     return () => { stopped = true; clearInterval(id); };
-  }, [askFeedId]);
+  }, [askFeedId, askMutation.isPending]);
   useEffect(() => {
     // One last read once the answer landed, so the tail of the feed is complete.
     if (askMutation.isPending || !askFeedId) return;
@@ -392,6 +495,10 @@ export default function VectorViewerPage() {
       return { ...data, loadMs: Math.round(performance.now() - t0) };
     },
     enabled: viewMode === 'project' && selectedProject !== null,
+    // Positions change only when the project is re-embedded. The dashboard-wide
+    // 10s poll re-fetched the whole point set for as long as the tab was open.
+    refetchInterval: false,
+    staleTime: 5 * 60_000,
   });
 
   // Handlers
@@ -404,9 +511,11 @@ export default function VectorViewerPage() {
       }
       // Always run vector search so the scatter/list stay populated and
       // citations can resolve to a selectable result.
+      const versionGroup = selectedProject || selectedGroups.length === 0 ? undefined : selectedGroups;
       searchMutation.mutate({
         query: searchQuery,
         projectId: selectedProject ?? undefined,
+        versionGroup,
         rerank: rerankOn,
       });
       // In Answer mode, also synthesize a cited answer.
@@ -414,34 +523,82 @@ export default function VectorViewerPage() {
         askMutation.mutate({
           query: searchQuery,
           projectId: selectedProject ?? undefined,
+          versionGroup,
           rlm: rlmDeep,
           rerank: rerankOn,
           askId: (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64),
         });
       }
     }
-  }, [searchQuery, selectedProject, searchMutation, askMutation, mode, saveSearchHistory, source, axonProject, axonSearchMutation, rerankOn, rlmDeep]);
+  }, [searchQuery, selectedProject, selectedGroups, searchMutation, askMutation, mode, saveSearchHistory, source, axonProject, axonSearchMutation, rerankOn, rlmDeep]);
 
   const handleProjectSelect = useCallback((projectId: number | null) => {
     setSelectedProject(projectId);
+    setSelectedGroups([]);
     const project = vectorStats?.projects.find(p => p.id === projectId);
     setSelectedProjectName(project?.name || '');
     try {
       const url = new URL(window.location.href);
       if (projectId) url.searchParams.set('projectId', String(projectId));
       else url.searchParams.delete('projectId');
+      url.searchParams.delete('vg');
       window.history.replaceState(null, '', url.toString());
     } catch { /* non-browser or blocked history — selection still works */ }
   }, [vectorStats?.projects]);
+  // Shareable too: ?vg=haxall/4.0.6,skyspark/3.1.12 selects the groups; no
+  // project is selected.
+  const applyGroups = useCallback((keys: string[]) => {
+    setSelectedGroups(keys);
+    setSelectedProject(null);
+    setSelectedProjectName('');
+    try {
+      const url = new URL(window.location.href);
+      if (keys.length) url.searchParams.set('vg', keys.join(','));
+      else url.searchParams.delete('vg');
+      url.searchParams.delete('projectId');
+      window.history.replaceState(null, '', url.toString());
+    } catch { /* ignore */ }
+  }, []);
+  // Label click: this group only. Checkbox: add/remove; the scope stays a group
+  // scope even when it empties (the "All projects" row restores the default).
+  const handleGroupSelect = useCallback((key: string) => applyGroups([key]), [applyGroups]);
+  const handleGroupToggle = useCallback((key: string) => {
+    applyGroups(selectedGroups.includes(key) ? selectedGroups.filter((k) => k !== key) : [...selectedGroups, key]);
+  }, [applyGroups, selectedGroups]);
   useEffect(() => {
     if (urlProjectApplied.current || !vectorStats?.projects) return;
     urlProjectApplied.current = true;
     try {
-      const raw = new URLSearchParams(window.location.search).get('projectId');
+      const params = new URLSearchParams(window.location.search);
+      const raw = params.get('projectId');
       const id = raw ? Number(raw) : NaN;
-      if (Number.isFinite(id) && vectorStats.projects.some(p => p.id === id)) handleProjectSelect(id);
+      if (Number.isFinite(id) && vectorStats.projects.some(p => p.id === id)) { handleProjectSelect(id); return; }
+      const known = new Set(vectorStats.projects.map(p => p.group?.key ?? 'other'));
+      const keys = (params.get('vg') ?? '').split(',').map(s => s.trim()).filter(k => k && known.has(k));
+      if (keys.length) { applyGroups(keys); return; }
+      // No URL scope: fall back to the scope remembered from the last visit.
+      const remembered = restoredScope.current;
+      if (remembered?.projectId != null && vectorStats.projects.some(p => p.id === remembered.projectId)) {
+        handleProjectSelect(remembered.projectId);
+      } else if (remembered?.groups.length) {
+        const ok = remembered.groups.filter(k => known.has(k));
+        if (ok.length) applyGroups(ok);
+      }
     } catch { /* ignore */ }
-  }, [vectorStats?.projects, handleProjectSelect]);
+  }, [vectorStats?.projects, handleProjectSelect, applyGroups]);
+
+  // Back to a clean page: no scope, defaults for every control, storage cleared.
+  const resetFilters = useCallback(() => {
+    handleProjectSelect(null);
+    setSource('fantom');
+    setViewMode('search');
+    setMode('vector');
+    setColorBy('nodeType');
+    setAxonProject('');
+    setSearchQuery('');
+    setSelectedResult(null);
+    try { localStorage.removeItem('vv_filters'); } catch { /* ignore */ }
+  }, [handleProjectSelect]);
 
   const handleCitationClick = useCallback((nodeId: string) => {
     const match = searchMutation.data?.results.find(r => r.nodeId === nodeId);
@@ -482,12 +639,18 @@ export default function VectorViewerPage() {
     <div className="flex flex-col lg:flex-row gap-4">
       <ProjectsSidebar
         entries={sidebarEntries}
-        selectedId={selectedProject ?? 0}
+        groups={sidebarGroups}
+        groupOf={(e) => (e.id === 0 ? null : groupKeyById.get(e.id) ?? 'other')}
+        selectedId={selectedProject ?? (selectedGroups.length ? null : 0)}
+        selectedGroupKeys={selectedGroups}
         onSelect={(id) => handleProjectSelect(id || null)}
+        onSelectGroup={handleGroupSelect}
+        onToggleGroup={handleGroupToggle}
+        storageKey="vector-viewer"
         emptyMessage={isLoadingStats ? 'Loading projects…' : 'No projects indexed'}
         fillHeight
         filterable
-        filterPlaceholder="Filter projects…"
+        filterPlaceholder="Filter projects or versions…"
       />
     <div className="flex-1 min-w-0 space-y-6">
       {/* Header */}
@@ -497,9 +660,25 @@ export default function VectorViewerPage() {
           <p className="text-gray-600 mt-1">
             Semantic code search and embedding visualization
           </p>
+          {selectedGroupInfo && (
+            <p className="mt-1 text-sm text-blue-700">
+              Scope: <span className="font-medium">{selectedGroupInfo.label}</span>
+              {' · '}{selectedGroupInfo.projects} projects · {selectedGroupInfo.vectors.toLocaleString()} vectors
+              {' — '}<code className="text-xs bg-blue-50 px-1 rounded">versionGroup: &quot;{selectedGroupInfo.keys.join(', ')}&quot;</code> in MCP
+              {' · '}<button type="button" className="underline" onClick={() => handleProjectSelect(null)}>clear</button>
+            </p>
+          )}
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
+        <button
+          type="button"
+          onClick={resetFilters}
+          className="px-3 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+          title="Clear the project/group scope, the query, and every control back to its default; forget the remembered selection"
+        >
+          Reset filters
+        </button>
         {/* Source Toggle (search mode): Fantom code vectors vs Axon function vectors */}
         {viewMode === 'search' && (
           <div className="flex rounded-lg border border-gray-300 overflow-hidden" title="Search source">

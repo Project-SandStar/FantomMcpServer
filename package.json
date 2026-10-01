@@ -1,6 +1,6 @@
 {
   "name": "mcp-fantom",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "MCP server providing AI assistants access to Fantom language documentation, code examples, and validation tools",
   "main": "build/index.js",
   "type": "module",
@@ -35,7 +35,8 @@
     "db:generate": "prisma generate",
     "db:setup": "prisma migrate deploy",
     "db:studio": "prisma studio",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "start:dev:launchd": "bash scripts/start-dev-launchd.sh"
   },
   "keywords": [
     "mcp",

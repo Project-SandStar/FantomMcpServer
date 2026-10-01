@@ -38,7 +38,7 @@ describe('defaults', () => {
     expect(d.allowedModels.reranker).not.toHaveProperty('note');
   });
 
-  it('pins an upstream for both embedding roles at 2560d', () => {
+  it('pins an upstream for both embedding roles at the default width', () => {
     for (const role of ['embedding', 'code-embedding'] as const) {
       expect(d.allowedModels[role]!.provider).toBeTruthy();
       expect(d.allowedModels[role]!.dims).toBe(2560);

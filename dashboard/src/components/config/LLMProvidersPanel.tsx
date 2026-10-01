@@ -31,6 +31,9 @@ export function LLMProvidersPanel() {
   const [groq, setGroq] = useState<ProviderState>(DEFAULT);
   const [anthropic, setAnthropic] = useState<ProviderState>(DEFAULT);
   const [gemini, setGemini] = useState<ProviderState>(DEFAULT);
+  // TypeSafe Jev: routing judgments only (RLM on/off per question). Not in
+  // the rerank-provider list, so it has its own card and state.
+  const [typesafe, setTypesafe] = useState<ProviderState>(DEFAULT);
 
   useEffect(() => {
     if (!data) return;
@@ -38,6 +41,7 @@ export function LLMProvidersPanel() {
     setGroq({ enabled: data.groq.enabled, model: data.groq.model ?? '', apiKey: '', hasKey: data.groq.hasKey, masked: data.groq.apiKey });
     setAnthropic({ enabled: data.anthropic.enabled, model: data.anthropic.model ?? '', apiKey: '', hasKey: data.anthropic.hasKey, masked: data.anthropic.apiKey });
     setGemini({ enabled: data.gemini.enabled, model: data.gemini.model ?? '', apiKey: '', hasKey: data.gemini.hasKey, masked: data.gemini.apiKey });
+    setTypesafe({ enabled: data.typesafe?.enabled ?? false, model: data.typesafe?.model ?? '', apiKey: '', hasKey: data.typesafe?.hasKey ?? false, masked: data.typesafe?.apiKey ?? null });
   }, [data]);
 
   // Snapshot of what was last saved so we can show the operator the
@@ -52,6 +56,7 @@ export function LLMProvidersPanel() {
       groq: { enabled: groq.enabled, model: groq.model || undefined, apiKey: groq.apiKey || undefined },
       anthropic: { enabled: anthropic.enabled, model: anthropic.model || undefined, apiKey: anthropic.apiKey || undefined },
       gemini: { enabled: gemini.enabled, model: gemini.model || undefined, apiKey: gemini.apiKey || undefined },
+      typesafe: { enabled: typesafe.enabled, model: typesafe.model || undefined, apiKey: typesafe.apiKey || undefined },
     }),
     onSuccess: async () => {
       // Capture the values we believed we just saved.
@@ -123,6 +128,44 @@ export function LLMProvidersPanel() {
       {providerCard('anthropic', anthropic, setAnthropic)}
       {providerCard('gemini', gemini, setGemini)}
 
+      <div className="border border-indigo-200 bg-indigo-50/40 rounded-md p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h4 className="text-sm font-semibold text-gray-900">TypeSafe Jev · routing</h4>
+            <p className="text-xs text-gray-600 mt-0.5">
+              One typed judgment per ask (~200 ms, fractions of a cent): skips the 35–95 s RLM loop when
+              retrieval already answers the question. Advisory — below the confidence floor the default route runs.
+            </p>
+          </div>
+          <label className="flex items-center gap-2 text-sm shrink-0">
+            <input type="checkbox" checked={typesafe.enabled}
+              onChange={e => setTypesafe({ ...typesafe, enabled: e.target.checked })} />
+            <span>Enabled</span>
+          </label>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className={labelClass}>Model</label>
+            <input type="text" className={inputClass} value={typesafe.model}
+              placeholder="jev-latest"
+              onChange={e => setTypesafe({ ...typesafe, model: e.target.value })} />
+          </div>
+          <div>
+            <label className={labelClass}>
+              API Key {typesafe.hasKey && <span className="text-green-600">· stored</span>}
+            </label>
+            <input type="password" className={inputClass} value={typesafe.apiKey}
+              placeholder={typesafe.masked ?? 'paste key to update'}
+              onChange={e => setTypesafe({ ...typesafe, apiKey: e.target.value })} />
+          </div>
+        </div>
+        <p className="text-xs text-gray-500">
+          Confidence floor: <code className="bg-gray-100 px-1 rounded">semanticSearch.jev.minConfidence</code> (default 0.7),
+          timeout <code className="bg-gray-100 px-1 rounded">semanticSearch.jev.timeoutMs</code> (default 4000) in the runtime config.
+          Decisions show in the ask feed and the log as <code className="bg-gray-100 px-1 rounded">[jev] route=…</code>.
+        </p>
+      </div>
+
       <div className="flex flex-wrap items-center gap-3">
         <button
           onClick={() => saveMut.mutate()}
@@ -148,7 +191,8 @@ export function LLMProvidersPanel() {
 
       <p className="text-xs text-gray-500">
         Keys are written to <code className="bg-gray-100 px-1 rounded">.env</code> as <code className="bg-gray-100 px-1 rounded">GROQ_API_KEY</code>,
-        <code className="bg-gray-100 px-1 rounded">ANTHROPIC_API_KEY</code>, <code className="bg-gray-100 px-1 rounded">GEMINI_API_KEY</code>.
+        <code className="bg-gray-100 px-1 rounded">ANTHROPIC_API_KEY</code>, <code className="bg-gray-100 px-1 rounded">GEMINI_API_KEY</code>,
+        <code className="bg-gray-100 px-1 rounded">TYPESAFE_API_KEY</code>.
         Server picks them up immediately; restart not required.
       </p>
     </div>

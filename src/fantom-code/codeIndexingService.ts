@@ -1268,7 +1268,9 @@ export class CodeIndexingService {
           }));
           // v3: graph context for just these files (edge scan restricted to
           // them), chunk expansion, and a refreshed `kind: file` row per file.
-          const context = await buildEmbeddingContext(projectId, embedNodes, { filePaths: paths });
+          // v4: LLM context for the changed nodes only (content-hash cache).
+          const { withLlmContext } = await import('../embedding/semanticSearchService.js');
+          const context = await withLlmContext(projectId, embedNodes, await buildEmbeddingContext(projectId, embedNodes, { filePaths: paths }));
           const workItems = [
             ...buildEmbeddingItems(embedNodes, context),
             ...await buildSyntheticItems(this.prisma, projectId, embedNodes, { filePaths: paths }).catch(() => []),

@@ -407,9 +407,6 @@ export function selectCloudReference(
   rows: VirtualContainer[],
   isLive: (r: VirtualContainer) => boolean = defaultIsLive,
 ): VirtualContainer | null {
-  const sameModel = rows
-    .filter(r => r.model === vc.model)
-    .sort((a, b) => a.providerName.localeCompare(b.providerName));
   // Anchor on a peer whose sidecar tunnel is OPEN. On 2026-09-18 three of
   // five hosts were down and the alphabetically-first one (the Mac mini) was
   // among them: every other provider was paired against it, every probe
@@ -417,11 +414,29 @@ export function selectCloudReference(
   // fault that was not theirs. Liveness is a hint, not a filter — when
   // nothing is live (tests, cold boot) fall back to the plain ordering so the
   // verdict is still "probe-failed" (transient) rather than silently absent.
+  return selectCloudReferences(vc, rows, isLive)[0] ?? null;
+}
+
+/**
+ * Every same-model peer that could hold the reference position for `vc`,
+ * anchor first, then the rest in name order. The anchor stays the
+ * deterministic reference; the others are what the gate falls back to when
+ * the anchor cannot answer a probe (a Mac over NetBird timing out, a 429
+ * on the shared upstream). Empty when `vc` IS the anchor or has no peer.
+ */
+export function selectCloudReferences(
+  vc: VirtualContainer,
+  rows: VirtualContainer[],
+  isLive: (r: VirtualContainer) => boolean = defaultIsLive,
+): VirtualContainer[] {
+  const sameModel = rows
+    .filter(r => r.model === vc.model)
+    .sort((a, b) => a.providerName.localeCompare(b.providerName));
   const live = sameModel.filter(isLive);
   const pool = live.length > 0 ? live : sameModel;
   const anchor = pool[0];
-  if (!anchor || anchor.providerName === vc.providerName) return null;
-  return anchor;
+  if (!anchor || anchor.providerName === vc.providerName) return [];
+  return pool.filter(r => r.providerName !== vc.providerName);
 }
 
 function defaultIsLive(r: VirtualContainer): boolean {
@@ -445,7 +460,13 @@ export async function verifyVectorCompatibility(
   vc: VirtualContainer,
   reference: CompatibilityReference | null,
   expectedDims: number,
-  opts: { texts?: string[]; minCosine?: number; regime?: VerificationRegime } = {},
+  opts: {
+    texts?: string[];
+    minCosine?: number;
+    regime?: VerificationRegime;
+    /** Tried in order when `reference` cannot answer (consumed as used). */
+    fallbackReferences?: CompatibilityReference[];
+  } = {},
 ): Promise<CompatibilityReport> {
   const texts = opts.texts ?? PROBE_TEXTS;
   const threshold = opts.minCosine ?? MIN_COMPATIBLE_COSINE;
@@ -487,6 +508,18 @@ export async function verifyVectorCompatibility(
     try {
       referenceVectors = await reference.embedBatch(texts);
     } catch (err) {
+      // The reference could not answer. Under `cloud-ref` every peer is the
+      // SAME model on the SAME upstream; when the anchor is merely slow or
+      // rate-limited (a Mac over NetBird timing out its 15 s probe, a
+      // DeepInfra 429), refusing every other lane for it took the whole
+      // fleet to zero verified providers and the re-embed died with
+      // "no OpenRouter-backed provider has passed the gate" (2026-09-29).
+      // Try the next reference the caller offers; only refuse when none
+      // answers.
+      const next = opts.fallbackReferences?.shift();
+      if (next) {
+        return verifyVectorCompatibility(vc, next, expectedDims, opts);
+      }
       recordRefusal({
         key, providerName: vc.providerName, kind: 'probe-failed', reference: regime, referenceName: reference.name,
         reason: `the ${regime === 'cloud-ref' ? 'cloud peer' : 'local'} reference embedder ${reference.name} failed, `
@@ -578,6 +611,7 @@ export async function ensureVerified(
   reference: CompatibilityReference | null,
   expectedDims: number,
   regime: VerificationRegime = reference?.regime ?? 'local-ref',
+  fallbackReferences: CompatibilityReference[] = [],
 ): Promise<boolean> {
   const key = verdictKey({
     providerName: vc.providerName, model: vc.model, upstreamProvider: vc.upstreamProvider, reference: regime,
@@ -586,7 +620,8 @@ export async function ensureVerified(
 
   let p = inFlight.get(key);
   if (!p) {
-    p = verifyVectorCompatibility(vc, reference, expectedDims, { regime }).finally(() => inFlight.delete(key));
+    p = verifyVectorCompatibility(vc, reference, expectedDims, { regime, fallbackReferences: [...fallbackReferences] })
+      .finally(() => inFlight.delete(key));
     inFlight.set(key, p);
   }
   return (await p).ok;

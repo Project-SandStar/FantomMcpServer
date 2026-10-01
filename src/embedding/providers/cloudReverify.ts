@@ -30,7 +30,7 @@
 
 import { listVirtualContainers } from '../../sidecars/virtualContainers.js';
 import {
-  clearTransientRefusals, verifyVectorCompatibility, cloudReference, selectCloudReference,
+  clearTransientRefusals, verifyVectorCompatibility, cloudReference, selectCloudReferences,
 } from './vectorCompatibility.js';
 import { embeddingRoutingPolicy, tableDimsFor } from './embeddingProvider.js';
 
@@ -92,8 +92,10 @@ export async function runReverify(reason: string): Promise<void> {
       const ordered = [...rows].sort((a, b) => a.providerName.localeCompare(b.providerName));
       let ok = 0;
       for (const vc of ordered) {
-        const peer = selectCloudReference(vc, ordered);
-        const rep = await verifyVectorCompatibility(vc, peer ? cloudReference(peer) : null, expectedDims, { regime: 'cloud-ref' });
+        const [peer, ...rest] = selectCloudReferences(vc, ordered);
+        const rep = await verifyVectorCompatibility(vc, peer ? cloudReference(peer) : null, expectedDims, {
+          regime: 'cloud-ref', fallbackReferences: rest.map(cloudReference),
+        });
         if (rep.ok) ok++;
       }
       console.log(`[cloud-reverify] ${reason}: ${ok}/${ordered.length} verified in ${((Date.now() - t0) / 1000).toFixed(1)}s`);

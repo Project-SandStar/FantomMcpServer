@@ -172,6 +172,16 @@ export function GlobalProgressPanel() {
   // index) owns the fleet, say so and offer to cancel it and resume filling
   // missing vectors instead of failing with a bare 409.
   const startEmbedMissing = async () => {
+    // One job at a time. Each click used to queue another build-missing job
+    // beside the running one (three stacked up on 2026-09-29), all fighting
+    // for the same lanes.
+    try {
+      const running = (await api.listReembedJobs()).jobs.find((j) => j.status === 'running' || j.status === 'queued');
+      if (running) {
+        alert(`A re-embed job is already running (${running.doneProjects}/${running.totalProjects} projects). Wait for it, or cancel it in Embedding Activity first.`);
+        return;
+      }
+    } catch { /* older server: no jobs endpoint */ }
     let holder: { kind: string; label: string; since: string } | null = null;
     try { holder = (await api.getHeavyJob()).holder; } catch { /* older server: no lock endpoint */ }
     if (holder) {

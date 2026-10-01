@@ -33,7 +33,14 @@ export interface ReembedJob {
   finishedAt?: string;
   totalProjects: number;
   doneProjects: number;
+  /** Last project a worker CLAIMED. With a worker pool this is one of several
+   *  in flight and is overwritten by whichever worker started last — see
+   *  `activeProjectIds` for the whole set. Kept for older clients. */
   currentProjectId?: number;
+  /** Every project a worker is embedding right now (pool of up to
+   *  `maxConcurrentProjects`). Added 2026-09-29: the page named one project
+   *  that was often already done while four others ran unseen. */
+  activeProjectIds?: number[];
   generated: number;
   deleted: number;
   errors: ReembedJobError[];

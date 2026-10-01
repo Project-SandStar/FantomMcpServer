@@ -14,7 +14,7 @@ import { createLogger } from '../utils/index.js';
 import { selectEmbeddingProvider, isSidecarUsable, embedBatchFanout, type EmbeddingProvider } from './providers/embeddingProvider.js';
 import { getHeavyJob } from './embedGate.js';
 import { getSidecar } from '../sidecars/registry.js';
-import { VectorStore, getVectorStore } from './vectorStore.js';
+import { VectorStore, getVectorStore, type VectorSearchResult } from './vectorStore.js';
 import { LadybugQueryManager, getLadybugQueryManager } from '../graph/ladybugQueryManager.js';
 import type { GraphMetrics } from '../graph/types.js';
 import { ladybugQuery } from '../graph/ladybugConnection.js';
@@ -24,7 +24,28 @@ import {
   rrfFuse, countChangedPositions, readHybridSettings, readRerankMode, rerankerSidecarUsable,
   keywordQueryVariants, HYBRID_CANDIDATES, type RerankMode, type ResultSources,
 } from './hybridSearch.js';
-import { buildEmbeddingItems, EMBED_TEXT_V3, type EmbeddingItem } from './embeddingText.js';
+import { buildEmbeddingItems, EMBED_TEXT_V3, type EmbeddingItem, type EmbeddingTextNode } from './embeddingText.js';
+
+/**
+ * v4 contextualiser step shared by every embed path (project build, shadow
+ * re-embed, incremental reindex): LLM `about:` sentences merged in front of
+ * the graph context. Advisory — any failure returns the graph context alone.
+ */
+export async function withLlmContext(
+  projectId: number,
+  nodes: Array<EmbeddingTextNode & { id: string }>,
+  graphContext: Map<string, string>,
+): Promise<Map<string, string>> {
+  try {
+    const { readContextualizeSettings, contextualizeNodes, mergeContexts } = await import('./embedContextualizer.js');
+    if (!readContextualizeSettings().enabled) return graphContext;
+    const { contexts } = await contextualizeNodes(projectId, nodes);
+    return contexts.size ? mergeContexts(graphContext, contexts) : graphContext;
+  } catch (err) {
+    logger.warn(`[contextualize] project=${projectId} skipped: ${(err as Error).message.split('\n')[0].slice(0, 160)}`);
+    return graphContext;
+  }
+}
 import { buildEmbeddingContext } from './embeddingContext.js';
 import { buildSyntheticItems } from './embedSynthetic.js';
 
@@ -111,7 +132,7 @@ export interface SemanticSearchResult {
   crossEncoderScore?: number;  // Cross-encoder relevance (when reranked)
   keywordScore?: number;  // FlexSearch symbol score (keyword-sourced hits)
   score?: number;         // Final ranking score (RRF-fused, normalized 0-1; = combinedScore)
-  sources?: ResultSources;     // ['vector'] | ['keyword'] | ['both']
+  sources?: ResultSources;     // ['vector'] | ['keyword'] | ['bm25'] | ['both']
 
   // Graph context
   callerCount?: number;
@@ -129,10 +150,23 @@ export interface SemanticSearchResult {
 
 export interface SemanticSearchOptions {
   projectId?: number;
+  /** Restrict to these projects (a version group, see src/projects/versionGroup.ts).
+   *  Used only when projectId is not set; hits are enriched from each hit's own
+   *  per-project graph db, like an unscoped search. */
+  projectIds?: number[];
   nodeType?: string;
   limit?: number;
   minScore?: number;
   includeGraphContext?: boolean;  // Include callers/callees in results
+  /**
+   * Pull per-hit caller/callee COUNTS from the graph (default true). They feed
+   * the graph score and the result's metrics; the RLM loop never reads them
+   * (formatHitForRlm renders name/type/file/snippet) yet paid for them: 50
+   * candidates over ~50 project stores = open → evict → reopen against a
+   * 16-connection pool, 4–10 s per search, 136 opens per ask (2026-09-30).
+   * false → zero metrics, graphWeight contributes 0, no graph store is opened.
+   */
+  includeGraphMetrics?: boolean;
   graphWeight?: number;           // Weight for graph score (0-1, default 0.3)
   llmReranker?: import('./llmReranker.js').LLMRerankerOptions;
   crossEncoderReranker?: import('./crossEncoderReranker.js').CrossEncoderRerankerOptions;
@@ -251,6 +285,7 @@ export class SemanticSearchService {
       // returned zero rows for valid queries (see readMinScore()).
       minScore,
       includeGraphContext = true,
+      includeGraphMetrics = true,
       graphWeight = 0.3
     } = options;
 
@@ -283,8 +318,10 @@ export class SemanticSearchService {
     // 2. Vector search. Hybrid mode pulls a fixed candidate pool (top 50) so the
     //    fusion + reranker have enough to work with; legacy mode keeps limit*2.
     const tAnn0 = Date.now();
-    const vectorResults = await this.vectorStore.search(queryEmbedding, {
+    const projectIds = projectId === undefined && options.projectIds?.length ? options.projectIds : undefined;
+    let vectorResults = await this.vectorStore.search(queryEmbedding, {
       projectId,
+      projectIds,
       nodeType,
       limit: hybridOn ? Math.max(HYBRID_CANDIDATES, limit) : limit * 2,
       minScore
@@ -296,22 +333,46 @@ export class SemanticSearchService {
     let keywordHits: SemanticSearchResult[] = [];
     if (hybridOn) {
       try {
-        keywordHits = await this.keywordCandidates(query, { projectId, nodeType, limit: HYBRID_CANDIDATES, graphWeight });
+        keywordHits = await this.keywordCandidates(query, { projectId, projectIds, nodeType, limit: HYBRID_CANDIDATES, graphWeight, includeGraphMetrics });
       } catch (err) {
         logger.warn(`[hybrid] keyword search failed, vector-only: ${(err as Error).message}`);
       }
     }
+    const keywordMs = Date.now() - tKw0;
+    // 2c. BM25 over the stored embed text (v4 tables; empty otherwise). Exact
+    //     identifiers and tags — `ph.lib`, `xeto.bindings`, an error string —
+    //     that the vector leg blurs and the symbol index never saw.
+    const tBm0 = Date.now();
+    let bm25Results: VectorSearchResult[] = [];
+    if (hybridOn) {
+      try {
+        bm25Results = await this.vectorStore.textSearch(query, { projectId, projectIds, nodeType, limit: HYBRID_CANDIDATES });
+      } catch (err) {
+        logger.warn(`[hybrid] bm25 search failed, continuing without it: ${(err as Error).message}`);
+      }
+    }
+    const bm25Ms = Date.now() - tBm0;
 
-    logger.info(`[search] "${query.slice(0, 60)}" project=${projectId ?? 'all'} vector=${vectorResults.length} keyword=${keywordHits.length} dims=${queryEmbedding?.length ?? 0} embedMs=${embedMs} annMs=${annMs} keywordMs=${Date.now() - tKw0}`);
-    if (vectorResults.length === 0 && keywordHits.length === 0) {
+    logger.info(`[search] "${query.slice(0, 60)}" project=${projectId ?? (projectIds ? `group(${projectIds.length})` : 'all')} vector=${vectorResults.length} keyword=${keywordHits.length} bm25=${bm25Results.length} dims=${queryEmbedding?.length ?? 0} embedMs=${embedMs} annMs=${annMs} keywordMs=${keywordMs} bm25Ms=${bm25Ms}`);
+    if (vectorResults.length === 0 && keywordHits.length === 0 && bm25Results.length === 0) {
       return [];
     }
+
+    // BM25 hits join the graph the same way vector hits do (node details,
+    // metrics, chunk citation). Rows the vector leg already returned keep
+    // the vector's score; the rest carry a semanticScore of 0 and earn their
+    // place through the fusion rank only.
+    const vectorIds = new Set(vectorResults.map(r => r.nodeId));
+    const bm25Only = bm25Results.filter(r => !vectorIds.has(r.nodeId)).map(r => ({ ...r, score: 0, distance: 1 }));
+    const bm25Order = new Map(bm25Results.map((r, i) => [r.nodeId, i]));
+    const joinedVector = [...vectorResults, ...bm25Only];
 
     // 3. Fetch node details. For a project-scoped search use that project's db.
     //    For a CROSS-project search (projectId undefined) the legacy shared db
     //    is stale/partial and drops most nodes (→ empty answers), so enrich each
     //    hit from the per-project db it actually lives in, keyed by the
     //    project_id LanceDB stored on the vector row.
+    vectorResults = joinedVector;
     const nodeIds = vectorResults.map(r => r.nodeId);
     let nodes: Awaited<ReturnType<typeof this.fetchNodesByIds>>;
     if (projectId !== undefined) {
@@ -352,7 +413,7 @@ export class SemanticSearchService {
     // not getMetrics() per hit (9 queries each, in a loop).
     const metricsMaps = new Map<number, Map<string, GraphMetrics>>();
     const tJoin0 = Date.now();
-    {
+    if (includeGraphMetrics) {
       const idsByPid = new Map<number, string[]>();
       for (const vr of vectorResults) {
         const node = nodeMap.get(vr.nodeId);
@@ -362,10 +423,18 @@ export class SemanticSearchService {
         arr.push(node.id);
         idsByPid.set(pid, arr);
       }
-      await Promise.all([...idsByPid].map(async ([pid, ids]) => {
-        try { metricsMaps.set(pid, await this.graph(pid === -1 ? undefined : pid).getMetricsBatch(ids)); }
-        catch { metricsMaps.set(pid, new Map()); }
-      }));
+      // Bounded fan-out. A version-group search (50 candidates over up to 62
+      // per-project graph dbs) fired one open per project at once; with the
+      // pool capped at FANTOM_GRAPH_MAX_OPEN=8 that is open → evict → reopen
+      // for the whole batch. Four at a time keeps every open inside the cap.
+      const pids = [...idsByPid];
+      const METRICS_CONCURRENCY = 4;
+      for (let i = 0; i < pids.length; i += METRICS_CONCURRENCY) {
+        await Promise.all(pids.slice(i, i + METRICS_CONCURRENCY).map(async ([pid, ids]) => {
+          try { metricsMaps.set(pid, await this.graph(pid === -1 ? undefined : pid).getMetricsBatch(ids)); }
+          catch { metricsMaps.set(pid, new Map()); }
+        }));
+      }
     }
     const zeroMetrics = (id: string): GraphMetrics => ({
       nodeId: id, incomingEdgeCount: 0, outgoingEdgeCount: 0, callerCount: 0, calleeCount: 0,
@@ -453,9 +522,16 @@ export class SemanticSearchService {
     let ordered: SemanticSearchResult[];
     if (hybridOn) {
       const keyOf = (r: SemanticSearchResult) => r.nodeId || `${r.filePath}:${r.lineStart}`;
+      // The vector list is the vector-sourced joined results in score order;
+      // the bm25 list is the joined results the FTS returned, in FTS order.
+      const vectorList = results.filter(r => vectorIds.has(r.nodeId));
+      const bm25List = results
+        .filter(r => bm25Order.has(r.nodeId))
+        .sort((a, b) => (bm25Order.get(a.nodeId) ?? 0) - (bm25Order.get(b.nodeId) ?? 0));
       const fused = rrfFuse<SemanticSearchResult>([
-        { source: 'vector', weight: hybridCfg.vectorWeight, items: results, key: keyOf },
+        { source: 'vector', weight: hybridCfg.vectorWeight, items: vectorList, key: keyOf },
         { source: 'keyword', weight: hybridCfg.keywordWeight, items: keywordHits, key: keyOf },
+        ...(bm25List.length ? [{ source: 'bm25' as const, weight: hybridCfg.bm25Weight, items: bm25List, key: keyOf }] : []),
       ]);
       // Secondary dedupe: a vector node and a symbol hit can carry different
       // ids for the same file:line (e.g. re-indexed under a new hash).
@@ -474,7 +550,7 @@ export class SemanticSearchService {
         ordered.push(r);
       }
       ordered = ordered.slice(0, HYBRID_CANDIDATES);
-      logger.debug(`[hybrid] vector=${results.length} keyword=${keywordHits.length} fused=${ordered.length} (vw=${hybridCfg.vectorWeight} kw=${hybridCfg.keywordWeight})`);
+      logger.debug(`[hybrid] vector=${vectorList.length} keyword=${keywordHits.length} bm25=${bm25List.length} fused=${ordered.length} (vw=${hybridCfg.vectorWeight} kw=${hybridCfg.keywordWeight} bw=${hybridCfg.bm25Weight})`);
     } else {
       ordered = results.map(r => ({ ...r, score: r.combinedScore, sources: ['vector'] as ResultSources }));
       ordered = ordered.slice(0, HYBRID_CANDIDATES);
@@ -595,7 +671,7 @@ export class SemanticSearchService {
    */
   private async keywordCandidates(
     query: string,
-    opts: { projectId?: number; nodeType?: string; limit: number; graphWeight: number },
+    opts: { projectId?: number; projectIds?: number[]; nodeType?: string; limit: number; graphWeight: number; includeGraphMetrics?: boolean },
   ): Promise<SemanticSearchResult[]> {
     const { getFantomFunctionSearchIndex } = await import('../fantom-code/searchIndex.js');
     const index = getFantomFunctionSearchIndex();
@@ -607,7 +683,7 @@ export class SemanticSearchService {
     const seen = new Set<string>();
     const hits: ReturnType<typeof index.search> = [];
     for (const variant of keywordQueryVariants(query)) {
-      const more = index.search(variant, { limit: opts.limit, projectId: opts.projectId });
+      const more = index.search(variant, { limit: opts.limit, projectId: opts.projectId, projectIds: opts.projectIds });
       for (const h of more) {
         const id = (h.function as { id: string }).id;
         if (seen.has(id)) continue;
@@ -618,7 +694,7 @@ export class SemanticSearchService {
     }
     // Same batching as the vector join: one metrics query pair per project.
     const kwMetrics = new Map<number, Map<string, GraphMetrics>>();
-    {
+    if (opts.includeGraphMetrics !== false) {
       const idsByPid = new Map<number, string[]>();
       for (const h of hits) {
         const f = h.function as unknown as { id: string; projectId: number };
@@ -930,7 +1006,10 @@ export class SemanticSearchService {
     // v3: graph context pre-pass (paged, per project — never per node), then
     // expand each node into its chunk items. Node ids stay the same; a long
     // symbol just yields several texts.
-    const context = await buildEmbeddingContext(projectId, nodes);
+    // v4: an LLM-written `about:` sentence per node goes in front of the graph
+    // line (cached per content hash; a failure just leaves the v3 text).
+    const graphContext = await buildEmbeddingContext(projectId, nodes);
+    const context = await withLlmContext(projectId, nodes, graphContext);
     const workItems: EmbeddingItem[] = [...buildEmbeddingItems(nodes, context), ...syntheticItems];
     ssCrash(`ITEMS_TO_EMBED nodes=${nodes.length} items=${workItems.length} synthetic=${syntheticItems.length}`);
 

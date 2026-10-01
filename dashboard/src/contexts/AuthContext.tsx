@@ -45,6 +45,55 @@ const STORAGE_KEYS = {
   PASSWORD: 'admin_pass',
 };
 
+/**
+ * Dev-mode-only automation sign-in for browser agents that cannot type into
+ * password fields (jev-browser). A URL fragment `#auth=<base64 of user:pass>`
+ * seeds the same stored credentials the login form would write, but only when
+ * BOTH hold:
+ *   - the dashboard is served from the developer's own machine
+ *     (localhost / 127.0.0.1), and
+ *   - the server reports `devMode: true` on /health, which it does only while
+ *     the marker file `config/dev-mode` exists on that host
+ *     (src/config/devMode.ts).
+ * Nothing is bypassed: the credentials still have to pass /admin/users/me
+ * before anything renders, exactly as after a form login. The fragment never
+ * leaves the browser (fragments are not sent to servers) and is removed from
+ * the URL as soon as it is read, whether or not it was honoured.
+ */
+async function consumeAuthFragment(): Promise<void> {
+  if (typeof window === 'undefined') return;
+  const m = /^#auth=([A-Za-z0-9+/=_-]+)$/.exec(window.location.hash);
+  if (!m) return;
+  // Strip first so the fragment never survives a reload or lands in history.
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+
+  const host = window.location.hostname;
+  if (host !== 'localhost' && host !== '127.0.0.1') return;
+
+  let devMode = false;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    const r = await fetch(`${getApiBase()}/health`, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (r.ok) devMode = (await r.json())?.devMode === true;
+  } catch {
+    devMode = false;
+  }
+  if (!devMode) return;
+
+  try {
+    const decoded = atob(m[1].replace(/-/g, '+').replace(/_/g, '/'));
+    const sep = decoded.indexOf(':');
+    if (sep > 0) {
+      localStorage.setItem(STORAGE_KEYS.USERNAME, decoded.substring(0, sep));
+      localStorage.setItem(STORAGE_KEYS.PASSWORD, decoded.substring(sep + 1));
+    }
+  } catch {
+    // malformed fragment: ignore, fall through to the login screen
+  }
+}
+
 // ============================================
 // Provider
 // ============================================
@@ -220,6 +269,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
    */
   useEffect(() => {
     const initAuth = async () => {
+      // Dev-mode fragment sign-in (no-op unless the URL carries #auth=).
+      await consumeAuthFragment();
       const userData = await verifyCredentials();
 
       if (userData) {

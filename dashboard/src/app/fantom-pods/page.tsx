@@ -4,7 +4,7 @@ import { useState, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, FantomPod, FantomPodWithInstance, CreatePodInput, FantomInstance } from '@/lib/api';
-import { ProjectsSidebar, ProjectsSidebarEntry } from '@/components/ProjectsSidebar';
+import { ProjectsSidebar, ProjectsSidebarEntry, ProjectsSidebarGroup } from '@/components/ProjectsSidebar';
 import { DependencyCounts, ProjectDependenciesPanel } from '@/components/ProjectDependenciesPanel';
 
 /** Normalise a filesystem path the same way the server's dependency summary does (no trailing slash). */
@@ -70,6 +70,9 @@ export default function FantomPodsPage() {
   const [selectedPodForCompile, setSelectedPodForCompile] = useState<FantomPod | null>(null);
   const [selectedPodForLogs, setSelectedPodForLogs] = useState<FantomPod | null>(null);
   const [filterInstanceId, setFilterInstanceId] = useState<number | 'all' | 'unassigned'>('all');
+  // Sidebar group = the Fantom SDK version an instance runs on ("1.0.83").
+  // Selecting one shows the pods of every instance on that Fantom version.
+  const [filterFantomVersion, setFilterFantomVersion] = useState<string | null>(null);
   const [filterVersion, setFilterVersion] = useState<string>('all');
   const [formData, setFormData] = useState<CreatePodInput>({
     name: '',
@@ -387,13 +390,19 @@ export default function FantomPodsPage() {
       result = result.filter(p => p.instance?.id === filterInstanceId);
     }
 
+    // Filter by the instance's Fantom SDK version (sidebar group).
+    if (filterFantomVersion) {
+      const ids = new Set(instances.filter(i => (i.fantomVersion ?? 'unknown') === filterFantomVersion).map(i => i.id));
+      result = result.filter(p => p.instance && ids.has(p.instance.id));
+    }
+
     // Filter by version compatibility
     if (filterVersion !== 'all') {
       result = result.filter(p => isPodCompatibleWithVersion(p, filterVersion));
     }
 
     return result;
-  }, [allPods, filterInstanceId, filterVersion]);
+  }, [allPods, instances, filterInstanceId, filterFantomVersion, filterVersion]);
 
   // Group pods by instance
   const podGroups = useMemo(() => {
@@ -448,7 +457,10 @@ export default function FantomPodsPage() {
     );
   }
 
-  // Projects panel entries (mirror of the instance filter dropdown).
+  // Projects panel entries (mirror of the instance filter dropdown). "All"
+  // and "Unassigned" stay pinned; instances sit under their Fantom SDK
+  // version ("Fantom 1.0.83"), newest first — selecting a version header
+  // shows the pods of every instance on it.
   const projectFilterEntries: ProjectsSidebarEntry<number | 'all' | 'unassigned'>[] = [
     { id: 'all', label: 'All Pods', count: allPods.length },
     {
@@ -463,13 +475,36 @@ export default function FantomPodsPage() {
       count: allPods.filter((p) => p.instance?.id === instance.id).length,
     })),
   ];
+  const fantomVersionOf = (id: number | 'all' | 'unassigned'): string | null => {
+    if (id === 'all' || id === 'unassigned') return null;
+    return instances.find((i) => i.id === id)?.fantomVersion ?? 'unknown';
+  };
+  const fantomVersionGroups: ProjectsSidebarGroup[] = (() => {
+    const acc = new Map<string, number>();
+    for (const i of instances) {
+      const v = i.fantomVersion ?? 'unknown';
+      acc.set(v, (acc.get(v) ?? 0) + allPods.filter((p) => p.instance?.id === i.id).length);
+    }
+    const tuple = (v: string) => { const m = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(v); return m ? [Number(m[1]), Number(m[2]), Number(m[3] ?? 0)] : [-1, -1, -1]; };
+    return [...acc.entries()]
+      .sort(([a], [b]) => { const ta = tuple(a), tb = tuple(b); for (let k = 0; k < 3; k++) if (ta[k] !== tb[k]) return tb[k] - ta[k]; return 0; })
+      // The row's right-hand number is the instance count (members); pods go
+      // in the sublabel so the two are not read as one figure.
+      .map(([v, count]) => ({ key: v, label: v === 'unknown' ? 'Fantom version unknown' : `Fantom ${v}`, sublabel: `${count} pod${count === 1 ? '' : 's'}` }));
+  })();
 
   return (
     <div className="flex flex-col lg:flex-row gap-4">
       <ProjectsSidebar
         entries={projectFilterEntries}
-        selectedId={filterInstanceId}
-        onSelect={setFilterInstanceId}
+        groups={fantomVersionGroups}
+        groupOf={(e) => fantomVersionOf(e.id)}
+        storageKey="fantom-pods"
+        selectedId={filterFantomVersion ? null : filterInstanceId}
+        selectedGroupKeys={filterFantomVersion ? [filterFantomVersion] : []}
+        onSelect={(id) => { setFilterFantomVersion(null); setFilterInstanceId(id); }}
+        onSelectGroup={(key) => { setFilterFantomVersion(key); setFilterInstanceId('all'); }}
+        groupTitle={(g, n) => `Show the pods of all ${n} instance${n === 1 ? '' : 's'} on ${g.label}`}
       />
 
       {/* Main Content Column */}

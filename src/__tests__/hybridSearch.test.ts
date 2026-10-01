@@ -28,6 +28,23 @@ type Hit = { id: string };
 const key = (h: Hit) => h.id;
 const hits = (...ids: string[]): Hit[] => ids.map(id => ({ id }));
 
+describe('hybridSearch.rrfFuse (three lists, v4)', () => {
+  it('a bm25-only hit ranks by its own weight; a hit in all three lists wins', () => {
+    const fused = rrfFuse<Hit>([
+      { source: 'vector', weight: 1.0, items: hits('v', 'all'), key },
+      { source: 'keyword', weight: 0.7, items: hits('k', 'all'), key },
+      { source: 'bm25', weight: 0.8, items: hits('b', 'all'), key },
+    ]);
+    const byKey = Object.fromEntries(fused.map(e => [e.key, e]));
+    expect(fused[0].key).toBe('all');
+    expect(byKey.all.sources).toEqual(['both']);
+    expect(byKey.all.ranks).toEqual({ vector: 2, keyword: 2, bm25: 2 });
+    expect(byKey.b.sources).toEqual(['bm25']);
+    expect(byKey.b.score).toBeCloseTo(0.8 / 61, 10);
+    expect(byKey.b.score).toBeGreaterThan(byKey.k.score);
+  });
+});
+
 describe('hybridSearch.rrfFuse', () => {
   it('uses k=60 and sums weight/(k+rank) per list', () => {
     expect(RRF_K).toBe(60);

@@ -71,3 +71,6 @@ dashboard/config/*.json
 
 # ast-grep parser libraries built by scripts/build-ast-grep-parsers.sh
 .ast-grep/parsers/
+
+# Dev-mode marker (src/config/devMode.ts): enables local-only dashboard conveniences
+config/dev-mode

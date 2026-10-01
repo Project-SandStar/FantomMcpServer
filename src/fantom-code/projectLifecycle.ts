@@ -115,6 +115,7 @@ export async function removeProject(
     } else {
       try {
         await prisma.fantomProject.delete({ where: { id: projectId } });
+        void import('../projects/versionGroup.js').then((m) => m.invalidateVersionGroupCache()).catch(() => {});
         prismaRowDeleted = true;
         steps.prismaRow = 'ok';
       } catch (err) {

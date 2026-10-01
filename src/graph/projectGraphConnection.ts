@@ -60,6 +60,16 @@ interface Entry {
 }
 
 const entries = new Map<number, Entry>();
+/**
+ * Opens in progress, keyed by project. Two callers that both miss `entries`
+ * (five re-embed workers plus a search fan-out do this) used to open TWO
+ * native Databases on the same file; the second `entries.set` replaced the
+ * first, whose handle was then freed while the engine was still using it —
+ * SIGSEGV in `BufferManager::pin` under an auto-checkpoint (three crashes,
+ * 2026-09-29/30; the crash log shows the same project opened twice 20 ms
+ * apart before each). Every caller now awaits the one open in flight.
+ */
+const opening = new Map<number, Promise<InstanceType<typeof Connection>>>();
 
 /** Default cap on simultaneously-open project DBs. Each entry holds a native
  *  file handle + Kuzu lock + buffer manager + virtual mmap. The old cap of 2
@@ -139,7 +149,111 @@ function isUnrecoverableDbError(msg: string): boolean {
   // is the missing shadow-paging file (".shadow"); a truncated WAL checkpoint
   // marker surfaces as "Reading past the end of the file …<id>.db.wal.checkpoint";
   // the rest are explicit corruption markers.
-  return /\.shadow|\.wal\.checkpoint|reading past the end of the file|unexpected end of file|wal.*(replay|recover|corrupt)|corrupt|checksum|truncated|malformed|database is (invalid|damaged)/i.test(msg);
+  // "not a valid Lbug database file" (2026-09-20, project 367): a file with no
+  // LBUG magic, e.g. left over from an older storage format. It was not
+  // matched here, so every open threw and the project stayed broken for days.
+  return /\.shadow|\.wal\.checkpoint|reading past the end of the file|unexpected end of file|wal.*(replay|recover|corrupt)|corrupt|checksum|truncated|malformed|database is (invalid|damaged)|not a valid .*database file|invalid .*database file|bad magic|unsupported (storage|file|database) version/i.test(msg);
+}
+
+// ── On-disk pre-flight ──────────────────────────────────────────────────────
+//
+// Every LadybugDB (Kuzu) database file starts with the 4-byte magic "LBUG".
+// A file without it can never open, and until 2026-09-20 nothing checked for
+// that before the first query: the open failed with a message the self-heal
+// path did not recognise, hydrate failed, the deferred first-parse hit the
+// same error, and the project silently had no graph. The pre-flight below
+// runs at boot (and from the admin API) BEFORE any open: a bad file is
+// quarantined (renamed, never deleted — it is evidence) and the project is
+// flagged so the boot drain force-reindexes it from source.
+
+const LBUG_MAGIC = 'LBUG';
+
+export type GraphStorePreflight =
+  | { ok: true; exists: boolean }
+  | { ok: false; reason: string; quarantinedTo: string | null };
+
+/** Rename <id>.db (and remove its Kuzu sidecars) instead of deleting it. */
+function quarantineProjectDbFiles(projectId: number, reason: string): string | null {
+  const dbPath = getProjectDbPath(projectId);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const target = `${dbPath}.corrupt-${stamp}`;
+  let moved: string | null = null;
+  try {
+    if (fs.existsSync(dbPath)) {
+      fs.renameSync(dbPath, target);
+      moved = target;
+    }
+  } catch (err) {
+    logger.warn(`Project ${projectId}: could not quarantine ${dbPath} (${err instanceof Error ? err.message : String(err)}); deleting instead`);
+  }
+  // Sidecars (WAL, checkpoint marker, shadow, tmp, pid) are useless without
+  // the main file and would poison the recreated DB — always remove them.
+  for (const f of projectDbSiblings(dbPath)) {
+    try {
+      if (fs.existsSync(f)) fs.rmSync(f, { recursive: true, force: true });
+    } catch { /* best effort */ }
+  }
+  logger.warn(`Project ${projectId} graph store quarantined (${reason})${moved ? ` → ${path.basename(moved)}` : ''}; flagged for rebuild from source`);
+  projectsNeedingGraphRebuild.add(projectId);
+  return moved;
+}
+
+/**
+ * Check a project's graph store on disk without opening it. A missing file is
+ * fine (first index creates it). A file that exists but lacks the LBUG magic,
+ * or is too short to hold a header, is quarantined and the project flagged.
+ */
+export function preflightProjectGraphStore(projectId: number): GraphStorePreflight {
+  const dbPath = getProjectDbPath(projectId);
+  let fd: number | null = null;
+  try {
+    if (!fs.existsSync(dbPath)) return { ok: true, exists: false };
+    const st = fs.statSync(dbPath);
+    if (st.isDirectory()) {
+      // Legacy layout (a directory per DB) — Kuzu ≥ 0.10 uses a single file.
+      const to = quarantineProjectDbFiles(projectId, 'directory where a database file is expected');
+      return { ok: false, reason: 'directory where a database file is expected', quarantinedTo: to };
+    }
+    if (st.size < LBUG_MAGIC.length) {
+      const to = quarantineProjectDbFiles(projectId, `file is ${st.size} bytes`);
+      return { ok: false, reason: `file is ${st.size} bytes`, quarantinedTo: to };
+    }
+    fd = fs.openSync(dbPath, 'r');
+    const buf = Buffer.alloc(LBUG_MAGIC.length);
+    fs.readSync(fd, buf, 0, LBUG_MAGIC.length, 0);
+    const magic = buf.toString('latin1');
+    if (magic !== LBUG_MAGIC) {
+      const reason = `bad header ${JSON.stringify(magic)}, expected "${LBUG_MAGIC}"`;
+      fs.closeSync(fd); fd = null;
+      const to = quarantineProjectDbFiles(projectId, reason);
+      return { ok: false, reason, quarantinedTo: to };
+    }
+    return { ok: true, exists: true };
+  } catch (err) {
+    // Cannot even stat/read it: leave it alone and let the open path decide.
+    logger.warn(`Project ${projectId} graph store pre-flight could not read ${dbPath}: ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: true, exists: true };
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+  }
+}
+
+/** Pre-flight every <id>.db under the graph directory. Returns what was quarantined. */
+export function preflightAllProjectGraphStores(): { checked: number; quarantined: Array<{ projectId: number; reason: string; quarantinedTo: string | null }> } {
+  const dir = getCachePath('graph');
+  const quarantined: Array<{ projectId: number; reason: string; quarantinedTo: string | null }> = [];
+  let checked = 0;
+  let names: string[] = [];
+  try { names = fs.readdirSync(dir); } catch { return { checked, quarantined }; }
+  for (const name of names) {
+    const m = /^(\d+)\.db$/.exec(name);
+    if (!m) continue;
+    const projectId = parseInt(m[1], 10);
+    checked++;
+    const r = preflightProjectGraphStore(projectId);
+    if (!r.ok) quarantined.push({ projectId, reason: r.reason, quarantinedTo: r.quarantinedTo });
+  }
+  return { checked, quarantined };
 }
 
 /**
@@ -336,8 +450,20 @@ export async function getProjectConnection(
     existing.lastUsed = Date.now();
     return existing.connection;
   }
+  const pending = opening.get(projectId);
+  if (pending) return pending;
+  const p = openProjectConnection(projectId).finally(() => { opening.delete(projectId); });
+  opening.set(projectId, p);
+  return p;
+}
 
+async function openProjectConnection(
+  projectId: number,
+): Promise<InstanceType<typeof Connection>> {
   await evictLruIfNeeded();
+  // The evict awaited; someone may have finished opening this project meanwhile.
+  const raced = entries.get(projectId);
+  if (raced) { raced.lastUsed = Date.now(); return raced.connection; }
 
   const dbPath = getProjectDbPath(projectId);
   const pidfile = checkProjectPidfile(projectId, dbPath);
@@ -366,12 +492,21 @@ export async function getProjectConnection(
     // via projectQuery's free-idle-and-retry. Override via FANTOM_GRAPH_DB_BUFFER_MIB.
     const bufMiBEnv = Number(process.env.FANTOM_GRAPH_DB_BUFFER_MIB);
     const PROJECT_DB_BUFFER_SIZE = (Number.isFinite(bufMiBEnv) && bufMiBEnv > 0 ? bufMiBEnv : 24) * 1024 * 1024;
+    // autoCheckpoint OFF. We CHECKPOINT ourselves on every close (below) and
+    // at shutdown; the engine's own checkpoint fires INSIDE a running query
+    // (`TransactionManager::checkpoint ← Transaction::getNextTuplesInternal`)
+    // and is the writer in every SIGSEGV stack we have
+    // (`Checkpointer::serializeMetadataSnapshot → InMemFileWriter::flush →
+    // BufferManager::pin`). One checkpoint path, at a moment we control.
+    // Fantom's writes per project are small and serialized; a WAL that grows
+    // between closes is folded on eviction.
     const db = new Database(
       dbPath,
       PROJECT_DB_BUFFER_SIZE,
       true,                  // enableCompression
       false,                 // readOnly
       PROJECT_DB_MAX_SIZE,
+      false,                 // autoCheckpoint
     );
     await db.init();
     const conn = new Connection(db);
@@ -389,9 +524,8 @@ export async function getProjectConnection(
       // all Kuzu sidecars and retry once with a fresh empty DB. The graph is
       // regenerable; we flag the project so the auto-embed pipeline rebuilds it
       // from source on its next pass.
-      logger.warn(`Project ${projectId} DB unrecoverable (${msg}); purging corrupt files and recreating empty`);
-      purgeProjectDbFiles(projectId);
-      projectsNeedingGraphRebuild.add(projectId);
+      logger.warn(`Project ${projectId} DB unrecoverable (${msg}); quarantining corrupt files and recreating empty`);
+      quarantineProjectDbFiles(projectId, msg.substring(0, 120));
       try {
         ({ database, connection } = await openDatabase());
         logger.warn(`Project ${projectId} graph DB reset to EMPTY after corruption — flagged for rebuild from source`);
@@ -619,10 +753,29 @@ export async function closeProjectConnection(projectId: number): Promise<void> {
   const entry = entries.get(projectId);
   if (!entry) return;
 
-  // Wait for any in-flight queries to drain. Bounded — emergency timeout.
+  // Wait for in-flight queries to drain. This used to give up after 5 s and
+  // close anyway; with the pool at cap under a search fan-out (5 embed
+  // workers + metrics for 50 candidates) a query queued behind a slow one was
+  // still inFlight when its connection was torn down, and the native side
+  // pinned a page on a closed FileHandle: SIGSEGV in
+  // `lbug::storage::BufferManager::pin ← ShadowUtils::createShadowVersion…`
+  // (node-2026-09-29-162118.ips, node-2026-09-29-193857.ips). A native crash
+  // costs the whole process and every job in it; a connection that stays
+  // open a little longer costs a buffer pool. Wait for the query gate — the
+  // serialized tail of everything queued on this entry — then re-check.
+  // An entry that is STILL busy after a long wait is left open; the LRU
+  // evictor already skips busy entries and proceeds above cap.
   const drainStart = Date.now();
-  while (entry.inFlight > 0 && Date.now() - drainStart < 5000) {
-    await new Promise((r) => setTimeout(r, 25));
+  while (entry.inFlight > 0 && Date.now() - drainStart < 60_000) {
+    try { await entry.queryGate; } catch { /* a rejected op still drained */ }
+    if (entry.inFlight > 0) await new Promise((r) => setTimeout(r, 25));
+  }
+  if (entry.inFlight > 0) {
+    logger.warn(
+      `[projectGraph] project ${projectId}: ${entry.inFlight} query(s) still in flight after 60 s — ` +
+        `leaving the connection open rather than closing under a live query (native SIGSEGV class).`,
+    );
+    return;
   }
 
   // CHECKPOINT folds the WAL into the main file. A read-only session leaves no

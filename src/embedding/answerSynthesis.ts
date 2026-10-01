@@ -269,6 +269,8 @@ function describeScopeProject(p: ScopeProject): string {
  */
 export function buildRlmExecutor(ctx: {
   projectId?: number;
+  /** Version-group scope when there is no primary project (see answerCodeQuestion). */
+  projectIds?: number[];
   siblings?: WorkspaceSibling[];
   crossEncoderReranker: unknown;
   /** 'off' disables the cross-encoder pass on the RLM's own searches. */
@@ -296,12 +298,22 @@ export function buildRlmExecutor(ctx: {
         // No per-hit related-node queries (formatHitForRlm never reads
         // relatedNodes) and a 16-doc rerank: the RLM sees 8 hits, and three
         // concurrent 50-doc reranks measured 1.7 / 4.7 / 6.2s on the cloud path.
+        // No cross-encoder inside the loop. The RLM wants CANDIDATES to read
+        // and follow; the final synthesis reranks the promoted set once. With
+        // rerank on, each of a round's 5 searches paid 7–30 s (join+related
+        // plus a cloud rerank round-trip) and round 1 alone ran 36 s past the
+        // deadline — a 120 s ask synthesised at 143 s (2026-09-30).
         const hits = await svc.search(query, {
           projectId: pid,
+          projectIds: pid === undefined ? ctx.projectIds : undefined,
           limit: 8,
           includeGraphContext: false,
+          // No per-hit graph metrics either: the RLM never reads them, and on
+          // a quiet server they were 4–10 s of a 18–34 s search (136 graph
+          // opens per ask, 37 projects evicted and reopened).
+          includeGraphMetrics: false,
           crossEncoderReranker: { ...((ctx.crossEncoderReranker as Record<string, unknown> | undefined) ?? {}), topK: 16 } as any,
-          rerank: ctx.rerank,
+          rerank: 'off',
         });
         const out: string[] = hits.map(formatHitForRlm);
         for (const h of hits) collectSemantic(h);
@@ -314,7 +326,7 @@ export function buildRlmExecutor(ctx: {
           // primary project's results above are still reranked.
           const legs = await Promise.all(ctx.siblings.map(async (sib) => {
             try {
-              const more = await svc.search(query, { projectId: sib.id, limit: 5, includeGraphContext: false, crossEncoderReranker: ctx.crossEncoderReranker as any, rerank: 'off' });
+              const more = await svc.search(query, { projectId: sib.id, limit: 5, includeGraphContext: false, includeGraphMetrics: false, crossEncoderReranker: ctx.crossEncoderReranker as any, rerank: 'off' });
               return { sib, more };
             } catch { return { sib, more: [] as SemanticSearchResult[] }; }
           }));
@@ -343,7 +355,7 @@ export function buildRlmExecutor(ctx: {
       const pid = ctx.projectId;
       try {
         const { getFantomFunctionSearchIndex } = await import('../fantom-code/searchIndex.js');
-        let hits = getFantomFunctionSearchIndex().search(query, { limit: 10, projectId: pid });
+        let hits = getFantomFunctionSearchIndex().search(query, { limit: 10, projectId: pid, projectIds: pid === undefined ? ctx.projectIds : undefined });
         const tagged = new Map<unknown, string>();
         if (ctx.siblings?.length) {
           for (const sib of ctx.siblings) {
@@ -381,10 +393,14 @@ export function buildRlmExecutor(ctx: {
       const query = raw.trim().replace(/[.-]?js$/i, '').replace(/^\.\//, '');
       if (!query) return 'search_files error: missing "query" argument.';
       const pid = ctx.projectId;
-      if (typeof pid !== 'number') return 'search_files error: no project in scope for this ask.';
+      // Scope: the asked project plus its related projects, or the version
+      // group when the ask has no primary project.
+      const projectIds = typeof pid === 'number'
+        ? [pid, ...(ctx.siblings ?? []).map((s) => s.id)]
+        : [...(ctx.projectIds ?? [])];
+      if (projectIds.length === 0) return 'search_files error: no project in scope for this ask.';
       try {
         const prisma = getPrismaClient();
-        const projectIds = [pid, ...(ctx.siblings ?? []).map((s) => s.id)];
         const projects = await prisma.fantomProject.findMany({ where: { id: { in: projectIds } }, select: { id: true, name: true, path: true } });
         const byId = new Map(projects.map((p) => [p.id, p]));
         // Primary project first, then scope projects; SQLite LIKE is case-insensitive.
@@ -430,7 +446,24 @@ export function buildRlmExecutor(ctx: {
     if (name === 'project_overview') {
       // Always the asked project; ignore any model-supplied projectId (see search_code).
       const pid = ctx.projectId;
-      if (typeof pid !== 'number') return 'project_overview error: no project in scope for this ask.';
+      if (typeof pid !== 'number') {
+        // A version-group ask has no single project: list the group instead.
+        if (ctx.projectIds?.length) {
+          try {
+            const rows = await getPrismaClient().fantomProject.findMany({
+              where: { id: { in: ctx.projectIds } },
+              select: { id: true, name: true, functionCount: true, typeCount: true },
+              orderBy: { functionCount: 'desc' },
+              take: 60,
+            });
+            return `Scope: ${ctx.projectIds.length} projects in the selected version group. Largest first:\n`
+              + rows.map((r) => `- ${r.name} (id ${r.id}; ${r.functionCount} functions, ${r.typeCount} types)`).join('\n');
+          } catch (err) {
+            return `project_overview failed: ${(err as Error).message}`;
+          }
+        }
+        return 'project_overview error: no project in scope for this ask.';
+      }
       try {
         return await buildProjectOverview(pid);
       } catch (err) {
@@ -571,6 +604,14 @@ const RLM_OVERRUN_SLACK_MS = 6_000;
 
 export interface AnswerCodeQuestionOptions {
   projectId?: number;
+  /**
+   * Version-group selector ("haxall 4.0.6", "skyspark 3.1", "skyspark
+   * 3.1.1-3.1.12"; see src/projects/versionGroup.ts). Without a projectId the
+   * whole group is the search scope. With one, the project must belong to the
+   * group and the dependency scope (siblings) is trimmed to the group, so a
+   * Haxall 4.0.6 question never widens into 4.0.4 code.
+   */
+  versionGroup?: string | string[];
   provider?: AnswerProviderSetting;
   model?: string;
   topK?: number;
@@ -678,6 +719,9 @@ export interface AnswerCodeQuestionResult {
   /** Stage-1 RLM (ss-rlm) usage: whether it drafted, which model, and the
    *  tool-use loop stats (rounds / tool calls) when the recursive gather ran. */
   rlm?: { used: boolean; model?: string | null; rounds?: number; toolCalls?: number; /** RLM-found items promoted to citable context. */ citations?: number };
+  /** Jev routing judgment when the gate ran (caller gave no `rlm` flag and
+   *  TypeSafe is enabled). `applied` = it turned the RLM loop off. */
+  jev?: { route: 'direct' | 'rlm'; confidence: number; identifier: boolean; applied: boolean; model: string; ms: number };
 }
 
 /**
@@ -700,7 +744,7 @@ function classifyComplexity(query: string, resultCount: number): 'simple' | 'com
 
 const DEFAULT_MODELS: Record<AnswerProvider, string> = {
   groq: 'llama-3.3-70b-versatile',
-  anthropic: 'claude-sonnet-5',
+  anthropic: 'claude-sonnet-5-5',
   gemini: 'gemini-3.8-flash',
   sidecar: 'qwen3.5:9b',
   // Informational only. The sidecar route pins the model from our own
@@ -898,7 +942,11 @@ export async function answerCodeQuestion(
     (opts.provider ?? synth.provider ?? 'auto') as AnswerProviderSetting;
   // One clock for the whole request; every stage below spends from it.
   const fast = opts.fast === true;
-  const useRlm = opts.rlm ?? !fast;
+  // The caller's flag wins. When it is absent, the Jev gate below may turn the
+  // RLM stage off for a question retrieval already answers.
+  let useRlm = opts.rlm ?? !fast;
+  const rlmExplicit = typeof opts.rlm === 'boolean';
+  let jevDecision: import('./jevGates.js').AskRouteDecision | null = null;
   const useRerank = opts.rerank !== false;
   // 'off' disables the cross-encoder pass; undefined lets config/policy decide.
   const rerankMode: RerankMode | undefined = useRerank ? undefined : 'off';
@@ -960,6 +1008,16 @@ export async function answerCodeQuestion(
   const maxContextChars = opts.maxContextChars ?? synth.maxContextChars ?? 12000;
   const includeHistory = opts.includeHistory ?? synth.includeHistory ?? true;
   const projectId = opts.projectId;
+  // Version group → project id list (or an error when the projectId sits
+  // outside the group). `groupIds` is the whole group; `projectIds` is what an
+  // unscoped search should use (undefined once a projectId narrows it).
+  const { scopeForRequest, describeVersionScope } = await import('../projects/versionGroup.js');
+  const versionScope = await scopeForRequest({ projectId, versionGroup: opts.versionGroup });
+  const groupIds = versionScope.scope ? new Set(versionScope.scope.projectIds) : null;
+  const projectIds = versionScope.projectIds;
+  if (versionScope.scope) {
+    console.log(`[answerCodeQuestion] ${describeVersionScope(versionScope.scope)}${projectId !== undefined ? ` (primary ${projectId})` : ''}`);
+  }
 
   // b. RETRIEVE via semantic search (vector → graph enrich → cross-encoder).
   const svc = getSemanticSearchService(getPrismaClient());
@@ -967,7 +1025,13 @@ export async function answerCodeQuestion(
   // search below stays scoped to exactly one projectId; never unscoped).
   const maxScopeProjects: number | undefined = typeof synth.maxScopeProjects === 'number' ? synth.maxScopeProjects : undefined;
   const tScope0 = Date.now();
-  const siblings = await getRelatedProjects(projectId, maxScopeProjects);
+  let siblings = await getRelatedProjects(projectId, maxScopeProjects);
+  if (groupIds && siblings.length) {
+    // Dependency scope stays inside the version group.
+    const before = siblings.length;
+    siblings = siblings.filter((s) => groupIds.has(s.id));
+    if (siblings.length !== before) console.log(`[answerCodeQuestion] dropped ${before - siblings.length} related project(s) outside the version group`);
+  }
   const scopeMs = Date.now() - tScope0;
   const tPrimary0 = Date.now();
   // The PRIMARY search is not raced. It is the one stage the answer cannot do
@@ -979,6 +1043,7 @@ export async function answerCodeQuestion(
   // search is a slow answer; an empty one is a wrong answer.
   let results = await svc.search(query, {
     projectId,
+    projectIds,
     limit: topK,
     includeGraphContext: true,
     crossEncoderReranker: semanticSearch.crossEncoderReranker,
@@ -1141,8 +1206,34 @@ export async function answerCodeQuestion(
     // with a few seconds left produces nothing and spends the reserve that the
     // final cited pass needs.
     const rlmBudget = msLeft() - SYNTHESIS_RESERVE_MS;
+    // ── Jev gate: is the loop needed for THIS question? ──────────────────
+    // Only when the caller did not decide (`rlm` absent) and the loop would
+    // otherwise run. One typed judgment over the question and the top hits;
+    // `direct` at or above the confidence floor skips the 35–95 s stage.
+    // Anything else — Jev off, no key, timeout, low confidence, `rlm` — keeps
+    // the default. The decision rides along in the result and the ask feed.
+    if (useRlm && !rlmExplicit && rlmBudget >= MIN_RLM_MS) {
+      try {
+        const { decideAskRoute } = await import('./jevGates.js');
+        const tJev0 = Date.now();
+        jevDecision = await decideAskRoute({
+          question: query,
+          hits: results.slice(0, 8).map((r) => ({ qualifiedName: r.qualifiedName, nodeType: r.nodeType, filePath: r.filePath })),
+          versionGroup: versionScope.scope?.raw,
+        });
+        if (jevDecision) {
+          const applied = jevDecision.decisive && jevDecision.route === 'direct';
+          if (applied) useRlm = false;
+          const line = `jev: ${jevDecision.route} (${Math.round(jevDecision.confidence * 100)}%${jevDecision.identifier ? ', identifier' : ''}) ${applied ? '→ skipping the RLM loop' : jevDecision.decisive ? '→ running the RLM loop' : '→ below the confidence floor, default route'} · ${Date.now() - tJev0}ms`;
+          if (opts.askId) emitAskEvent(opts.askId, { kind: 'thought', text: line, detail: 'jev' });
+          try { opts.onProgress?.({ stage: 'investigating', message: line, progress: 2, total: 4 }); } catch { /* ignore */ }
+        }
+      } catch (err) {
+        console.warn(`[jev] gate failed, default route: ${(err as Error).message}`);
+      }
+    }
     if (!useRlm) {
-      console.log(`[answerCodeQuestion] RLM stage off (rlm=false${fast ? ', fast mode' : ''}) — answering from retrieval.`);
+      console.log(`[answerCodeQuestion] RLM stage off (${jevDecision && jevDecision.route === 'direct' && jevDecision.decisive && !rlmExplicit ? 'jev: direct' : `rlm=false${fast ? ', fast mode' : ''}`}) — answering from retrieval.`);
     } else if (rlmBudget < MIN_RLM_MS) {
       console.log(
         `[answerCodeQuestion] skipping the RLM stage — ${Math.round(msLeft() / 1000)}s left of the `
@@ -1155,6 +1246,7 @@ export async function answerCodeQuestion(
       const tools = RLM_TOOLS;
       const executeTool = buildRlmExecutor({
         projectId,
+        projectIds,
         siblings,
         crossEncoderReranker: semanticSearch.crossEncoderReranker,
         rerank: rerankMode,
@@ -1186,6 +1278,18 @@ export async function answerCodeQuestion(
         scopeNote: siblings.length ? buildScopeNote(primaryName, primaryLanguage, siblings) : undefined,
         extraSubQuestions: libraryScopeSubQuestions(query, siblings),
         projectId,
+        // For the plan gate: is a file name the question mentions an indexed
+        // source path in scope (→ search_files) or a generated file that only
+        // exists as a literal in the code (→ search_code)?
+        isIndexedPath: async (fileName: string): Promise<boolean> => {
+          const scope = projectId !== undefined ? [projectId] : projectIds;
+          if (!scope?.length) return false;
+          const hit = await getPrismaClient().indexedFile.findFirst({
+            where: { projectId: { in: scope }, filePath: { endsWith: fileName } },
+            select: { id: true },
+          });
+          return hit !== null;
+        },
         // Evidence is the dominant term in synthesis latency — the prompt is
         // read before a single token comes back, and 16k chars of it bought a
         // 2k answer. 9k keeps the RLM-found code that makes the answer good
@@ -1331,6 +1435,8 @@ export async function answerCodeQuestion(
       maxTokens: fast ? 1024 : Math.max(maxTokens, 4096),
       timeoutMs: synthMax,
       temperature: 0.2,
+      // Synthesis is LLM work: only hosts assigned the rlm-sandbox role carry it.
+      role: 'rlm-sandbox',
     });
     usedProvider = 'openrouter';
     usedModel = out.model;
@@ -1342,8 +1448,36 @@ export async function answerCodeQuestion(
     return out.text;
   };
 
+  // A provider-direct RLM model (`direct:gemini:…`, `direct:anthropic:…`)
+  // also writes the answer: the synthesis prompt goes to that provider's own
+  // API with the same key. Before this the final pass still went through the
+  // sidecar's OpenRouter route with the `direct:` id, which is a 400 there,
+  // and every direct ask degraded to citations-only (2026-09-30).
+  const directSynthesis = async (): Promise<string | null> => {
+    try {
+      const { getOpenRouterSettings } = await import('../sidecars/openRouterConfig.js');
+      const { parseDirectRlmModel } = await import('../sidecars/openRouterModels.js');
+      const direct = parseDirectRlmModel(getOpenRouterSettings().rlmSandboxModel ?? '');
+      if (!direct) return null;
+      const tokens = Math.max(maxTokens, 4096);
+      const text = direct.provider === 'gemini'
+        ? await callGeminiChat(direct.model, SYSTEM_PROMPT, synthUserPrompt, tokens)
+        : await callAnthropicChat(direct.model, SYSTEM_PROMPT, synthUserPrompt, tokens);
+      usedProvider = direct.provider;
+      usedModel = direct.model;
+      console.log(`[answerCodeQuestion] synthesis via ${direct.provider}'s own API (${direct.model}) at ${Math.round((Date.now() - startedAt) / 1000)}s of ${Math.round(budgetMs / 1000)}s`);
+      return text;
+    } catch (err) {
+      console.warn(`[answerCodeQuestion] direct synthesis failed: ${(err as Error).message.split('\n')[0].slice(0, 200)} — falling back to '${provider}'`);
+      return null;
+    }
+  };
+
   try {
-    if (provider === 'openrouter') {
+    const viaDirect = provider === 'openrouter' ? await directSynthesis() : null;
+    if (viaDirect !== null) {
+      answer = viaDirect;
+    } else if (provider === 'openrouter') {
       answer = await runOpenRouter();
     } else if (provider === 'sidecar') {
       answer = await runSidecar();
@@ -1433,5 +1567,15 @@ export async function answerCodeQuestion(
     },
     complexity,
     rlm: { used: rlmUsed, model: rlmModel, rounds: rlmRounds, toolCalls: rlmToolCalls, citations: promoted.length },
+    ...(jevDecision ? {
+      jev: {
+        route: jevDecision.route,
+        confidence: jevDecision.confidence,
+        identifier: jevDecision.identifier,
+        applied: jevDecision.decisive && jevDecision.route === 'direct' && !rlmExplicit,
+        model: jevDecision.model,
+        ms: jevDecision.ms,
+      },
+    } : {}),
   };
 }

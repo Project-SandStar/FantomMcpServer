@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type ShadowStateResponse, type VectorStatsResponse } from '@/lib/api';
+import { formatRelative, formatRunAnchor } from '@/lib/time';
 
 /**
  * Per-project vector coverage table for the dashboard home page.
@@ -156,8 +157,21 @@ export function ProjectVectorTable() {
     queryFn: () => api.getShadowState(),
     refetchInterval: 15_000,
   });
+  // Which projects a re-embed worker is on RIGHT NOW. The console names them;
+  // the table did not, so a row could sit at 0 vectors with nothing saying it
+  // was being written this second.
+  const { data: pipeline } = useQuery({
+    queryKey: ['auto-pipeline-status'],
+    queryFn: () => api.getAutoPipelineStatus(),
+    refetchInterval: 2_000,
+  });
+  const activeIds = new Set((pipeline?.reembedJob?.activeProjects ?? []).map((p) => p.id));
 
-  const [sort, setSort] = useState<'coverage' | 'nodes' | 'name'>('coverage');
+  // Default: by id, so the order on screen is the order the re-embed queue
+  // walks — the rows being written sit on top and the next ones are right
+  // below. Alper asked for this 2026-09-29 after "lowest coverage" kept
+  // reshuffling mid-run and hid what was actually being embedded.
+  const [sort, setSort] = useState<'id' | 'coverage' | 'nodes' | 'name' | 'lastRun'>('id');
   const [filter, setFilter] = useState<'all' | 'incomplete' | 'mismatch'>('all');
   const [busyId, setBusyId] = useState<number | null>(null);
 
@@ -219,8 +233,21 @@ export function ProjectVectorTable() {
       );
     }
     const sorted = [...filtered].sort((a, b) => {
+      // Rows a worker is writing RIGHT NOW always come first, whatever the
+      // sort, so the eye never has to hunt for them.
+      const aActive = activeIds.has(a.id) ? 0 : 1;
+      const bActive = activeIds.has(b.id) ? 0 : 1;
+      if (aActive !== bActive) return aActive - bActive;
+      if (sort === 'id') return a.id - b.id;
       if (sort === 'name') return a.name.localeCompare(b.name);
       if (sort === 'nodes') return b.nodeCount - a.nodeCount;
+      if (sort === 'lastRun') {
+        // Oldest first — the rows most due for a run on top; never-embedded last.
+        const at = a.embeddedAt ? Date.parse(a.embeddedAt) : Number.POSITIVE_INFINITY;
+        const bt = b.embeddedAt ? Date.parse(b.embeddedAt) : Number.POSITIVE_INFINITY;
+        if (at !== bt) return at - bt;
+        return b.nodeCount - a.nodeCount;
+      }
       // coverage: lowest first (worst projects on top)
       const aCov = a.nodeCount > 0 ? a.vectorCount / a.nodeCount : 1;
       const bCov = b.nodeCount > 0 ? b.vectorCount / b.nodeCount : 1;
@@ -228,7 +255,7 @@ export function ProjectVectorTable() {
       return b.nodeCount - a.nodeCount;
     });
     return sorted;
-  }, [stats, sort, filter, configuredModel]);
+  }, [stats, sort, filter, configuredModel, activeIds]);
 
   if (isLoading) {
     return (
@@ -283,9 +310,11 @@ export function ProjectVectorTable() {
             onChange={(e) => setSort(e.target.value as typeof sort)}
             className="text-sm border border-gray-300 rounded-md px-2 py-1"
           >
+            <option value="id">Sort: id (queue order)</option>
             <option value="coverage">Sort: lowest coverage</option>
             <option value="nodes">Sort: most nodes</option>
             <option value="name">Sort: name</option>
+            <option value="lastRun">Sort: oldest run</option>
           </select>
           <button
             onClick={() => {
@@ -337,6 +366,12 @@ export function ProjectVectorTable() {
               <th className="px-4 py-2 text-left font-medium text-gray-500 uppercase tracking-wider">
                 Sidecar
               </th>
+              <th
+                className="px-4 py-2 text-left font-medium text-gray-500 uppercase tracking-wider"
+                title="When this project's vectors were last written (projectEmbeddingMeta.json)"
+              >
+                Last run
+              </th>
               <th className="px-4 py-2 text-right font-medium text-gray-500 uppercase tracking-wider">
                 Action
               </th>
@@ -345,7 +380,7 @@ export function ProjectVectorTable() {
           <tbody className="bg-white divide-y divide-gray-100">
             {rows.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-4 py-8 text-center text-gray-500">
+                <td colSpan={8} className="px-4 py-8 text-center text-gray-500">
                   {filter === 'all' ? 'No projects' : 'No projects match this filter'}
                 </td>
               </tr>
@@ -367,7 +402,10 @@ export function ProjectVectorTable() {
                 p.embeddingModel != null &&
                 configuredModel != null &&
                 p.embeddingModel !== configuredModel;
-              const rowClass = drift
+              const embeddingNow = activeIds.has(p.id);
+              const rowClass = embeddingNow
+                ? 'bg-cyan-50 ring-1 ring-inset ring-cyan-200'
+                : drift
                 ? 'bg-amber-50/50'
                 : mismatch
                 ? 'bg-amber-50/50'
@@ -383,6 +421,15 @@ export function ProjectVectorTable() {
                       #{p.id}
                     </span>
                     {p.name}
+                    {embeddingNow && (
+                      <span
+                        className="ml-2 inline-flex items-center gap-1 rounded-full bg-cyan-100 px-2 py-0.5 text-[11px] font-medium text-cyan-800 border border-cyan-200"
+                        title="A re-embed worker is writing this project right now"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-cyan-500 animate-pulse" />
+                        embedding
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-2 text-right text-gray-700 tabular-nums">
                     {p.nodeCount.toLocaleString()}
@@ -509,6 +556,19 @@ export function ProjectVectorTable() {
                             title={`selected ${p.embeddingSelectedSidecarName}, which served no texts`}
                           >failover</span>
                         )}
+                      </span>
+                    ) : (
+                      <span className="text-xs text-gray-400">—</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2 whitespace-nowrap">
+                    {/* Relative in the cell, exact UTC on hover. `embeddedAt` is
+                        the last vector write for the project; the server blanks
+                        it (like the model) when the project has no vectors, so a
+                        dropped project reads "—", not a stale date. */}
+                    {p.embeddedAt ? (
+                      <span className="text-xs text-gray-700" title={formatRunAnchor(p.embeddedAt)}>
+                        {formatRelative(p.embeddedAt) || formatRunAnchor(p.embeddedAt)}
                       </span>
                     ) : (
                       <span className="text-xs text-gray-400">—</span>

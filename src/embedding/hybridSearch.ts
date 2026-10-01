@@ -6,26 +6,32 @@
  * Everything in here is pure or cheap; the service owns the I/O.
  *
  * Settings (`semanticSearch.*`, runtime config, no restart needed):
- *   hybrid: { enabled: true, vectorWeight: 1.0, keywordWeight: 0.7 }
+ *   hybrid: { enabled: true, vectorWeight: 1.0, keywordWeight: 0.7, bm25Weight: 0.8 }
  *   rerank: 'auto' | 'on' | 'off'   (default 'auto')
+ *
+ * Three lists since v4: vector (ANN), keyword (FlexSearch symbol names) and
+ * bm25 (LanceDB FTS over the stored embed text). The bm25 list is empty on a
+ * pre-v4 table, which leaves the fusion exactly as it was.
  */
 
 import { readRuntimeSemantic, isSidecarUsable } from './providers/embeddingProvider.js';
 import { listSidecars } from '../sidecars/registry.js';
 import type { Sidecar } from '../admin/types.js';
 
-export type RetrievalSource = 'vector' | 'keyword';
-export type ResultSources = Array<'vector' | 'keyword' | 'both'>;
+export type RetrievalSource = 'vector' | 'keyword' | 'bm25';
+/** Which lists a result came from; 'both' = more than one. */
+export type ResultSources = Array<'vector' | 'keyword' | 'bm25' | 'both'>;
 
 export interface HybridSettings {
   enabled: boolean;
   vectorWeight: number;
   keywordWeight: number;
+  bm25Weight: number;
 }
 
 export type RerankMode = 'auto' | 'on' | 'off';
 
-export const DEFAULT_HYBRID: HybridSettings = { enabled: true, vectorWeight: 1.0, keywordWeight: 0.7 };
+export const DEFAULT_HYBRID: HybridSettings = { enabled: true, vectorWeight: 1.0, keywordWeight: 0.7, bm25Weight: 0.8 };
 export const RRF_K = 60;
 /** Candidates pulled from each retriever and handed to the reranker. */
 export const HYBRID_CANDIDATES = 50;
@@ -41,6 +47,7 @@ export function readHybridSettings(): HybridSettings {
     enabled: typeof h.enabled === 'boolean' ? h.enabled : DEFAULT_HYBRID.enabled,
     vectorWeight: num(h.vectorWeight, DEFAULT_HYBRID.vectorWeight),
     keywordWeight: num(h.keywordWeight, DEFAULT_HYBRID.keywordWeight),
+    bm25Weight: num(h.bm25Weight, DEFAULT_HYBRID.bm25Weight),
   };
 }
 
@@ -138,7 +145,7 @@ export function rrfFuse<T>(lists: Array<RankedList<T>>, k: number = RRF_K): Arra
       if (cur) {
         cur.score += contrib;
         cur.ranks[list.source] = rank;
-        cur.sources = ['both'];
+        cur.sources = ['both']; // any two or more lists
       } else {
         acc.set(key, {
           key, item, score: contrib, normalized: 0,

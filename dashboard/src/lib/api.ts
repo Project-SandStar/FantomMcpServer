@@ -856,6 +856,8 @@ export interface AutoPipelineStatus {
   reembedJob?: {
     id: string; scope: 'all' | { projectId: number }; status: string; startedAt: string;
     totalProjects: number; doneProjects: number; currentProjectId?: number; currentProjectName?: string;
+    /** Every project a pool worker is embedding right now. */
+    activeProjects?: Array<{ id: number; name: string }>;
     generated: number; deleted: number; errors: number; model?: string; dimensions?: number; cancelRequested: boolean;
   };
 }
@@ -904,6 +906,8 @@ export interface LLMProvidersResponse {
   groq: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean };
   anthropic: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean };
   gemini: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean };
+  /** TypeSafe Jev — routing judgments (RLM on/off), not a text generator. */
+  typesafe?: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean };
 }
 
 export interface RecentSearch {
@@ -1694,6 +1698,7 @@ export const api = {
     groq?: { enabled?: boolean; model?: string; apiKey?: string };
     anthropic?: { enabled?: boolean; model?: string; apiKey?: string };
     gemini?: { enabled?: boolean; model?: string; apiKey?: string };
+    typesafe?: { enabled?: boolean; model?: string; apiKey?: string };
   }) => apiRequest<{ success: boolean; restartRequired: boolean }>('/settings/llm-providers', { method: 'POST', body }),
 
   // Usage
@@ -2122,7 +2127,7 @@ export const api = {
   // ============================================
   // Vector/Semantic Search
   // ============================================
-  semanticSearch: (query: string, options?: { projectId?: number; nodeType?: string; limit?: number; includeGraphContext?: boolean }) =>
+  semanticSearch: (query: string, options?: { projectId?: number; versionGroup?: string | string[]; nodeType?: string; limit?: number; includeGraphContext?: boolean }) =>
     apiRequest<SemanticSearchResponse>('/vectors/search', {
       method: 'POST',
       body: { query, ...options },
@@ -2135,7 +2140,7 @@ export const api = {
    * calls answerCodeQuestion directly and keeps the full budget, so it still
    * gets the RLM-found citations.
    */
-  ask: (body: { query: string; projectId?: number; provider?: string; model?: string; topK?: number; fast?: boolean; rlm?: boolean; rerank?: boolean; askId?: string }) =>
+  ask: (body: { query: string; projectId?: number; versionGroup?: string | string[]; provider?: string; model?: string; topK?: number; fast?: boolean; rlm?: boolean; rerank?: boolean; askId?: string }) =>
     apiRequest<AskAnswerResponse>('/vectors/ask', {
       method: 'POST',
       body,
@@ -2505,6 +2510,9 @@ export interface VectorStatsResponse {
   projects: Array<{
     id: number;
     name: string;
+    instanceId?: number | null;
+    /** Product/version line ("haxall/4.0.6"); null when unknown. */
+    group?: { key: string; label: string; product: string; version: string | null } | null;
     nodeCount: number;
     vectorCount: number;
     embeddingModel?: string | null;

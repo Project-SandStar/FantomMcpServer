@@ -31,7 +31,7 @@ interface RerankItem { nodeId: string; score: number }
 
 const DEFAULT_MODELS: Record<LLMProviderName, string> = {
   groq: 'llama-3.3-70b-versatile',
-  anthropic: 'claude-sonnet-5',
+  anthropic: 'claude-sonnet-5-5',
   gemini: 'gemini-3.8-flash',
 };
 

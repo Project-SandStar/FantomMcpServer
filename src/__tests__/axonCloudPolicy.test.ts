@@ -24,9 +24,30 @@ import { jest } from '@jest/globals';
 
 const CLOUD_MODEL = 'qwen/qwen3-embedding-4b';
 const LOCAL_MODEL = 'qwen3-embedding:4b';
+const DIMS = 2560;
 
 /** What the mocked config holds for the case under test. */
 let policy: string = 'cloud';
+
+// `resolveAxonEmbeddingModel()` reads `semanticSearch.codeModel` and
+// `codeDimensions` from the runtime config FILE. Unmocked, that was the live
+// `config/fantomMcpServer-config.json` of whoever ran the suite — the test
+// passed only while that file happened to hold the 4B/2560 pair, and failed
+// the day the fleet moved to 8B/4096 (2026-09-30). Fixed values here, like
+// openRouterOnlyPolicy.test.ts does.
+jest.unstable_mockModule('node:fs', () => {
+  const real = jest.requireActual('node:fs') as typeof import('node:fs');
+  const isRuntimeConfig = (p: unknown) => String(p).endsWith('fantomMcpServer-config.json');
+  return {
+    ...real,
+    default: real,
+    existsSync: (p: string) => (isRuntimeConfig(p) ? true : real.existsSync(p)),
+    readFileSync: (p: string, enc?: BufferEncoding) =>
+      (isRuntimeConfig(p)
+        ? JSON.stringify({ semanticSearch: { codeModel: LOCAL_MODEL, codeDimensions: DIMS } })
+        : real.readFileSync(p, enc as BufferEncoding)),
+  };
+});
 
 /**
  * The two doors, for the wiring test below. Both WORK — a search that reached
@@ -124,7 +145,7 @@ describe('resolveAxonEmbeddingModel — resolved through the code-embedding poli
 
   it('reports dims from codeDimensions — the width the provider gate verifies against', () => {
     policy = 'cloud';
-    expect(resolveAxonEmbeddingModel().dimensions).toBe(2560);
+    expect(resolveAxonEmbeddingModel().dimensions).toBe(DIMS);
   });
 });
 

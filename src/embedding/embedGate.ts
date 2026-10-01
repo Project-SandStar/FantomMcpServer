@@ -18,12 +18,29 @@
  */
 
 let shadowReembedActive = false;
+/** True while a full rebuild writes the ACTIVE slot (`live: true`), not a shadow. */
+let liveRebuildActive = false;
 
-export function setShadowReembedActive(active: boolean): void {
-  shadowReembedActive = active;
+/**
+ * `target` says which slot the rebuild writes. Readers that must not fight a
+ * rebuild (watchdog, auto-embed) gate on either; `/vectors/stats` counts the
+ * INACTIVE slot only for a shadow build. A live rebuild used to raise the same
+ * flag and the page counted the inactive slot — empty right after a width
+ * change dropped the old table — and showed 0 vectors while 16k rows landed
+ * in the live one (2026-09-29, 4B → 8B switch).
+ */
+export function setShadowReembedActive(active: boolean, target: 'shadow' | 'live' = 'shadow'): void {
+  if (target === 'live') { liveRebuildActive = active; if (active) shadowReembedActive = false; }
+  else { shadowReembedActive = active; if (active) liveRebuildActive = false; }
 }
 
+/** A full rebuild is running somewhere (shadow OR live) — stand down. */
 export function isShadowReembedActive(): boolean {
+  return shadowReembedActive || liveRebuildActive;
+}
+
+/** The rebuild writes the INACTIVE slot: count that slot for progress. */
+export function isShadowSlotBuilding(): boolean {
   return shadowReembedActive;
 }
 

@@ -5,7 +5,7 @@ import { useSearchParams, useRouter } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import dynamic from 'next/dynamic';
 import { getApiBase } from '@/lib/api';
-import { ProjectsSidebar, ProjectsSidebarEntry } from '@/components/ProjectsSidebar';
+import { ProjectsSidebar, ProjectsSidebarEntry, ProjectsSidebarGroup } from '@/components/ProjectsSidebar';
 import { TimelinePicker } from '@/components/timeline/TimelinePicker';
 import { IndexRunStrip } from '@/components/timeline/IndexRunStrip';
 import { PlaybackControls } from '@/components/timeline/PlaybackControls';
@@ -186,7 +186,9 @@ async function rebuildProjectGraph(projectId: number): Promise<{
   return res.json();
 }
 
-async function fetchProjects(): Promise<Array<{ id: number; name: string }>> {
+type ProjectRow = { id: number; name: string; group?: { key: string; label: string; product: string; version: string | null } | null };
+
+async function fetchProjects(): Promise<ProjectRow[]> {
   const apiBase = getApiBase();
   const username = typeof window !== 'undefined' ? localStorage.getItem('admin_user') || 'admin' : 'admin';
   const password = typeof window !== 'undefined' ? localStorage.getItem('admin_pass') || 'admin' : 'admin';
@@ -522,20 +524,45 @@ function Graph3DPageInner() {
     }
   }, [activeProjectId, queryClient]);
 
-  const sidebarEntries: ProjectsSidebarEntry<number>[] = (projects ?? []).map(
-    (p) => ({ id: p.id, label: p.name })
-  );
+  // Product → version → project tree, same shape as /vector-viewer. Inside a
+  // group the instance prefix ("Haxall 4.0.6:") repeats the header, so the
+  // label is the pod path only.
+  const sidebarEntries: ProjectsSidebarEntry<number>[] = (projects ?? []).map((p) => ({
+    id: p.id,
+    label: p.group && p.group.key !== 'other' && p.name.includes(':') ? p.name.slice(p.name.indexOf(':') + 1) : p.name,
+  }));
+  const groupKeyById = new Map((projects ?? []).map((p) => [p.id, p.group?.key ?? 'other']));
+  const sidebarGroups: ProjectsSidebarGroup[] = (() => {
+    const order = ['skyspark', 'haxall', 'fantom', 'other'];
+    const label: Record<string, string> = { skyspark: 'SkySpark', haxall: 'Haxall', fantom: 'Fantom SDK', other: 'Other' };
+    const acc = new Map<string, ProjectsSidebarGroup & { version: string | null }>();
+    for (const p of projects ?? []) {
+      const g = p.group ?? { key: 'other', label: 'Other', product: 'other', version: null };
+      if (!acc.has(g.key)) acc.set(g.key, { key: g.key, label: g.label, product: g.product, productLabel: label[g.product] ?? g.product, version: g.version });
+    }
+    const tuple = (v: string | null) => { const m = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(v ?? ''); return m ? [Number(m[1]), Number(m[2]), Number(m[3] ?? 0)] : [-1, -1, -1]; };
+    return [...acc.values()].sort((a, b) => {
+      const pa = order.indexOf(a.product ?? ''), pb = order.indexOf(b.product ?? '');
+      if (pa !== pb) return (pa === -1 ? 99 : pa) - (pb === -1 ? 99 : pb);
+      const ta = tuple(a.version), tb = tuple(b.version);
+      for (let i = 0; i < 3; i++) if (ta[i] !== tb[i]) return tb[i] - ta[i];
+      return 0;
+    });
+  })();
 
   return (
     <div className="flex flex-col lg:flex-row gap-4">
       <ProjectsSidebar
         entries={sidebarEntries}
+        groups={sidebarGroups}
+        groupOf={(e) => groupKeyById.get(e.id) ?? 'other'}
+        storageKey="graph-3d"
         selectedId={activeProjectId || null}
         onSelect={(id) => setProjectId(id)}
         emptyMessage="No projects indexed"
         fillHeight
         filterable
-        filterPlaceholder="Filter projects…"
+        filterPlaceholder="Filter projects or versions…"
       />
 
       <div className="flex-1 min-w-0 space-y-4">

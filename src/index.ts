@@ -135,6 +135,11 @@ function resolveRssGuardMb(): number {
   return 4000;
 }
 const RSS_GUARD_MB = resolveRssGuardMb();
+/** Shared description for the `versionGroup` argument of the project-scoped tools. */
+const VERSION_GROUP_ARG_DOC =
+  'Restrict to one or more product/version lines: "haxall 4.0.6", "skyspark 3.1" (any patch), "skyspark 3.1.1-3.1.12" (range), '
+  + '"fantom 1.0.83", or a product alone ("haxall"). Several: "haxall 4.0.6, skyspark 3.1.12" (comma-separated). '
+  + 'Use listVersionGroups for the groups. Combine with projectId only when the project is in the group.';
 if (RSS_GUARD_MB > 0) {
   setInterval(() => {
     const rssMb = process.memoryUsage().rss / 1024 / 1024;
@@ -154,6 +159,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { getInstallRoot } from './utils/installRoot.js';
+import { isDevMode } from './config/devMode.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -320,7 +326,7 @@ class FantomMCPServer {
     this.server = new Server(
       {
         name: 'mcp-fantom',
-        version: '1.0.1',
+        version: '1.1.0',
       },
       {
         capabilities: {
@@ -645,7 +651,11 @@ class FantomMCPServer {
       // drain serially after the boot loop completes via runIndex (which DOES
       // hash-gate). The deferred drain is best-effort and does not block boot
       // readiness — server is already responsive when we get here.
-      const pendingFirstParse: Array<{ id: number; name: string; path: string }> = [];
+      // `force`: the graph store was quarantined (corrupt on disk) and recreated
+      // empty, so the hash-gate must not skip the re-parse — file hashes are
+      // unchanged but the graph is gone.
+      const pendingFirstParse: Array<{ id: number; name: string; path: string; force?: boolean }> = [];
+      const { preflightProjectGraphStore, projectNeedsGraphRebuild } = await import('./graph/projectGraphConnection.js');
       let projIdx = 0;
       for (const project of projects) {
         projIdx++;
@@ -659,6 +669,17 @@ class FantomMCPServer {
             // Circuit breaker tripped — re-entering native Kuzu would SIGSEGV.
             // Skip; searchFantomCode falls back to in-memory state on demand.
             crashLog(`BOOT_PROJ_SKIP id=${project.id} reason=ladybug-degraded`);
+            continue;
+          }
+          // Pre-flight the on-disk store BEFORE opening it: a file without the
+          // LBUG magic can never open. It is quarantined (renamed) and the
+          // project goes straight to a forced re-parse instead of failing
+          // hydrate, then failing the deferred first-parse the same way.
+          const pre = preflightProjectGraphStore(project.id);
+          if (!pre.ok) {
+            this.log(`  Graph store for ${project.name} quarantined (${pre.reason}) — rebuilding from source after boot`);
+            crashLog(`BOOT_PROJ_QUARANTINE id=${project.id} reason=${pre.reason} to=${pre.quarantinedTo ?? 'deleted'}`);
+            pendingFirstParse.push({ id: project.id, name: project.name, path: project.path, force: true });
             continue;
           }
           crashLog(`BOOT_PROJ_HYDRATE_START id=${project.id} name=${project.name}`);
@@ -677,9 +698,17 @@ class FantomMCPServer {
           if (hydratedRows > 0) {
             this.log(`  Hydrated ${project.name} (language=${projLang}) from LadybugDB`);
           } else {
-            // Never indexed before — queue for post-boot drain.
-            pendingFirstParse.push({ id: project.id, name: project.name, path: project.path });
-            crashLog(`BOOT_PROJ_DEFER_PARSE id=${project.id} name=${project.name}`);
+            // Never indexed before — queue for post-boot drain. If the open
+            // path self-healed a corrupt store during hydrate, the graph is
+            // now empty while file hashes are unchanged: force the re-parse.
+            // Same when Prisma says the project had symbols but the graph has
+            // none (store deleted or quarantined by hand): a plain runIndex
+            // would hash-gate to "no changes" and leave the graph empty.
+            const hadSymbols = ((project as any).functionCount ?? 0) > 0 || ((project as any).typeCount ?? 0) > 0;
+            const force = projectNeedsGraphRebuild(project.id) || hadSymbols;
+            if (force) this.log(`  Graph for ${project.name} is empty but the project was indexed before — forcing a rebuild after boot`);
+            pendingFirstParse.push({ id: project.id, name: project.name, path: project.path, force });
+            crashLog(`BOOT_PROJ_DEFER_PARSE id=${project.id} name=${project.name} force=${force} hadSymbols=${hadSymbols}`);
           }
         } catch (err) {
           this.log(`    Error hydrating project ${project.name}: ${err}`);
@@ -779,9 +808,13 @@ class FantomMCPServer {
           crashLog(`BOOT_DRAIN_ENTER ${drainIdx}/${pendingFirstParse.length} id=${p.id} name=${p.name}`);
           const t0 = Date.now();
           try {
-            const r = await runIndex(db, getPrismaClient(), p.id, { trigger: 'manual' });
-            crashLog(`BOOT_DRAIN_DONE id=${p.id} fns=${r.indexResult.functionsIndexed} types=${r.indexResult.typesIndexed} ms=${Date.now() - t0}`);
-            this.log(`  First-parse ${p.name}: ${r.indexResult.functionsIndexed} fns, ${r.indexResult.typesIndexed} types`);
+            const r = await runIndex(db, getPrismaClient(), p.id, { trigger: 'manual', force: p.force === true });
+            crashLog(`BOOT_DRAIN_DONE id=${p.id} force=${p.force === true} fns=${r.indexResult.functionsIndexed} types=${r.indexResult.typesIndexed} ms=${Date.now() - t0}`);
+            this.log(`  ${p.force ? 'Rebuilt' : 'First-parse'} ${p.name}: ${r.indexResult.functionsIndexed} fns, ${r.indexResult.typesIndexed} types`);
+            if (p.force) {
+              const { clearProjectGraphRebuildFlag } = await import('./graph/projectGraphConnection.js');
+              clearProjectGraphRebuildFlag(p.id);
+            }
           } catch (err) {
             crashLog(`BOOT_DRAIN_FAIL id=${p.id} err=${err instanceof Error ? err.message : String(err)}`);
             this.log(`  First-parse ${p.name} failed: ${err}`);
@@ -1463,7 +1496,7 @@ class FantomMCPServer {
         };
       })(),
       initialized: this.initializationComplete,
-      version: '1.0.1',
+      version: '1.1.0',
       serverPath: path.resolve(dirname(fileURLToPath(import.meta.url)), 'index.js'),
       port: getServerPort(),
       stats: {
@@ -1770,6 +1803,7 @@ class FantomMCPServer {
                 isPublic: { type: 'boolean', description: 'Filter by visibility' },
                 limit: { type: 'number', description: 'Max results (default: 20)' },
                 compatibleWith: { type: 'string', description: 'Filter to compatible version' },
+                versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
                 dedupBy: { type: 'string', enum: ['none', 'qualifiedName', 'qualifiedNameSignature'], description: 'Collapse duplicate hits (default: qualifiedNameSignature). Helpful when bundled/vendored code produces the same symbol from multiple file paths.' },
               },
               required: ['query'],
@@ -1861,6 +1895,7 @@ class FantomMCPServer {
                 query: { type: 'string', description: 'Substring to score against name, path, podName, description' },
                 language: { type: 'string', description: 'Exact language match (e.g. "typescript")' },
                 instanceId: { type: 'number', description: 'Filter to one instance' },
+                versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
                 hasGraphData: { type: 'boolean', description: 'Only projects with >0 LadybugDB nodes' },
                 minFunctions: { type: 'number', description: 'Skip projects with fewer than N indexed functions' },
                 limit: { type: 'number', description: 'Max results (default 20, max 100)' },
@@ -1887,6 +1922,7 @@ class FantomMCPServer {
               type: 'object',
               properties: {
                 compatibleWith: { type: 'string', description: 'Filter to compatible version' },
+                versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
                 limit: { type: 'number', description: 'Max rows (default 50, max 500)' },
                 offset: { type: 'number', description: 'Pagination offset (default 0)' },
                 pathContains: { type: 'string', description: 'Case-insensitive substring match on path' },
@@ -2197,6 +2233,7 @@ class FantomMCPServer {
                 query: { type: 'string', description: 'Natural language search query' },
                 projectId: { type: 'number', description: 'Filter by project ID' },
                 projectName: { type: 'string', description: 'Alternative to projectId — exact name match' },
+                versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
                 nodeType: { type: 'string', description: 'Filter by node type (function, method, type)' },
                 limit: { type: 'number', description: 'Max results (default: 10)' },
               },
@@ -2214,6 +2251,7 @@ class FantomMCPServer {
               properties: {
                 query: { type: 'string', description: 'Natural language question about the codebase' },
                 projectId: { type: 'number', description: 'Filter by project ID' },
+                versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
                 useRlm: { type: 'boolean', description: 'Run the RLM investigation loop (tool calls over search + call graph) before answering. Default true: deeper, cited answers, typically 60–120s. false answers from retrieval only (~20–40s).' },
                 useReranker: { type: 'boolean', description: 'Cross-encoder rerank of retrieved candidates (default true; routed to local GPU or OpenRouter per policy). false keeps the fused vector+keyword order.' },
               },
@@ -2232,9 +2270,16 @@ class FantomMCPServer {
                 nodeId: { type: 'string', description: 'Node ID (alternative to qualifiedName)' },
                 projectId: { type: 'number', description: 'Filter by project ID' },
                 projectName: { type: 'string', description: 'Alternative to projectId — exact name match' },
+                versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
                 limit: { type: 'number', description: 'Max results (default: 5)' },
               },
             },
+          },
+          {
+            name: 'listVersionGroups',
+            description: 'List the product/version groups projects belong to (SkySpark 3.1.12, Haxall 4.0.6, Fantom 1.0.83, …) with project counts. Pass a group to the versionGroup filter of the search tools.',
+            category: 'retrieve',
+            inputSchema: { type: 'object', properties: {} },
           },
           {
             name: 'getCallers',
@@ -2661,6 +2706,10 @@ class FantomMCPServer {
         status: 'ok',
         initialized: this.initializationComplete,
         uptime: process.uptime(),
+        // True only when the config/dev-mode marker file exists on this host.
+        // The dashboard enables local-only conveniences (fragment sign-in for
+        // browser agents) from this flag; see src/config/devMode.ts.
+        devMode: isDevMode(),
         docsIndexed: this.searchIndex.getStats().totalItems || 0,
         activeSessions: this.httpTransports.size,
         agents: {
@@ -2738,7 +2787,7 @@ class FantomMCPServer {
 
           // Create a NEW Server instance for this session
           const sessionServer = new Server(
-            { name: 'mcp-fantom', version: '1.0.1' },
+            { name: 'mcp-fantom', version: '1.1.0' },
             { capabilities: { tools: {}, resources: {} } }
           );
 
@@ -3391,6 +3440,7 @@ class FantomMCPServer {
                 type: 'string',
                 description: 'Filter to code from pods compatible with this version (e.g., "3.1.12")',
               },
+              versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
               dedupBy: {
                 type: 'string',
                 enum: ['none', 'qualifiedName', 'qualifiedNameSignature'],
@@ -3457,6 +3507,7 @@ class FantomMCPServer {
               query: { type: 'string', description: 'Substring to score against name/path/podName/description. Empty query returns recent projects sorted by lastIndexed.' },
               language: { type: 'string', description: 'Exact language match (e.g. "typescript")' },
               instanceId: { type: 'number', description: 'Filter to one instance' },
+              versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
               hasGraphData: { type: 'boolean', description: 'Only projects with >0 LadybugDB nodes' },
               minFunctions: { type: 'number', description: 'Skip projects with fewer than N indexed functions' },
               limit: { type: 'number', description: 'Max results (default 20, max 100)' },
@@ -3485,6 +3536,7 @@ class FantomMCPServer {
                 type: 'string',
                 description: 'Filter to projects from instances compatible with this version (e.g., "3.1.12")',
               },
+              versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
               limit: { type: 'number', description: 'Max rows (default 50, max 500)' },
               offset: { type: 'number', description: 'Pagination offset (default 0)' },
               pathContains: { type: 'string', description: 'Case-insensitive substring match on path' },
@@ -3892,6 +3944,7 @@ class FantomMCPServer {
               query: { type: 'string', description: 'Natural language search query' },
               projectId: { type: 'number', description: 'Filter by project ID' },
               projectName: { type: 'string', description: 'Alternative to projectId — exact name match' },
+              versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
               nodeType: { type: 'string', description: 'Filter by node type (function, method, type)' },
               limit: { type: 'number', description: 'Max results (default: 10)', default: 10 },
             },
@@ -3911,6 +3964,7 @@ class FantomMCPServer {
             properties: {
               query: { type: 'string', description: 'Natural language question about the codebase' },
               projectId: { type: 'number', description: 'Filter by project ID' },
+              versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
               useRlm: { type: 'boolean', description: 'Run the RLM investigation loop (tool calls over search + call graph) before answering. Default true: deeper, cited answers, typically 60–120s. false answers from retrieval only (~20–40s).' },
               useReranker: { type: 'boolean', description: 'Cross-encoder rerank of retrieved candidates (default true; routed to local GPU or OpenRouter per policy). false keeps the fused vector+keyword order.' },
             },
@@ -3933,9 +3987,20 @@ class FantomMCPServer {
               nodeId: { type: 'string', description: 'Node ID (alternative to qualifiedName)' },
               projectId: { type: 'number', description: 'Filter by project ID' },
               projectName: { type: 'string', description: 'Alternative to projectId — exact name match' },
+              versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
               limit: { type: 'number', description: 'Max results (default: 5)', default: 5 },
             },
           },
+        },
+        // Version groups: the product/version lines the search tools can be scoped to
+        {
+          name: 'listVersionGroups',
+          description:
+            'List the product/version groups the indexed projects belong to — SkySpark 3.1.12, Haxall 4.0.6, ' +
+            'Fantom 1.0.83, … — with project counts and ids. Pass a group to the `versionGroup` argument of ' +
+            'searchFantomCode / semanticCodeSearch / askCodebase / findSimilarCode / listFantomProjects / searchProjects ' +
+            'to search one version line only ("haxall 4.0.6", "skyspark 3.1", "skyspark 3.1.1-3.1.12").',
+          inputSchema: { type: 'object', properties: {} },
         },
         // Graph Navigation: Get Callers
         {
@@ -4591,7 +4656,7 @@ class FantomMCPServer {
         }
 
         case 'searchFantomCode': {
-          const { query, projectId: pidIn, projectName, instanceId, podId, category, className, type: funcType, isPublic, limit = 20, compatibleWith, dedupBy = 'qualifiedNameSignature' } = args as {
+          const { query, projectId: pidIn, projectName, instanceId, podId, category, className, type: funcType, isPublic, limit = 20, compatibleWith, versionGroup, dedupBy = 'qualifiedNameSignature' } = args as {
             query: string;
             projectId?: number;
             projectName?: string;
@@ -4603,12 +4668,15 @@ class FantomMCPServer {
             isPublic?: boolean;
             limit?: number;
             compatibleWith?: string;
+            versionGroup?: string;
             dedupBy?: 'none' | 'qualifiedName' | 'qualifiedNameSignature';
           };
           const { resolveProjectId } = await import('./utils/dbBootstrap.js');
           const projectId = await resolveProjectId(getPrismaClient(), { projectId: pidIn, projectName });
+          const { scopeForRequest, describeVersionScope } = await import('./projects/versionGroup.js');
+          const versionScope = await scopeForRequest({ projectId, versionGroup });
 
-          this.log(`Searching Fantom code for: "${query}"${instanceId ? ` (instanceId: ${instanceId})` : ''}${podId ? ` (podId: ${podId})` : ''}${compatibleWith ? ` (compatibleWith: ${compatibleWith})` : ''}`);
+          this.log(`Searching Fantom code for: "${query}"${instanceId ? ` (instanceId: ${instanceId})` : ''}${podId ? ` (podId: ${podId})` : ''}${compatibleWith ? ` (compatibleWith: ${compatibleWith})` : ''}${versionScope.scope ? ` (${describeVersionScope(versionScope.scope)})` : ''}`);
 
           const searchIndex = getFantomFunctionSearchIndex();
           // Pull more rows than `limit` so dedup can collapse duplicates
@@ -4617,6 +4685,7 @@ class FantomMCPServer {
           const options: FunctionSearchOptions = {
             limit: Math.min(limit * fetchMultiplier, 500),
             projectId,
+            projectIds: versionScope.projectIds,
             instanceId,
             podId,
             category: category as FantomCategory,
@@ -4927,6 +4996,7 @@ class FantomMCPServer {
             query = '',
             language: filterLanguage,
             instanceId: filterInstanceId,
+            versionGroup,
             hasGraphData,
             minFunctions,
             limit = 20,
@@ -4934,11 +5004,12 @@ class FantomMCPServer {
             query?: string;
             language?: string;
             instanceId?: number;
+            versionGroup?: string;
             hasGraphData?: boolean;
             minFunctions?: number;
             limit?: number;
           };
-          this.log(`searchProjects "${query}" lang=${filterLanguage ?? 'any'} hasGraph=${hasGraphData ?? 'any'}`);
+          this.log(`searchProjects "${query}" lang=${filterLanguage ?? 'any'} hasGraph=${hasGraphData ?? 'any'}${versionGroup ? ` versionGroup="${versionGroup}"` : ''}`);
 
           const db = getFantomDatabase();
           await db.initialize();
@@ -4951,6 +5022,11 @@ class FantomMCPServer {
           }
           if (typeof filterInstanceId === 'number') {
             projects = projects.filter(p => p.instanceId === filterInstanceId);
+          }
+          if (versionGroup) {
+            const { resolveVersionScope } = await import('./projects/versionGroup.js');
+            const inGroup = new Set((await resolveVersionScope(versionGroup)).projectIds);
+            projects = projects.filter(p => inGroup.has(p.id));
           }
           if (typeof minFunctions === 'number') {
             projects = projects.filter(p => p.functionCount >= minFunctions);
@@ -5055,6 +5131,7 @@ class FantomMCPServer {
         case 'listFantomProjects': {
           const {
             compatibleWith,
+            versionGroup,
             limit = 50,
             offset = 0,
             pathContains,
@@ -5064,6 +5141,7 @@ class FantomMCPServer {
             compact = true,
           } = args as {
             compatibleWith?: string;
+            versionGroup?: string;
             limit?: number;
             offset?: number;
             pathContains?: string;
@@ -5075,6 +5153,7 @@ class FantomMCPServer {
 
           this.log(
             `Listing Fantom projects${compatibleWith ? ` (compatibleWith: ${compatibleWith})` : ''}` +
+            (versionGroup ? ` (versionGroup: ${versionGroup})` : '') +
             ` limit=${limit} offset=${offset}` +
             (pathContains ? ` pathContains="${pathContains}"` : '') +
             (nameContains ? ` nameContains="${nameContains}"` : '')
@@ -5083,6 +5162,8 @@ class FantomMCPServer {
           const db = getFantomDatabase();
           await db.initialize();
           let projects = await db.getAllProjects();
+          const { getProjectVersionGroups, resolveVersionScope } = await import('./projects/versionGroup.js');
+          const groupsById = await getProjectVersionGroups().catch(() => new Map());
 
           // Apply scalar filters first.
           if (filterLanguage) {
@@ -5091,6 +5172,10 @@ class FantomMCPServer {
           }
           if (typeof filterInstanceId === 'number') {
             projects = projects.filter(p => p.instanceId === filterInstanceId);
+          }
+          if (versionGroup) {
+            const inGroup = new Set((await resolveVersionScope(versionGroup)).projectIds);
+            projects = projects.filter(p => inGroup.has(p.id));
           }
           if (nameContains) {
             const needle = nameContains.toLowerCase();
@@ -5126,11 +5211,13 @@ class FantomMCPServer {
           // Compact projection by default to keep responses under the token cap.
           const rows = slice.map(p => {
             const ext = p as any;
+            const vg = groupsById.get(p.id);
             if (compact) {
               return {
                 id: p.id,
                 name: p.name,
                 language: ext.language ?? 'fantom',
+                versionGroup: vg?.key ?? null,
                 functionCount: p.functionCount,
                 typeCount: p.typeCount,
                 lastIndexed: p.lastIndexed,
@@ -5144,6 +5231,8 @@ class FantomMCPServer {
               parserType: ext.parserType,
               podName: p.podName,
               instanceId: p.instanceId,
+              versionGroup: vg?.key ?? null,
+              versionGroupLabel: vg?.label ?? null,
               description: (p as any).description,
               functionCount: p.functionCount,
               typeCount: p.typeCount,
@@ -5164,6 +5253,7 @@ class FantomMCPServer {
                   limit: safeLimit,
                   hasMore: safeOffset + safeLimit < total,
                   ...(compatibleWith && { compatibleWith }),
+                  ...(versionGroup && { versionGroup }),
                   projects: rows,
                 }, null, 2)
               }
@@ -5981,22 +6071,25 @@ class FantomMCPServer {
 
         case 'semanticCodeSearch': {
           const ssConfig = this.config.semanticSearch || {};
-          const { query, projectId: pidIn, projectName, nodeType, limit = ssConfig.defaultLimit || 10 } = args as {
+          const { query, projectId: pidIn, projectName, versionGroup, nodeType, limit = ssConfig.defaultLimit || 10 } = args as {
             query: string;
             projectId?: number;
             projectName?: string;
+            versionGroup?: string;
             nodeType?: string;
             limit?: number;
           };
 
-          this.log(`Semantic code search: "${query}"`);
-
           const prisma = getPrismaClient();
           const { resolveProjectId } = await import('./utils/dbBootstrap.js');
           const projectId = await resolveProjectId(prisma, { projectId: pidIn, projectName });
+          const { scopeForRequest, describeVersionScope } = await import('./projects/versionGroup.js');
+          const versionScope = await scopeForRequest({ projectId, versionGroup });
+          this.log(`Semantic code search: "${query}"${versionScope.scope ? ` (${describeVersionScope(versionScope.scope)})` : ''}`);
           const semanticService = getSemanticSearchService(prisma);
           const results = await semanticService.search(query, {
             projectId,
+            projectIds: versionScope.projectIds,
             nodeType,
             limit,
             minScore: ssConfig.minScore,
@@ -6011,7 +6104,7 @@ class FantomMCPServer {
             };
           }
 
-          const lines = [`Found ${results.length} results:\n`];
+          const lines = [`Found ${results.length} results${versionScope.scope ? ` (${describeVersionScope(versionScope.scope)})` : ''}:\n`];
           for (const result of results) {
             lines.push(`## ${result.qualifiedName}`);
             lines.push(`   Score: ${(result.combinedScore * 100).toFixed(1)}% (semantic: ${(result.semanticScore * 100).toFixed(1)}%, graph: ${(result.graphScore * 100).toFixed(1)}%)`);
@@ -6047,9 +6140,28 @@ class FantomMCPServer {
           return result;
         }
 
+        case 'listVersionGroups': {
+          const { listVersionGroups } = await import('./projects/versionGroup.js');
+          const groups = await listVersionGroups();
+          await trackTool(true);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                count: groups.length,
+                hint: 'Pass `key` or `label` as the versionGroup argument; "skyspark 3.1" selects every 3.1.x group, "skyspark 3.1.1-3.1.12" a range, "haxall 4.0.6, skyspark 3.1.12" several.',
+                groups: groups.map((g) => ({
+                  key: g.key, label: g.label, product: g.product, version: g.version, line: g.line,
+                  projectCount: g.projectCount,
+                })),
+              }, null, 2),
+            }],
+          };
+        }
+
         case 'askCodebase': {
-          const { query, projectId, useRlm, useReranker } = args as { query: string; projectId?: number; useRlm?: boolean; useReranker?: boolean };
-          this.log(`Ask codebase: "${query}"${useRlm === false ? ' (no RLM)' : ''}${useReranker === false ? ' (no rerank)' : ''}`);
+          const { query, projectId, versionGroup, useRlm, useReranker } = args as { query: string; projectId?: number; versionGroup?: string; useRlm?: boolean; useReranker?: boolean };
+          this.log(`Ask codebase: "${query}"${versionGroup ? ` (versionGroup: ${versionGroup})` : ''}${useRlm === false ? ' (no RLM)' : ''}${useReranker === false ? ' (no rerank)' : ''}`);
           const { answerCodeQuestion } = await import('./embedding/answerSynthesis.js');
           // MCP progress: if the client sent a progressToken, stream stage
           // updates back as notifications/progress. Fire-and-forget — a
@@ -6063,7 +6175,7 @@ class FantomMCPServer {
                 }).catch(() => {});
               }
             : undefined;
-          const result = await answerCodeQuestion(query, { projectId, onProgress, rlm: useRlm, rerank: useReranker });
+          const result = await answerCodeQuestion(query, { projectId, versionGroup, onProgress, rlm: useRlm, rerank: useReranker });
           const out = [result.answer.trim()];
           if (result.citations.length > 0) {
             out.push('', 'Sources:');
@@ -6078,17 +6190,20 @@ class FantomMCPServer {
         }
 
         case 'findSimilarCode': {
-          const { qualifiedName, nodeId: rawNodeId, projectId: pidIn, projectName, limit = 5 } = args as {
+          const { qualifiedName, nodeId: rawNodeId, projectId: pidIn, projectName, versionGroup, limit = 5 } = args as {
             qualifiedName?: string;
             nodeId?: string;
             projectId?: number;
             projectName?: string;
+            versionGroup?: string;
             limit?: number;
           };
           const { resolveProjectId } = await import('./utils/dbBootstrap.js');
           const projectId = await resolveProjectId(getPrismaClient(), { projectId: pidIn, projectName });
+          const { scopeForRequest } = await import('./projects/versionGroup.js');
+          const versionScope = await scopeForRequest({ projectId, versionGroup });
 
-          this.log(`Find similar code: ${qualifiedName || rawNodeId}`);
+          this.log(`Find similar code: ${qualifiedName || rawNodeId}${versionGroup ? ` (versionGroup: ${versionGroup})` : ''}`);
 
           const prisma = getPrismaClient();
           let nodeId = rawNodeId;
@@ -6107,7 +6222,7 @@ class FantomMCPServer {
           }
 
           const semanticService = getSemanticSearchService(prisma);
-          const results = await semanticService.findSimilar(nodeId, { projectId, limit });
+          const results = await semanticService.findSimilar(nodeId, { projectId, projectIds: versionScope.projectIds, limit });
 
           if (results.length === 0) {
             await trackTool(true);

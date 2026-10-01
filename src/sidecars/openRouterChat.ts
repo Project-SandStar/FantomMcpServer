@@ -32,10 +32,13 @@
  */
 
 import { listSidecars } from './registry.js';
+import { getSidecarHeartbeatAgeMs } from './soundsuiteMaster.js';
 
 /** The sidecar's OpenRouter-facing HTTP port. */
 const SIDECAR_API_PORT = 8098;
 const DEFAULT_TIMEOUT_MS = 90_000;
+/** A heartbeat older than this (client sends every 5 s) marks the host's WS path as unreliable. */
+const STALE_HEARTBEAT_MS = 60_000;
 
 export class OpenRouterChatUnavailable extends Error {
   readonly code = 'openrouter-chat-unavailable';
@@ -115,7 +118,18 @@ export interface OpenRouterChatResult {
 export async function openRouterChat(
   system: string,
   user: string,
-  opts: { maxTokens?: number; timeoutMs?: number; temperature?: number } = {},
+  opts: {
+    maxTokens?: number;
+    timeoutMs?: number;
+    temperature?: number;
+    reasoning?: boolean;
+    /**
+     * Only hosts that run this role are asked (while at least one does). The
+     * route itself needs no container — it is a proxy — but which host carries
+     * LLM traffic is the operator's call, made by assigning the role.
+     */
+    role?: string;
+  } = {},
 ): Promise<OpenRouterChatResult> {
   const masterUrl = await canonicalMasterUrl();
   if (!masterUrl) {
@@ -127,23 +141,66 @@ export async function openRouterChat(
   // Any enabled sidecar will do: the route is a thin proxy and the key it uses
   // is ours regardless of which host answers. Trying them in turn means one
   // unreachable host does not fail the request.
-  const all = listSidecars({ enabled: true });
+  // Which hosts, in which order:
+  //   1. With `opts.role`: only hosts that RUN the role (from their own status),
+  //      while any does. A host the operator left without the role is not asked
+  //      — that is what assigning roles per host means.
+  //   2. The host that answered last time first, if it still qualifies.
+  //   3. Hosts with a fresh WS heartbeat before hosts without one. A host whose
+  //      register frame arrives but whose heartbeat frames do not (gpu-02,
+  //      2026-09-29: PMTU drops large frames) is reachable over HTTP yet cannot
+  //      return a multi-KB completion in time; it was `lastGoodHost` once and
+  //      then ate the whole 39s window on every ask.
+  let all = listSidecars({ enabled: true });
   if (all.length === 0) throw new OpenRouterChatUnavailable('no enabled sidecar is registered.');
-  // Try the host that answered last time first. Registry order put the same
-  // host first every call, so when that host was slow every request paid for
-  // it before failing over — if it failed over at all.
-  const hosts = lastGoodHost
-    ? [...all.filter(h => h.name === lastGoodHost), ...all.filter(h => h.name !== lastGoodHost)]
-    : all;
+  if (opts.role) {
+    const { hostsForRole, describeRoleHosts } = await import('./sidecarRoles.js');
+    const ranked = await hostsForRole(opts.role, { strict: true });
+    if (ranked.length && !ranked.some(h => h.hasRole)) {
+      console.warn(`[openrouter-chat] no enabled sidecar reports the ${opts.role} role — trying every host (${describeRoleHosts(opts.role, ranked)})`);
+    } else {
+      const skipped = all.filter(s => !ranked.some(h => h.sidecar.id === s.id)).map(s => s.name);
+      if (skipped.length) console.log(`[openrouter-chat] ${opts.role}: not asking ${skipped.join(', ')} (role not assigned there)`);
+    }
+    all = ranked.map(h => h.sidecar);
+  }
+  const heartbeatAge = (id: string): number | null => {
+    try { return getSidecarHeartbeatAgeMs(id); } catch { return null; }
+  };
+  const fresh = (id: string): boolean => {
+    const age = heartbeatAge(id);
+    return age !== null && age < STALE_HEARTBEAT_MS;
+  };
+  const ranked = [...all].sort((a, b) => {
+    const fa = fresh(a.id) ? 0 : 1;
+    const fb = fresh(b.id) ? 0 : 1;
+    if (fa !== fb) return fa - fb;
+    return 0;
+  });
+  const hosts = lastGoodHost && fresh(ranked.find(h => h.name === lastGoodHost)?.id ?? '')
+    ? [...ranked.filter(h => h.name === lastGoodHost), ...ranked.filter(h => h.name !== lastGoodHost)]
+    : ranked;
+  const stale = hosts.filter(h => !fresh(h.id)).map(h => h.name);
+  if (stale.length) console.log(`[openrouter-chat] hosts without a recent heartbeat go last: ${stale.join(', ')}`);
 
-  const body = JSON.stringify({
+  // Thinking models (deepseek-v4-flash, 2026-09-29) spend the whole
+  // max_tokens on reasoning and return content:null, finish_reason:"length".
+  // That surfaced as "empty completion" on every host, and failing over could
+  // not help — every host reaches the same upstream. The cited write-up needs
+  // no chain of thought (the RLM did the investigating), so reasoning is off
+  // unless the caller asks for it; OpenRouter ignores the field for models
+  // without a reasoning mode. Measured on gpu-01: reasoning on → 154 tokens of
+  // which 138 reasoning, 126 chars of answer; off → 159 tokens, 412 chars.
+  const buildBody = (maxTokens: number): string => JSON.stringify({
     messages: [
       { role: 'system', content: system },
       { role: 'user', content: user },
     ],
-    max_tokens: opts.maxTokens ?? 1024,
+    max_tokens: maxTokens,
     ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+    reasoning: { enabled: opts.reasoning === true },
   });
+  const baseMaxTokens = opts.maxTokens ?? 1024;
 
   const errors: string[] = [];
   // ONE deadline for the whole call, not one per host.
@@ -166,24 +223,43 @@ export async function openRouterChat(
     const attemptMs = remaining;
     const timer = setTimeout(() => ac.abort(new Error(`deadline (${attemptMs}ms)`)), attemptMs);
     try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...masterIdentityHeaders(masterUrl) },
-        body,
-        signal: ac.signal,
-      });
-      const json = await res.json().catch(() => null) as any;
-      if (!res.ok) {
+      let maxTokens = baseMaxTokens;
+      let res: Response | null = null;
+      let json: any = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...masterIdentityHeaders(masterUrl) },
+          body: buildBody(maxTokens),
+          signal: ac.signal,
+        });
+        json = await res.json().catch(() => null);
+        if (!res.ok) break;
+        const content = json?.choices?.[0]?.message?.content;
+        const finish = json?.choices?.[0]?.finish_reason;
+        // Cut off before any content came back: the same host gets twice the
+        // room once. A different host would only repeat the cut.
+        if ((typeof content !== 'string' || !content.trim()) && finish === 'length' && attempt === 0) {
+          console.warn(
+            `[openrouter-chat] ${host.name}: hit max_tokens=${maxTokens} with no content `
+            + `(reasoning_tokens=${json?.usage?.completion_tokens_details?.reasoning_tokens ?? '?'}); retrying with ${maxTokens * 2}`,
+          );
+          maxTokens *= 2;
+          continue;
+        }
+        break;
+      }
+      if (!res || !res.ok) {
         // The route returns an OpenAI error envelope, and its messages are
         // written to be actionable (409 names both masters, 503 says which
         // model is missing). Surface it rather than the status alone.
-        const msg = json?.error?.message ?? `HTTP ${res.status}`;
+        const msg = json?.error?.message ?? `HTTP ${res?.status ?? '?'}`;
         errors.push(`${host.name}: ${String(msg).slice(0, 200)}`);
         continue;
       }
       const text = json?.choices?.[0]?.message?.content;
       if (typeof text !== 'string' || !text.trim()) {
-        errors.push(`${host.name}: empty completion`);
+        errors.push(`${host.name}: empty completion (finish_reason=${json?.choices?.[0]?.finish_reason ?? '?'})`);
         continue;
       }
       lastGoodHost = host.name;

@@ -84,6 +84,7 @@ export function EmbeddingActivityConsole() {
           id: polledJob.id, scope: polledJob.scope, status: polledJob.status, startedAt: polledJob.startedAt,
           totalProjects: polledJob.totalProjects, doneProjects: polledJob.doneProjects,
           currentProjectId: polledJob.currentProjectId, currentProjectName: undefined as string | undefined,
+          activeProjects: undefined as Array<{ id: number; name: string }> | undefined,
           generated: polledJob.generated, deleted: polledJob.deleted, errors: polledJob.errors.length,
           model: polledJob.model, dimensions: polledJob.dimensions, cancelRequested: polledJob.cancelRequested,
         }
@@ -159,7 +160,24 @@ export function EmbeddingActivityConsole() {
               </span>
             </>
           )}
-          {currentProjectName && (job || data?.running) && (
+          {/* The re-embed pool runs several projects at once; name them all.
+              A single "now X" flickered between workers and usually showed one
+              that had just finished. */}
+          {job?.activeProjects?.length ? (
+            <>
+              <span className="text-gray-400">·</span>
+              <span className="text-gray-500" title={job.activeProjects.map((p) => `${p.name} (#${p.id})`).join('\n')}>
+                now{' '}
+                {job.activeProjects.slice(0, 5).map((p, i) => (
+                  <span key={p.id}>
+                    {i > 0 && <span className="text-gray-300"> · </span>}
+                    <span className="font-mono text-gray-800">{p.name}</span>
+                  </span>
+                ))}
+                {job.activeProjects.length > 5 && <span className="text-gray-400"> +{job.activeProjects.length - 5}</span>}
+              </span>
+            </>
+          ) : currentProjectName && (job || data?.running) ? (
             <>
               <span className="text-gray-400">·</span>
               <span className="text-gray-500">
@@ -167,7 +185,7 @@ export function EmbeddingActivityConsole() {
                 {currentProjectId != null && <span className="text-gray-400"> (#{currentProjectId})</span>}
               </span>
             </>
-          )}
+          ) : null}
           {(sidecar || servedBy) && (
             <>
               <span className="text-gray-400">·</span>
@@ -219,7 +237,9 @@ export function EmbeddingActivityConsole() {
           <div className="text-cyan-400">
             <span className="text-gray-600">[{hhmmss(new Date().toISOString())}]</span>{' '}
             re-embed job {jobScopeLabel}: {job.doneProjects}/{job.totalProjects} projects, +{job.generated.toLocaleString()} vectors
-            {currentProjectName ? `, embedding ${currentProjectName}` : ''}
+            {job.activeProjects?.length
+              ? `, embedding ${job.activeProjects.map((p) => p.name).join(', ')}`
+              : currentProjectName ? `, embedding ${currentProjectName}` : ''}
             {job.model ? ` [${job.model}${job.dimensions ? ` ${job.dimensions}d` : ''}]` : ''}
             {job.errors > 0 ? ` — ${job.errors} error${job.errors === 1 ? '' : 's'}` : ''}
             {job.cancelRequested ? ' — cancel requested' : ''}

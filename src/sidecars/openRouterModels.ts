@@ -86,8 +86,8 @@ export const EMBEDDING_CATALOGUE: CatalogueModel[] = [
     codeCapable: true,
     localCounterpart: 'qwen3-embedding:4b',
     pinProvider: 'DeepInfra',
-    // The only width-exact drop-in for the live 2560d code table.
-    dropInFor: ['code-embedding'],
+    // Was the drop-in for the 2560d table until 2026-09-29; the live table is
+    // 4096d (8B) now. Sole host DeepInfra — see the 8B entry for why it lost.
   },
   {
     id: 'qwen/qwen3-embedding-8b',
@@ -96,7 +96,14 @@ export const EMBEDDING_CATALOGUE: CatalogueModel[] = [
     contextTokens: 32_768,
     codeCapable: true,
     localCounterpart: 'qwen3-embedding:8b',
-    pinProvider: 'DeepInfra',
+    // Three hosts serve the open weights (Nebius, DeepInfra, SiliconFlow).
+    // Nebius first: DeepInfra's engine answered "Model busy" 91 times in one
+    // boot on 2026-09-29 while sole host of the 4B. The pin is still ONE
+    // upstream per role (the gate keys verdicts on it); a second lane may be
+    // pinned to another host once the cross-host cosine probe clears it.
+    pinProvider: 'Nebius',
+    // 4096d is the live code table since the 2026-09-29 switch.
+    dropInFor: ['code-embedding', 'embedding'],
   },
   {
     id: 'openai/text-embedding-3-small',
@@ -267,6 +274,62 @@ export const RLM_CATALOGUE: CatalogueModel[] = CHAT_CATALOGUE.filter(m => m.tool
  */
 export const DEFAULT_RLM_SANDBOX_MODEL = 'deepseek/deepseek-v4-flash';
 
+/**
+ * RLM models reached through a provider's OWN API with the key on the LLM
+ * Providers page — not through OpenRouter and not through a sidecar. The id
+ * carries the provider as a prefix (`direct:gemini:<model>`); the RLM loop
+ * resolves it to the provider's OpenAI-compatible chat endpoint. Listed in
+ * the same dropdown as the OpenRouter models so the choice is one control.
+ *
+ * Why: the OpenRouter route runs through a sidecar's virtual container and
+ * whatever host OpenRouter picks — deepseek-v4-flash measured 18 tok/s on
+ * DigitalOcean (2026-09-30). Gemini 3.8 Flash on Google's own endpoint
+ * answered the same tool-calling probe in 5 s.
+ */
+export type DirectProvider = 'gemini' | 'anthropic';
+
+export interface DirectRlmModel {
+  id: string;                // 'direct:gemini:gemini-3.8-flash'
+  provider: DirectProvider;  // which key on the LLM Providers page
+  model: string;             // the provider's model id
+  label: string;
+  contextTokens: number;
+  priceIn?: number;
+  priceOut?: number;
+}
+
+export const DIRECT_RLM_MODELS: DirectRlmModel[] = [
+  { id: 'direct:gemini:gemini-3.8-flash', provider: 'gemini', model: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (Gemini API key)', contextTokens: 1_050_000, priceIn: 0.75, priceOut: 3.75 },
+  { id: 'direct:gemini:gemini-3.7-flash', provider: 'gemini', model: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash (Gemini API key)', contextTokens: 1_050_000, priceIn: 0.75, priceOut: 3.75 },
+  { id: 'direct:gemini:gemini-3.5-flash', provider: 'gemini', model: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash (Gemini API key)', contextTokens: 1_050_000, priceIn: 1.50, priceOut: 9.00 },
+  { id: 'direct:anthropic:claude-sonnet-5-5', provider: 'anthropic', model: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 (Anthropic API key)', contextTokens: 1_000_000, priceIn: 3.00, priceOut: 15.00 },
+  { id: 'direct:anthropic:claude-opus-5-5', provider: 'anthropic', model: 'claude-opus-5-5', label: 'Claude Opus 5.5 (Anthropic API key)', contextTokens: 1_000_000, priceIn: 15.00, priceOut: 75.00 },
+  { id: 'direct:anthropic:claude-haiku-4-5-20251001', provider: 'anthropic', model: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 (Anthropic API key)', contextTokens: 200_000, priceIn: 1.00, priceOut: 5.00 },
+];
+
+/** Env var that holds each direct provider's key (set on the LLM Providers page). */
+export const DIRECT_PROVIDER_KEY_ENV: Record<DirectProvider, string> = {
+  gemini: 'GEMINI_API_KEY',
+  anthropic: 'ANTHROPIC_API_KEY',
+};
+
+/** Direct models whose provider key is present in this process. */
+export function availableDirectRlmModels(env: NodeJS.ProcessEnv = process.env): DirectRlmModel[] {
+  return DIRECT_RLM_MODELS.filter(m => !!env[DIRECT_PROVIDER_KEY_ENV[m.provider]]);
+}
+
+/** Parse a `direct:<provider>:<model>` id; null for an OpenRouter id. */
+export function parseDirectRlmModel(id: string): DirectRlmModel | null {
+  return DIRECT_RLM_MODELS.find(m => m.id === id) ?? null;
+}
+
+/** Dropdown label for a direct model — same shape as rlmOptionLabel. */
+export function directRlmOptionLabel(m: DirectRlmModel): string {
+  const parts = [m.label, `${fmtContext(m.contextTokens)} ctx`];
+  if (m.priceIn !== undefined) parts.push(`$${m.priceIn.toFixed(2)}/M in`);
+  return parts.join(' · ');
+}
+
 export type RlmFallbackMode = 'local-only' | 'local-first';
 
 export const RLM_FALLBACK_MODES: Array<{ id: RlmFallbackMode; label: string }> = [
@@ -282,7 +345,7 @@ export function isRlmFallbackMode(v: unknown): v is RlmFallbackMode {
 
 /** Is this a model the RLM loop can actually drive? */
 export function isRlmCapable(id: string): boolean {
-  return RLM_CATALOGUE.some(m => m.id === id);
+  return RLM_CATALOGUE.some(m => m.id === id) || DIRECT_RLM_MODELS.some(m => m.id === id);
 }
 
 /** "<Label> · <ctx> · $<in>/M in" — price matters here in a way it does not

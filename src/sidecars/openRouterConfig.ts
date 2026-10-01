@@ -226,7 +226,7 @@ export interface ValidationIssue { role?: VirtualRole; message: string }
  */
 export function validateOpenRouterSettings(
   s: OpenRouterSettings,
-  opts: { hasKey: boolean },
+  opts: { hasKey: boolean; codeDimensions?: number },
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (!opts.hasKey && !s.keyPushed) {
@@ -262,8 +262,14 @@ export function validateOpenRouterSettings(
     if (isEmbeddingRole && !m.provider) {
       issues.push({ role, message: `Embedding role "${role}" has no pinned upstream provider. Two upstreams serving "${m.model}" can return different vectors, so an unpinned route can split the vector space between requests — the sidecar refuses it and falls back to local.` });
     }
-    if (isEmbeddingRole && m.dims && m.dims !== 2560) {
-      issues.push({ role, message: `Role "${role}" declares ${m.dims}d but code_vectors is 2560d. It would be refused by the compatibility gate.` });
+    // Compare against the CONFIGURED table width, not a literal: the literal
+    // was the 4B's 2560 and blocked the 2026-09-29 switch to the 8B (4096d)
+    // even though the full re-embed that follows a width change is exactly
+    // what makes the new width right. A mismatch is still worth a warning —
+    // it means a shadow rebuild is required before this model can serve.
+    const tableDims = opts.codeDimensions ?? 2560;
+    if (isEmbeddingRole && m.dims && m.dims !== tableDims) {
+      issues.push({ role, message: `Role "${role}" declares ${m.dims}d but the code table is ${tableDims}d. It would be refused by the compatibility gate until a full re-embed at ${m.dims}d (set semanticSearch.codeDimensions to ${m.dims} and run POST /admin/vectors/re-embed/start {projectId:0}).` });
     }
   }
   return issues;

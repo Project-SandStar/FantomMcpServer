@@ -245,6 +245,8 @@ export interface CacheMetadata {
 export interface FunctionSearchOptions {
   limit?: number;
   projectId?: number;
+  /** Restrict to these projects (a version group). Ignored when projectId is set. */
+  projectIds?: number[];
   instanceId?: number;
   podId?: number;
   category?: FantomCategory;

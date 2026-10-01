@@ -223,6 +223,17 @@ export interface RlmGatherOptions {
   extraSubQuestions?: RlmPlan['subQuestions'];
   /** Upper bound on accumulated evidence chars (default 16000). */
   maxEvidenceChars?: number;
+  /** Set false to skip the Jev plan/evidence gates (tests, or a caller that
+   *  already decided). Default on; each gate is advisory and null-safe. */
+  jevGates?: boolean;
+  /** Is this file name an indexed source path in the ask's scope? Lets the
+   *  plan gate send a missed file name to search_files (indexed) or
+   *  search_code (a generated file that exists only as a literal). */
+  isIndexedPath?: (fileName: string) => Promise<boolean>;
+  /** Run the forced-final draft round even when evidence was gathered.
+   *  Default false: synthesis writes the answer from the evidence and the
+   *  draft round cost ~19 s for 0 chars on deepseek-v4-flash. */
+  draftRound?: boolean;
 }
 
 export interface RlmGatherResult {
@@ -237,6 +248,14 @@ export interface RlmGatherResult {
 
 interface RlmEndpoint {
   base: string;
+  /** Full chat-completions URL when it is not `<base>/v1/chat/completions`
+   *  (Gemini's OpenAI-compatible route is `<base>/chat/completions`). Set
+   *  only for provider-direct endpoints; also the signal to send plain
+   *  OpenAI fields only (no OpenRouter extensions such as `reasoning`). */
+  chatUrl?: string;
+  /** Which provider's OpenAI-compatible dialect this is. Each has a quirk
+   *  the loop must respect (see shapeForProvider). Unset = OpenRouter/sidecar. */
+  direct?: 'gemini' | 'anthropic';
   model: string;
   authHeader: Record<string, string>;
   /** True when this is the hosted ss-rlm-sandbox rather than a local ss-rlm. */
@@ -291,6 +310,37 @@ async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoint | nul
     }
   }
   if (mode === 'local-only') return null;
+
+  // A provider-direct model (`direct:gemini:…`): the provider's own
+  // OpenAI-compatible chat endpoint with the key from the LLM Providers page.
+  // No sidecar, no OpenRouter, no master identity — one hop. Gemini's
+  // endpoint passes `tools` through and answers with `tool_calls`
+  // (verified 2026-09-30: gemini-3.8-flash, 5 s, finish_reason tool_calls).
+  if (sandboxModel) {
+    const { parseDirectRlmModel, DIRECT_PROVIDER_KEY_ENV } = await import('../sidecars/openRouterModels.js');
+    const direct = parseDirectRlmModel(sandboxModel);
+    if (direct) {
+      const key = process.env[DIRECT_PROVIDER_KEY_ENV[direct.provider]];
+      if (!key) {
+        console.warn(`[RLM] ${sandboxModel} needs the ${direct.provider} key from the LLM Providers page — none set; skipping RLM.`);
+        return null;
+      }
+      console.log(`[RLM] driving the loop on ${direct.provider}'s own API with ${direct.model}`);
+      // Each provider's OpenAI-compatible chat route (neither is
+      // `<base>/v1/chat/completions`, which the sidecar and vLLM use).
+      // Both verified with a tool-calling probe on 2026-09-30.
+      const chatUrl = direct.provider === 'gemini'
+        ? 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'
+        : 'https://api.anthropic.com/v1/chat/completions';
+      return {
+        base: chatUrl.replace(/\/chat\/completions$/, ''),
+        chatUrl,
+        direct: direct.provider,
+        model: direct.model,
+        authHeader: { Authorization: `Bearer ${key}` },
+      };
+    }
+  }
   if (!sandboxModel) {
     console.warn(
       `[RLM] policy is "${mode}" but no sandbox model is configured — skipping RLM. `
@@ -299,11 +349,19 @@ async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoint | nul
     return null;
   }
 
-  // Any enabled sidecar can host the container; it is reached on its own port,
-  // not through a capability the registry tracks.
-  const { listSidecars } = await import('../sidecars/registry.js');
-  const host = listSidecars({ enabled: true })[0];
-  if (!host) return null;
+  // The host is one that RUNS the rlm-sandbox role — read from the sidecar,
+  // not assumed. `listSidecars()[0]` used to take the first enabled host; a
+  // host the operator deliberately left without the role (gpu-02) was then
+  // asked to drive the loop. Hosts without it are last resort only when no
+  // host has it, and that is logged.
+  const { hostsForRole, describeRoleHosts } = await import('../sidecars/sidecarRoles.js');
+  const ranked = await hostsForRole('rlm-sandbox');
+  const first = ranked[0];
+  if (!first) return null;
+  if (!first.hasRole) {
+    console.warn(`[RLM] no enabled sidecar reports the rlm-sandbox role (${describeRoleHosts('rlm-sandbox', ranked)}) — using ${first.sidecar.name} as last resort`);
+  }
+  const host = first.sidecar;
 
   // Identity. One container serves BOTH masters and each has its own key and
   // budget, so the sidecar refuses (409) rather than guess whose to spend. The
@@ -341,9 +399,10 @@ async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoint | nul
   // want the container's recursion rather than their own.
   const base = `${host.protocol}://${host.host}:${SIDECAR_API_PORT}/api`;
   console.log(
-    mode === 'cloud-only'
+    (mode === 'cloud-only'
       ? `[RLM] "OpenRouter only": driving the loop on ${host.name} via the sidecar's OpenRouter route with ${sandboxModel}`
-      : `[RLM] DEGRADED — no sidecar is running ss-rlm; driving the loop on ${host.name} via the sidecar's OpenRouter route with ${sandboxModel}`,
+      : `[RLM] DEGRADED — no sidecar is running ss-rlm; driving the loop on ${host.name} via the sidecar's OpenRouter route with ${sandboxModel}`)
+    + ` (${describeRoleHosts('rlm-sandbox', ranked)})`,
   );
   return {
     base,
@@ -456,6 +515,24 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
     try { opts.onEvent?.({ ...e, t: Date.now() - t0 }); } catch { /* a bad listener must not fail the gather */ }
   };
 
+  // A tool call cannot be cancelled (the search service has no signal), but
+  // the loop must not WAIT past its deadline: a 30 s reranked search that
+  // finished after the budget pushed a 120 s ask to 143 s. Race every call
+  // against the remaining time; a late result is dropped, not awaited.
+  const toolWithDeadline = async (name: string, args: Record<string, unknown>): Promise<string> => {
+    const ms = remaining();
+    if (ms <= 0) return `${name} skipped: deadline reached.`;
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<string>((resolve) => {
+      timer = setTimeout(() => resolve(`${name} timed out after ${Math.round(ms / 1000)}s (RLM deadline) — answer from the evidence already gathered.`), ms);
+    });
+    try {
+      return await Promise.race([opts.executeTool(name, args), late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   const appendEvidence = (label: string, result: string) => {
     const merged = mergeEvidence([{ label, result }], seenBlocks, Math.max(0, maxEvidenceChars - evidence.length));
     if (merged.text.length > 0) evidence += (evidence ? '\n\n' : '') + merged.text;
@@ -514,6 +591,54 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
     if (opts.plan !== false) {
       plan = await planQuestion(ep, opts, signal, remaining());
     }
+    // Jev gate 2 — does the plan cover the question? A plan that misses the
+    // symbol the question names is the usual reason a gather comes back
+    // empty. When Jev is decisive and names identifiers the plan does not
+    // search, add one search per identifier — search_files for a file name,
+    // search_symbols for a symbol (a file name through search_symbols found
+    // nothing and cost a round-trip each, 2026-09-30); the model's own
+    // sub-questions stay. Advisory: any failure leaves the plan as it is.
+    if (plan && opts.jevGates !== false && remaining() > MIN_ROUND_BUDGET_MS) {
+      try {
+        const { checkPlan, toolForIdentifier, looksLikeFileName } = await import('./jevGates.js');
+        const tJ = Date.now();
+        const d = await checkPlan({ question: opts.question, restated: plan.restated, subQuestions: plan.subQuestions });
+        if (d) {
+          const have = new Set(opts.tools.map((t) => t.function.name));
+          const add = d.decisive && d.coverage < 0.75 ? d.identifiersNotSearched.slice(0, 3) : [];
+          // One Prisma lookup for every file-looking identifier: is it an
+          // indexed source path in scope? Decides search_files vs search_code.
+          const indexed = new Set<string>();
+          const fileIds = add.filter(looksLikeFileName);
+          if (fileIds.length && opts.isIndexedPath) {
+            for (const id of fileIds) { try { if (await opts.isIndexedPath(id)) indexed.add(id); } catch { /* treat as not indexed */ } }
+          }
+          const seen = new Set(plan.subQuestions.map((s) => `${s.tool}:${s.query.toLowerCase()}`));
+          const extras = add
+            .map((id) => ({ id, tool: toolForIdentifier(id, opts.isIndexedPath ? (x) => indexed.has(x) : undefined) }))
+            .filter(({ id, tool }) => have.has(tool) && !seen.has(`${tool}:${id.toLowerCase()}`))
+            .map(({ id, tool }) => ({
+              question: tool === 'search_files' ? `Which files make up ${id} and what do they define?`
+                : tool === 'search_code' ? `Where is ${id} written or read, and by what?`
+                : `Where is ${id} defined and what does it hold?`,
+              tool,
+              query: id,
+            }));
+          if (extras.length) {
+            plan = { restated: plan.restated, subQuestions: [...plan.subQuestions, ...extras] };
+            console.log(`[RLM] plan += ${extras.length} jev sub-question(s): ${extras.map((e) => `${e.tool}(${JSON.stringify(e.query)})`).join(', ')}`);
+          }
+          ev({
+            kind: 'thought',
+            text: `jev: plan covers ${Math.round(d.coverage * 100)}%${d.missing !== 'none' ? `, missing ${d.missing}` : ''}`
+              + `${extras.length ? ` → added ${extras.map((e) => e.query).join(', ')}` : d.decisive ? '' : ' (uncertain, kept as is)'} · ${Date.now() - tJ}ms`,
+            detail: 'jev',
+          });
+        }
+      } catch (err) {
+        console.warn(`[jev] plan gate failed, plan kept: ${(err as Error).message}`);
+      }
+    }
     if (opts.extraSubQuestions?.length) {
       const base = plan ?? { restated: opts.question, subQuestions: [] };
       const seen = new Set(base.subQuestions.map((s) => `${s.tool}:${s.query.toLowerCase()}`));
@@ -540,7 +665,7 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
           ev({ kind: 'ask', id: `g${i + 1}`, text: `${sq.tool}(${JSON.stringify(sq.query)})`, detail: sq.question });
           let result: string;
           try {
-            result = await opts.executeTool(sq.tool, { query: sq.query });
+            result = await toolWithDeadline(sq.tool, { query: sq.query });
           } catch (err) {
             result = `${sq.tool} failed: ${(err as Error).message}`;
           }
@@ -627,6 +752,10 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
           tool_choice: round === maxRounds ? 'none' : 'auto',
           max_tokens: roundMaxTokens,
           temperature,
+          // A round is "read the tool results, decide the next call" — no
+          // chain of thought needed, and on a thinking model it eats the
+          // whole token budget before the tool call (see noReasoning).
+          ...noReasoning(ep),
         },
         signal,
         `round ${round}`,
@@ -695,7 +824,7 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
             );
             let result: string;
             try {
-              result = await opts.executeTool(call.function.name, args);
+              result = await toolWithDeadline(call.function.name, args);
             } catch (err) {
               result = `Tool ${call.function.name} failed: ${(err as Error).message}`;
             }
@@ -723,7 +852,61 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
           messages.push({ role: 'tool', tool_call_id: call.id, name: call.function.name, content: result });
         }
         console.log(`[RLM] round ${round} done elapsed=${Date.now() - roundT0}ms (gathering)`);
+        // The next round would be the forced-final one (tool_choice:'none'),
+        // whose only job is a DRAFT. Synthesis works from the evidence and
+        // reads the draft as a hint at most (answerSynthesis.ts: `rlmDraft`);
+        // it is the answer only when synthesis itself fails. On
+        // deepseek-v4-flash that round returned draftChars=0 in every run
+        // today and cost ~19 s of a 49 s gather (2026-09-30). When this
+        // round gathered evidence, hand it over now; a caller that wants the
+        // draft passes `draftRound: true`.
+        if (round + 1 === maxRounds && evidence.length > 0 && opts.draftRound !== true) {
+          console.log(`[RLM] round ${round + 1} (final draft) skipped — evidence gathered, synthesis needs no draft`);
+          ev({ kind: 'thought', text: 'evidence gathered — skipping the draft round, synthesis writes the answer', detail: 'rlm' });
+          return finish('', 'draft-skipped');
+        }
         continue;
+      }
+
+      // Jev gate 3 — the model wants to answer now. Is the evidence enough?
+      // The cheap rule below (usefulHits === 0) catches an answer with NO
+      // evidence; Jev catches an answer with the WRONG evidence — a named
+      // symbol absent, one side of a flow present. When it is decisive and
+      // says no, nudge once (same nudge as below) instead of drafting thin.
+      // Advisory: any failure or an uncertain answer falls through.
+      if (usefulHits > 0 && !nudged && round < maxRounds && opts.jevGates !== false && remaining() > MIN_ROUND_BUDGET_MS) {
+        try {
+          const { checkEvidence, evidenceSymbolsAndFiles } = await import('./jevGates.js');
+          const { symbols, files } = evidenceSymbolsAndFiles(evidence);
+          const tJ = Date.now();
+          const d = await checkEvidence({
+            question: opts.question, symbolsFound: symbols, filesFound: files,
+            evidenceChars: evidence.length, usefulHits, round, maxRounds,
+          });
+          if (d) {
+            ev({
+              kind: 'thought',
+              text: `jev: evidence ${d.sufficient ? 'sufficient' : 'not enough'} (${Math.round(d.probability * 100)}%)`
+                + `${d.namedSymbolsMissing.length ? `, missing ${d.namedSymbolsMissing.join(', ')}` : ''}`
+                + `${d.decisive ? (d.sufficient ? ' → drafting' : ' → one more search') : ' (uncertain, model decides)'} · ${Date.now() - tJ}ms`,
+              detail: 'jev',
+            });
+            if (d.decisive && !d.sufficient) {
+              nudged = true;
+              messages.push({ role: 'assistant', content: typeof msg?.content === 'string' ? msg.content : '' });
+              messages.push({
+                role: 'user',
+                content:
+                  `The evidence so far does not cover ${d.namedSymbolsMissing.length ? d.namedSymbolsMissing.map((s) => `\`${s}\``).join(', ') : 'part of the question'}. ` +
+                  'Before answering, issue ONE focused search_symbols (the bare identifier) or search_code (a 2–5 word concept) for what is missing, then answer grounded in what it returns.',
+              });
+              console.log(`[RLM] round ${round} jev: evidence insufficient (${d.probability.toFixed(2)}, missing=[${d.namedSymbolsMissing.join(', ')}]) — nudging to search once`);
+              continue;
+            }
+          }
+        } catch (err) {
+          console.warn(`[jev] evidence gate failed, model decides: ${(err as Error).message}`);
+        }
       }
 
       // No tool calls. If the model tried to answer WITHOUT any useful
@@ -766,6 +949,58 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
 // Endpoint helpers
 // ──────────────────────────────────────────────────────────────────────────
 
+/**
+ * The "no chain of thought" knob for this endpoint. Two dialects:
+ * - OpenRouter / sidecar: `reasoning: { enabled: false }`.
+ * - Google's OpenAI-compatible route: `reasoning_effort: 'none'`; it rejects
+ *   the `reasoning` object (400). Without this, Gemini 3.8 Flash spends the
+ *   whole `max_tokens` thinking — a 512-token plan came back as 20 visible
+ *   tokens, finish=length (2026-09-30) — and every loop round did the same.
+ *   Measured: with reasoning_effort none the same plan is 182 tokens,
+ *   finish=stop, 1.8 s.
+ */
+function noReasoning(ep: RlmEndpoint): Record<string, unknown> {
+  if (ep.direct === 'gemini') return { reasoning_effort: 'none' };
+  if (ep.direct === 'anthropic') return {};   // no reasoning field in this dialect; off by default
+  return { reasoning: { enabled: false } };
+}
+
+/**
+ * Per-provider request shaping for the OpenAI-compatible dialects. Each was
+ * found by a 400 on 2026-09-30:
+ * - Gemini: an assistant message with `tool_calls` the model did not emit
+ *   itself (the plan-gather injects one) must carry a `thought_signature`,
+ *   or the next call is rejected. Google documents a skip token for exactly
+ *   this replay case.
+ * - Anthropic: `temperature` is rejected on the 5.5 models ("deprecated for
+ *   this model"); `stream: false` is fine.
+ */
+function shapeForProvider(ep: RlmEndpoint, body: Record<string, unknown>): Record<string, unknown> {
+  if (ep.direct === 'gemini') {
+    const msgs = body.messages as ChatMessage[] | undefined;
+    if (Array.isArray(msgs)) {
+      body = {
+        ...body,
+        messages: msgs.map((m) => {
+          if (m.role !== 'assistant' || !Array.isArray(m.tool_calls)) return m;
+          return {
+            ...m,
+            tool_calls: m.tool_calls.map((tc) =>
+              (tc as { extra_content?: unknown }).extra_content
+                ? tc
+                : { ...tc, extra_content: { google: { thought_signature: 'skip_thought_signature_validator' } } }),
+          };
+        }),
+      };
+    }
+  }
+  if (ep.direct === 'anthropic') {
+    const { temperature: _t, ...rest } = body;
+    body = rest;
+  }
+  return body;
+}
+
 /** POST /v1/chat/completions; logs + returns null on any failure (never throws). */
 async function chatCompletion(
   ep: RlmEndpoint,
@@ -775,10 +1010,10 @@ async function chatCompletion(
 ): Promise<any | null> {
   let res: Response;
   try {
-    res = await fetch(`${ep.base}/v1/chat/completions`, {
+    res = await fetch(ep.chatUrl ?? `${ep.base}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...ep.authHeader },
-      body: JSON.stringify({ model: ep.model, stream: false, ...body }),
+      body: JSON.stringify({ model: ep.model, stream: false, ...shapeForProvider(ep, body) }),
       signal,
     });
   } catch (err) {
@@ -828,17 +1063,31 @@ export async function planQuestion(
       ],
       max_tokens: 512,
       temperature: 0.1,
+      // Thinking models (deepseek-v4-flash, the rlm-sandbox model since
+      // 2026-09-29) spend the whole max_tokens on chain-of-thought and return
+      // content:null, finish_reason:"length" — every plan came back as
+      // "unparseable (0 chars)" and every deep answer paid this call plus the
+      // single-question fallback. The plan is a strict-JSON decomposition;
+      // it needs no reasoning. Same fix openRouterChat applies to synthesis.
+      // Ignored by models without a reasoning mode. NOT sent to a
+      // provider-direct endpoint: Google's OpenAI-compatible route rejects
+      // the field outright (400 "Unknown name reasoning", 2026-09-30).
+      ...noReasoning(ep),
     },
     signal,
     'plan',
   );
-  const raw: string = typeof j?.choices?.[0]?.message?.content === 'string' ? j.choices[0].message.content : '';
+  const choice0 = j?.choices?.[0];
+  const raw: string = typeof choice0?.message?.content === 'string' ? choice0.message.content : '';
+  const finish = typeof choice0?.finish_reason === 'string' ? choice0.finish_reason : undefined;
   const plan = parsePlanJson(raw, toolNames, opts.question);
   if (!plan) {
+    const usage = j?.usage as { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } | undefined;
     console.warn(
-      `[RLM] plan unparseable (${raw.length} chars) — falling back to single-question gather. head=${JSON.stringify(
-        raw.slice(0, 160),
-      )}`,
+      `[RLM] plan unparseable (${raw.length} chars, finish=${finish ?? '?'}` +
+        `${usage?.completion_tokens != null ? `, completion_tokens=${usage.completion_tokens}` : ''}` +
+        `${usage?.completion_tokens_details?.reasoning_tokens != null ? `, reasoning_tokens=${usage.completion_tokens_details.reasoning_tokens}` : ''}` +
+        `) — falling back to single-question gather. head=${JSON.stringify(raw.slice(0, 160))}`,
     );
     return null;
   }

@@ -33,6 +33,10 @@ export const DEFAULT_EXCLUDE_DIRS: ReadonlySet<string> = new Set([
   // 'target' already covered above
   // Misc
   'tmp', 'temp', '.tmp',
+  // Agent scratch: Claude Code keeps per-agent git worktrees (full copies of
+  // the repo) under .claude/worktrees. Indexing them put 1,457 duplicate,
+  // stale files next to the 379 real ones of this repo (2026-09-29).
+  '.claude', 'worktrees',
 ]);
 
 /**
