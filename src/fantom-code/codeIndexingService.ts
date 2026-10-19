@@ -17,12 +17,17 @@ import { FantomCodeParser } from './codeParser.js';
 import { buildLadybugGraph } from '../graph/ladybugGraphBuilder.js';
 import { ladybugQuery } from '../graph/ladybugConnection.js';
 import { clearFileGraph } from '../graph/ladybugSchema.js';
+import { beginProjectIndexing } from './activeIndexing.js';
+import { patchProjectGraph, replacePendingRefs, type GraphPatchResult } from '../indexing/graphPatch.js';
+import { loadLazyConfig } from '../indexing/lazyConfig.js';
 import {
   TreeSitterCodeParser,
   createTreeSitterParser,
   createMultiLanguageScanner
 } from './treeSitterAdapter.js';
 import { TrioParser } from './trioParser.js';
+import { PARSER_SCHEMA_VERSION, indexVersionFor } from './indexVersion.js';
+import { applySymbolKeys, createKeyBaseResolver, KEY_SCHEME_STABLE, storedKeyBase, type SymbolIdMapping } from './symbolKey.js';
 import type { SupportedLanguage } from '../parser/treeSitter/types.js';
 import type {
   FantomProject,
@@ -53,6 +58,27 @@ export interface FullIndexResult extends IndexResult {
    * Callers (runIndex) use this to suppress stats updates that would
    * otherwise overwrite Prisma counts with 0/0. */
   noChange?: boolean;
+  /** index_runs row of this run (lazy indexing links its task to it). */
+  runId?: number;
+  /** Paths the hash gate marked changed / removed (capped at 2 000 each). */
+  changedFiles?: string[];
+  removedFiles?: string[];
+}
+
+/**
+ * Change-set metadata a lazy indexing task records on its run row
+ * (src/indexing/taskWorker.ts, lazy-incremental-indexing.md 3.2.7).
+ */
+export interface LazyRunMeta {
+  changeSource: 'git' | 'dirty' | 'mtime' | 'sha' | 'version' | 'forced';
+  gitFromCommit?: string | null;
+  gitCommit?: string | null;
+  gitBranch?: string | null;
+  headMove?: string | null;
+  gitDirty?: boolean;
+  gitHeadTime?: Date | null;
+  /** headMove = switch: history records counts only. */
+  checkout?: boolean;
 }
 
 export interface IndexingOptions {
@@ -62,10 +88,44 @@ export interface IndexingOptions {
   forceParser?: 'regex' | 'tree-sitter';  // Override parser selection
   // Incremental indexing controls (v1)
   force?: boolean;           // Skip the file-hash gate and rebuild fully (default: false)
-  trigger?: 'manual' | 'auto' | 'watch' | 'mcp' | 'mcp-add' | 'mcp-refresh' | 'mcp-incremental' | 'admin-reindex' | 'file-watch'; // Recorded on the IndexRun row
+  keepVectors?: boolean;     // With force: keep the project's vectors (runIndex drops them otherwise; 3.2.6, D4)
+  trigger?: 'manual' | 'auto' | 'watch' | 'mcp' | 'mcp-add' | 'mcp-refresh' | 'mcp-incremental' | 'admin-reindex' | 'file-watch' | 'git' | 'report'; // Recorded on the IndexRun row
+  lazy?: LazyRunMeta;        // Lazy indexing: change source and git move, written on the IndexRun row
   buildEmbeddings?: boolean; // Auto-embed LanceDB vectors after parse (default: true via runIndex)
   allowRegexFallback?: boolean; // For non-Fantom languages, opt in to degraded indexing if tree-sitter init fails (default: false — error instead).
+  /** Key scheme override (rekey task); default fantom_projects.key_scheme. */
+  keyScheme?: number;
+  /** Receives legacy id → stable id per parsed file (rekey task). */
+  onSymbolKeys?: (mappings: SymbolIdMapping[]) => void;
 }
+
+export interface ReindexFilesArgs {
+  projectId: number;
+  /** Changed or added files (absolute). A path missing on disk counts as removed. */
+  paths: string[];
+  /** Files gone from disk (absolute). */
+  removed?: string[];
+  trigger?: 'manual' | 'auto' | 'watch' | 'mcp' | 'mcp-add' | 'mcp-refresh' | 'mcp-incremental' | 'admin-reindex' | 'file-watch' | 'git' | 'report';
+  /** Lazy task context, written on the IndexRun row. */
+  lazy?: LazyRunMeta;
+  /** Embed the changed nodes now (default true). false: the caller queues the embed pass. */
+  embed?: boolean;
+}
+
+export type ReindexFilesResult = FullIndexResult & {
+  runId: number;
+  addedCount: number;
+  modifiedCount: number;
+  removedCount: number;
+  embeddedCount: number;
+  /** Vector rows dropped for changed / deleted nodes. */
+  vectorsDropped: number;
+  /** Graph patch outcome; absent when the patch refused (preload cap) or failed. */
+  patch?: GraphPatchResult;
+};
+
+/** Key base per file for a stable-key project (3.8), or null for legacy ids. */
+type KeyBaseOf = ((absPath: string) => string) | null;
 
 // Extended project type with multi-language support
 export interface ExtendedProject extends FantomProject {
@@ -184,13 +244,47 @@ export class CodeIndexingService {
   }
 
   /**
+   * Key base resolver for a stable-key project (fantom_projects.key_scheme 2,
+   * lazy-incremental-indexing.md 3.8), or null: legacy ids, no key base.
+   */
+  private async keyBaseResolver(projectId: number, projectPath: string, override?: number): Promise<KeyBaseOf> {
+    let scheme = override;
+    if (scheme == null) {
+      const row = await this.prisma.fantomProject.findUnique({ where: { id: projectId }, select: { keyScheme: true } }).catch(() => null);
+      scheme = row?.keyScheme ?? 1;
+    }
+    return scheme >= KEY_SCHEME_STABLE ? createKeyBaseResolver(projectPath) : null;
+  }
+
+  /** Rewrite a parsed file to stable ids (no-op for a legacy-id project). */
+  private applyStableKeys(parsed: ParsedFile, projectId: number, keyBaseOf: KeyBaseOf, sink?: (m: SymbolIdMapping[]) => void): void {
+    if (!keyBaseOf) return;
+    const mappings = applySymbolKeys(parsed, { projectId, keyBase: keyBaseOf(parsed.filePath) });
+    sink?.(mappings);
+  }
+
+  /**
    * Index a project with both in-memory index and graph building
    */
   async indexProject(
     project: FantomProject | ExtendedProject,
     options: IndexingOptions = {}
   ): Promise<FullIndexResult> {
-    const { buildGraph = true, skipInMemory = false, forceParser, force = false, trigger = 'manual' } = options;
+    // Marks the project busy so DELETE …/index-runs/:runId refuses with 409
+    // (activeIndexing.ts — finished_at IS NULL also covers crashed runs).
+    const endIndexing = beginProjectIndexing(project.id);
+    try {
+      return await this.indexProjectImpl(project, options);
+    } finally {
+      endIndexing();
+    }
+  }
+
+  private async indexProjectImpl(
+    project: FantomProject | ExtendedProject,
+    options: IndexingOptions
+  ): Promise<FullIndexResult> {
+    const { buildGraph = true, skipInMemory = false, forceParser, force = false, trigger = 'manual', lazy } = options;
     const startTime = Date.now();
     const startedAt = new Date(startTime);
     const errors: ParseError[] = [];
@@ -337,27 +431,41 @@ export class CodeIndexingService {
     const indexedRows = await this.prisma.indexedFile.findMany({
       where: { projectId: project.id }
     });
+    // Stable symbol keys (3.8): only a re-keyed project (or the rekey task) keys
+    // by git root; everything else keeps the legacy ids and key_base ''.
+    const keyBaseOf = await this.keyBaseResolver(project.id, project.path, options.keyScheme);
+    const storedKb = (fp: string) => (keyBaseOf ? storedKeyBase(keyBaseOf(fp), project.path) : '');
     const indexedMap = new Map(indexedRows.map(r => [r.filePath, r]));
     const isSeedingRun = indexedRows.length === 0;
 
-    type FileHash = { path: string; mtimeMs: number; sha: string; size: number };
+    type FileHash = { path: string; mtimeMs: number; sha: string; size: number; version: string; keyBase: string };
     const scanned: FileHash[] = [];
     const changedFiles: string[] = [];
+    let versionMisses = 0;
     for (const fp of files) {
       try {
         const stat = await fsp.stat(fp);
         const mtimeMs = Math.floor(stat.mtimeMs);
         const prior = indexedMap.get(fp);
+        // A file parsed by an older parser/extractor/grammar re-parses even
+        // when its bytes are unchanged (indexVersion.ts).
+        const version = indexVersionFor(fp, parserType);
+        const keyBase = storedKb(fp);
+        const versionMatch = !!prior && prior.indexVersion === version && (prior.keyBase ?? '') === keyBase;
         // Cheap mtime check first; only hash if mtime differs
         if (prior && Number(prior.mtimeMs) === mtimeMs && Number(prior.byteSize) === stat.size) {
-          scanned.push({ path: fp, mtimeMs, sha: prior.contentSha, size: stat.size });
+          scanned.push({ path: fp, mtimeMs, sha: prior.contentSha, size: stat.size, version, keyBase });
+          if (!versionMatch) { changedFiles.push(fp); versionMisses++; }
           continue;
         }
         const buf = await fsp.readFile(fp);
         const sha = createHash('sha256').update(buf).digest('hex');
-        scanned.push({ path: fp, mtimeMs, sha, size: buf.byteLength });
+        scanned.push({ path: fp, mtimeMs, sha, size: buf.byteLength, version, keyBase });
         if (!prior || prior.contentSha !== sha) {
           changedFiles.push(fp);
+        } else if (!versionMatch) {
+          changedFiles.push(fp);
+          versionMisses++;
         }
       } catch (err) {
         errors.push({
@@ -371,6 +479,9 @@ export class CodeIndexingService {
     const removedFiles = indexedRows
       .filter(r => !scannedPaths.has(r.filePath))
       .map(r => r.filePath);
+    if (versionMisses > 0) {
+      logger.info(`[gate] project=${project.name} ${versionMisses} unchanged file(s) re-parse: parser/extractor version changed`);
+    }
 
     // Capture git HEAD if the project root is a git checkout. Best-effort —
     // never block indexing on git failures. Provides finer-grained
@@ -399,8 +510,18 @@ export class CodeIndexingService {
         force,
         isSeedingRun,
         filesScanned: files.length,
-        gitCommit,
-        gitBranch,
+        // A lazy task knows the commit it diffed to; HEAD may have moved since.
+        gitCommit: lazy?.gitCommit ?? gitCommit,
+        gitBranch: lazy?.gitCommit ? (lazy.gitBranch ?? null) : gitBranch,
+        parserVersion: PARSER_SCHEMA_VERSION,
+        ...(lazy ? {
+          changeSource: lazy.changeSource,
+          gitFromCommit: lazy.gitFromCommit ?? null,
+          headMove: lazy.headMove ?? null,
+          gitDirty: lazy.gitDirty ?? false,
+          gitHeadTime: lazy.gitHeadTime ?? null,
+          checkout: lazy.checkout ?? false,
+        } : {}),
       } as any,
     });
 
@@ -452,6 +573,9 @@ export class CodeIndexingService {
         errors,
         duration: durationMs,
         noChange: true,
+        runId: indexRun.id,
+        changedFiles: [],
+        removedFiles: [],
       };
     }
 
@@ -608,6 +732,7 @@ export class CodeIndexingService {
         } else {
           parsed = regexParser.parseFile(filePath);
         }
+        this.applyStableKeys(parsed, project.id, keyBaseOf, options.onSymbolKeys);
         const ms = Date.now() - parseStart;
         const heapDeltaMb = Math.round((process.memoryUsage().heapUsed - memBefore) / 1024 / 1024);
         if (ms > 1000 || heapDeltaMb > 50) {
@@ -660,7 +785,19 @@ export class CodeIndexingService {
       const memBeforeGraph = process.memoryUsage();
       logger.info(`[phase] graph START project=${project.name} parsedFiles=${parsedFiles.length} rss=${Math.round(memBeforeGraph.rss / 1024 / 1024)}MB heap=${Math.round(memBeforeGraph.heapUsed / 1024 / 1024)}MB`);
       try {
-        graphResult = await buildLadybugGraph(project.id, parsedFiles);
+        // Stable-key projects take file-level patches (3.4) later: seed
+        // pending_refs from this build so a patch can resolve references
+        // to symbols its files add.
+        graphResult = await buildLadybugGraph(project.id, parsedFiles, { collectUnresolved: !!keyBaseOf });
+        if (graphResult.unresolvedRefs) {
+          try {
+            const n = await replacePendingRefs(this.prisma, project.id, graphResult.unresolvedRefs, loadLazyConfig().pendingRefs.maxPerProject);
+            logger.info(`[phase] pending_refs project=${project.name} rows=${n}`);
+          } catch (err) {
+            logger.warn(`pending_refs seed failed for ${project.name}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          delete graphResult.unresolvedRefs;
+        }
         logger.info(`[phase] graph DONE project=${project.name} nodes=${graphResult.nodeCount} edges=${graphResult.edgeCount}`);
         logger.info(`[LadybugDB] Graph built: ${graphResult.nodeCount} nodes, ${graphResult.edgeCount} edges`);
         for (const lErr of graphResult.errors) {
@@ -865,6 +1002,8 @@ export class CodeIndexingService {
           contentSha: s.sha,
           byteSize: s.size,
           symbolCount: symbolsPerFile.get(s.path) ?? 0,
+          indexVersion: s.version,
+          keyBase: s.keyBase,
           indexedAt: new Date(),
         })),
       });
@@ -894,6 +1033,9 @@ export class CodeIndexingService {
       errors,
       duration: durationMs,
       graphResult,
+      runId: indexRun.id,
+      changedFiles: changedFiles.slice(0, 2000),
+      removedFiles: removedFiles.slice(0, 2000),
       ...(zeroFilesDiagnostic ?? {}),
     };
 
@@ -951,24 +1093,34 @@ export class CodeIndexingService {
 
   /**
    * Re-index a specific subset of files within a project. Used by the
-   * MCP `reindexChangedFiles` tool: the assistant tells us exactly which
-   * files it just edited and we update only those.
+   * MCP `reindexChangedFiles` tool (the assistant names the files it just
+   * edited) and by the lazy `parse` task (src/indexing/taskWorker.ts).
    *
-   * Per-file scope: clears CodeNode/CodeEdge for each path, re-parses,
-   * rebuilds graph for those parsed files only (clearProject=false), and
-   * upserts IndexedFile rows. Records one IndexRun + ApiChange rows.
-   *
-   * Caveat: cross-file edges (other files that reference symbols in the
-   * changed file) may go stale until a full project re-index runs. v1
-   * accepts this — full re-index resolves it.
+   * The graph is patched by key (src/indexing/graphPatch.ts,
+   * lazy-incremental-indexing.md 3.4): unchanged keys keep their id and
+   * their incoming edges from other files, names resolve against the whole
+   * project, renames are linked, dangling references wait in pending_refs.
+   * Upserts IndexedFile rows; records one IndexRun + ApiChange rows. Only
+   * nodes whose text changed are re-embedded (embed: false leaves that to
+   * the caller; their stale vectors are dropped either way).
    */
-  async reindexFiles(args: {
-    projectId: number;
-    paths: string[];
-    trigger?: 'manual' | 'auto' | 'watch' | 'mcp' | 'mcp-add' | 'mcp-refresh' | 'mcp-incremental' | 'admin-reindex' | 'file-watch';
-  }): Promise<FullIndexResult & { runId: number; addedCount: number; modifiedCount: number; removedCount: number; embeddedCount: number }> {
-    const { projectId, paths, trigger = 'mcp-incremental' } = args;
+  async reindexFiles(args: ReindexFilesArgs): Promise<ReindexFilesResult> {
+    const { projectId } = args;
     return this.withProjectLock(projectId, async () => {
+      const endIndexing = beginProjectIndexing(projectId);
+      try {
+        return await this.reindexFilesLocked(args);
+      } finally {
+        endIndexing();
+      }
+    });
+  }
+
+  private async reindexFilesLocked(args: ReindexFilesArgs): Promise<ReindexFilesResult> {
+    const { projectId, trigger = 'mcp-incremental', lazy, embed = true } = args;
+    // Removed paths go through the same patch (an empty new node set).
+    const paths = [...new Set([...args.paths, ...(args.removed ?? [])])];
+    {
       const startTime = Date.now();
       const startedAt = new Date(startTime);
       const errors: ParseError[] = [];
@@ -1007,7 +1159,18 @@ export class CodeIndexingService {
           force: false,
           isSeedingRun: false,
           filesScanned: paths.length,
-        },
+          parserVersion: PARSER_SCHEMA_VERSION,
+          ...(lazy ? {
+            changeSource: lazy.changeSource,
+            gitFromCommit: lazy.gitFromCommit ?? null,
+            gitCommit: lazy.gitCommit ?? null,
+            gitBranch: lazy.gitBranch ?? null,
+            headMove: lazy.headMove ?? null,
+            gitDirty: lazy.gitDirty ?? false,
+            gitHeadTime: lazy.gitHeadTime ?? null,
+            checkout: lazy.checkout ?? false,
+          } : {}),
+        } as any,
       });
 
       // Initialize parsers (mirroring indexProject's setup).
@@ -1033,6 +1196,7 @@ export class CodeIndexingService {
       }
       const regexParser = new FantomCodeParser(projectId, podMeta);
       const trioParser = new TrioParser(projectId, podMeta?.podName, axonTreeSitter);
+      const keyBaseOf = await this.keyBaseResolver(projectId, projectRow.path);
 
       // Snapshot per-file existing symbols (for diff) BEFORE clearing.
       type PrevSym = { signature: string; filePath: string; kind: string };
@@ -1056,19 +1220,6 @@ export class CodeIndexingService {
         }
       }
 
-      // Clear graph nodes for each path so the rebuild is clean.
-      for (const fp of paths) {
-        try {
-          await clearFileGraph(projectId, fp);
-        } catch (err) {
-          errors.push({
-            file: fp,
-            message: `clearFileGraph failed: ${err instanceof Error ? err.message : String(err)}`,
-            severity: 'warning',
-          });
-        }
-      }
-
       // Parse each path. Drop paths that no longer exist on disk — those become "removed" symbols.
       const parsedFiles: ParsedFile[] = [];
       const removedPaths: string[] = [];
@@ -1089,6 +1240,7 @@ export class CodeIndexingService {
           } else {
             parsed = regexParser.parseFile(fp);
           }
+          this.applyStableKeys(parsed, projectId, keyBaseOf);
           parsedFiles.push(parsed);
           filesProcessed++;
           typesIndexed += parsed.types.length;
@@ -1104,26 +1256,53 @@ export class CodeIndexingService {
         }
       }
 
-      // In-memory index: remove old entries for these files, then re-add.
+      // In-memory index: after a restart it may not hold this project, and a
+      // remove-and-add of the changed files would then leave search with only
+      // them. Hydrate from the graph first, then swap the files.
+      if (this.indexer.getFunctionsByProject(projectId).length === 0) {
+        try {
+          await this.hydrateIndexerFromLadybug({
+            id: projectId, name: projectRow.name, path: projectRow.path, language, parserType,
+            functionCount: projectRow.functionCount ?? 0, typeCount: projectRow.typeCount ?? 0,
+            createdAt: projectRow.createdAt.toISOString(), updatedAt: projectRow.updatedAt.toISOString(),
+          });
+        } catch (err) {
+          logger.warn(`reindexFiles hydrate failed for project ${projectId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       this.indexer.removeFilesFromProject(projectId, paths);
       for (const pf of parsedFiles) {
         for (const t of pf.types) this.indexer.addType(t);
         for (const f of pf.functions) this.indexer.addFunction(f);
       }
 
-      // Rebuild graph for parsed files only (clearProject: false — we already
-      // wiped per-path above).
+      // Patch the graph by key (3.4). Above the preload cap the patch refuses
+      // and the files are cleared and rebuilt as before phase 3.
       let graphResult: GraphBuildResult | undefined;
-      if (parsedFiles.length > 0) {
-        try {
-          graphResult = await buildLadybugGraph(projectId, parsedFiles, { clearProject: false });
-        } catch (err) {
-          errors.push({
-            file: '',
-            message: `LadybugDB rebuild failed: ${err instanceof Error ? err.message : String(err)}`,
-            severity: 'error',
-          });
+      let patch: GraphPatchResult | undefined;
+      try {
+        const lazyCfg = loadLazyConfig();
+        patch = await patchProjectGraph({
+          projectId, parsedFiles, removedPaths, prisma: this.prisma, runId: indexRun.id,
+          maxPreloadNodes: lazyCfg.graphPatch.maxPreloadNodes,
+          maxPendingRefs: lazyCfg.pendingRefs.maxPerProject,
+        });
+        if (patch.status === 'too-large') {
+          for (const fp of paths) await clearFileGraph(projectId, fp);
+          if (parsedFiles.length > 0) graphResult = await buildLadybugGraph(projectId, parsedFiles, { clearProject: false });
+          patch = undefined;
+        } else {
+          graphResult = {
+            projectId, success: true, nodeCount: patch.nodesCreated + patch.nodesUpdated + patch.nodesUnchanged,
+            edgeCount: patch.edgesCreated, unresolvedCount: patch.unresolved, durationMs: patch.durationMs, errors: [],
+          };
         }
+      } catch (err) {
+        errors.push({
+          file: '',
+          message: `LadybugDB graph patch failed: ${err instanceof Error ? err.message : String(err)}`,
+          severity: 'error',
+        });
       }
 
       // Diff vs prevSymbols.
@@ -1190,6 +1369,8 @@ export class CodeIndexingService {
             contentSha: sha,
             byteSize: buf.byteLength,
             symbolCount,
+            indexVersion: indexVersionFor(pf.filePath, parserType),
+            keyBase: keyBaseOf ? storedKeyBase(keyBaseOf(pf.filePath), projectRow.path) : '',
             indexedAt: new Date(),
           },
           update: {
@@ -1197,6 +1378,8 @@ export class CodeIndexingService {
             contentSha: sha,
             byteSize: buf.byteLength,
             symbolCount,
+            indexVersion: indexVersionFor(pf.filePath, parserType),
+            keyBase: keyBaseOf ? storedKeyBase(keyBaseOf(pf.filePath), projectRow.path) : '',
             indexedAt: new Date(),
           },
         });
@@ -1232,29 +1415,36 @@ export class CodeIndexingService {
       // have changed with the edited files; refresh best-effort.
       await this.refreshProjectDependencies(projectId);
 
-      // ── Re-embed the changed files' nodes so SEMANTIC SEARCH reflects the
-      // edit. The graph rebuild above replaced these files' CodeNodes with new
-      // ids — orphaning their old vectors and leaving the new nodes UNEMBEDDED —
-      // so without this step semanticCodeSearch goes stale/empty for an edited
-      // file (defeating the point of an incremental reindex). Embed
-      // synchronously via the configured code provider (e.g. the jina sidecar)
-      // so a single MCP call = parse + graph + vectors. Best-effort: if the
-      // embedding sidecar is down the graph is still fresh and the auto-embed
-      // watchdog backfills the missing vectors later. (Orphaned old vectors are
-      // harmless — search enrichment drops any hit whose node no longer exists.)
+      // ── Vectors. The patch keeps the id (and so the vector) of every node
+      // whose text did not change; a line shift costs nothing. Vectors of
+      // changed or deleted nodes are dropped, so the embed pass (here, or the
+      // lazy `embed` task, which skips ids that have a vector) redoes exactly
+      // those. Without a patch (preload cap) every node of the files counts.
       let embeddedCount = 0;
-      try {
-        const fileList = paths.map(p => `'${p.replace(/'/g, "\\'")}'`).join(', ');
-        const nodes = fileList
+      let vectorsDropped = 0;
+      const changedIds = patch ? patch.changedIds : null;
+      if (patch && patch.staleVectorIds.length > 0) {
+        try {
+          const { getVectorStore } = await import('../embedding/vectorStore.js');
+          vectorsDropped = await getVectorStore(this.prisma).deleteNodeVectors(projectId, patch.staleVectorIds);
+        } catch (err) {
+          logger.warn(`reindexFiles: stale vector drop failed for project ${projectId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (embed && (changedIds === null || changedIds.length > 0)) try {
+        const idClause = changedIds
+          ? `n.id IN [${changedIds.map(id => `'${id.replace(/'/g, "\\'")}'`).join(', ')}]`
+          : `n.file_path IN [${paths.map(p => `'${p.replace(/'/g, "\\'")}'`).join(', ')}]`;
+        const nodes = paths.length > 0
           ? await ladybugQuery<{ id: string; name: string; qn: string; sig: string | null; doc: string | null; fp: string; ls: number; le: number; nt: string }>(
               projectId,
-              `MATCH (n:CodeNode {project_id: ${projectId}}) WHERE n.file_path IN [${fileList}] ` +
+              `MATCH (n:CodeNode {project_id: ${projectId}}) WHERE ${idClause} ` +
               `RETURN n.id AS id, n.name AS name, n.qualified_name AS qn, n.signature AS sig, n.documentation AS doc, ` +
               `n.file_path AS fp, n.line_start AS ls, n.line_end AS le, n.node_type AS nt`,
             )
           : [];
         if (nodes.length > 0) {
-          const { buildEmbeddingItems, fileNodeId } = await import('../embedding/embeddingText.js');
+          const { buildEmbeddingItems } = await import('../embedding/embeddingText.js');
           const { buildEmbeddingContext } = await import('../embedding/embeddingContext.js');
           const { buildSyntheticItems } = await import('../embedding/embedSynthetic.js');
           const { selectEmbeddingProviderForProject } = await import('../embedding/providers/embeddingProvider.js');
@@ -1275,19 +1465,58 @@ export class CodeIndexingService {
             ...buildEmbeddingItems(embedNodes, context),
             ...await buildSyntheticItems(this.prisma, projectId, embedNodes, { filePaths: paths }).catch(() => []),
           ];
-          // Files that no longer exist lose their file row (their nodes were removed above).
-          for (const rp of removedPaths) { try { await vs.deleteEmbedding(fileNodeId(rp)); } catch { /* best effort */ } }
-          const B = 50;
-          for (let i = 0; i < workItems.length; i += B) {
-            const batch = workItems.slice(i, i + B);
-            const vecs = await provider.embedBatch(batch.map(it => it.text));
-            const items = batch.map((it, j) => ({ ...it, embedding: vecs[j] })).filter(x => x.embedding);
-            if (items.length) embeddedCount += await vs.storeEmbeddings(items, projectId);
+          const ep = loadLazyConfig().embedPatch;
+          if (ep?.enabled) {
+            // Phase 4 (3.5): skip text that vector_state already holds, embed
+            // the rest through embed_cache (a moved symbol or a branch switched
+            // back costs no provider call), delete orphans of these files.
+            const [{ embedPatch, deleteVectorState }, { getEmbedCache }] = await Promise.all([
+              import('../indexing/embedPatch.js'), import('../embedding/embedCache.js'),
+            ]);
+            const r = await embedPatch({
+              prisma: this.prisma,
+              model: provider.getModelName(),
+              embed: texts => provider.embedBatch(texts),
+              cache: getEmbedCache(),
+              store: items => vs.storeEmbeddings(items, projectId, undefined, provider),
+              deleteVectors: ids => vs.deleteNodeVectors(projectId, ids),
+            }, {
+              projectId,
+              items: workItems,
+              // Without a patch every node of the files is in workItems.
+              filePaths: changedIds === null ? paths : undefined,
+              removedPaths,
+              mustEmbed: new Set(patch?.staleVectorIds ?? []),
+              runId: indexRun.id,
+            });
+            embeddedCount += r.rowsStored;
+            vectorsDropped += r.orphansDeleted;
+            if (patch) {
+              const kept = new Set(workItems.map(w => w.nodeId));
+              await deleteVectorState(this.prisma, projectId, patch.staleVectorIds.filter(id => !kept.has(id)));
+            }
+          } else {
+            const B = 50;
+            for (let i = 0; i < workItems.length; i += B) {
+              const batch = workItems.slice(i, i + B);
+              const vecs = await provider.embedBatch(batch.map(it => it.text));
+              const items = batch.map((it, j) => ({ ...it, embedding: vecs[j] })).filter(x => x.embedding);
+              if (items.length) embeddedCount += await vs.storeEmbeddings(items, projectId);
+            }
           }
           logger.info(`reindexFiles project=${projectId} re-embedded ${embeddedCount} rows for ${nodes.length} changed-file nodes (${workItems.length} items)`);
         }
       } catch (err) {
         logger.warn(`reindexFiles re-embed failed (graph updated; vectors backfill via auto-embed): ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // Files that no longer exist lose their file row (their nodes were removed above).
+      if (removedPaths.length > 0) {
+        try {
+          const [{ fileNodeId }, { getVectorStore }] = await Promise.all([
+            import('../embedding/embeddingText.js'), import('../embedding/vectorStore.js'),
+          ]);
+          vectorsDropped += await getVectorStore(this.prisma).deleteNodeVectors(projectId, removedPaths.map(fileNodeId));
+        } catch { /* best effort */ }
       }
 
       return {
@@ -1304,8 +1533,12 @@ export class CodeIndexingService {
         modifiedCount,
         removedCount,
         embeddedCount,
+        vectorsDropped,
+        removedFiles: removedPaths,
+        changedFiles: parsedFiles.map(p => p.filePath),
+        ...(patch ? { patch } : {}),
       };
-    });
+    }
   }
 
   /**
@@ -1392,6 +1625,7 @@ export class CodeIndexingService {
 
     const regexParser = new FantomCodeParser(project.id, podMeta);
     const parsedFiles: ParsedFile[] = [];
+    const keyBaseOf = await this.keyBaseResolver(project.id, project.path);
 
     for (let i = 0; i < files.length; i++) {
       const filePath = files[i];
@@ -1401,6 +1635,7 @@ export class CodeIndexingService {
         } else {
           parsedFiles.push(regexParser.parseFile(filePath));
         }
+        this.applyStableKeys(parsedFiles[parsedFiles.length - 1], project.id, keyBaseOf);
       } catch (err) {
         logger.warn(`Failed to parse ${filePath}: ${err}`);
       }

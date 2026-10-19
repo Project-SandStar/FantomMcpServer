@@ -227,6 +227,24 @@ export interface GraphBuildResult {
   unresolvedCount: number;
   durationMs: number;
   errors: string[];
+  /** Only with buildFromFiles({ collectUnresolved: true }): rows for pending_refs. */
+  unresolvedRefs?: UnresolvedRef[];
+}
+
+/**
+ * An outgoing reference no node resolved in this build (pending_refs row,
+ * lazy-incremental-indexing.md 3.4 step 4).
+ */
+export interface UnresolvedRef {
+  sourceId: string;
+  sourceFile: string;
+  sourceKey: string;
+  targetName: string;
+  edgeType: string;
+  line: number;
+  col: number;
+  confidence: number;
+  className: string;
 }
 
 export interface VectorBuildResult {

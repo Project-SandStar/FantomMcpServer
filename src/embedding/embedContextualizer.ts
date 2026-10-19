@@ -186,6 +186,19 @@ export interface ContextualizeStats {
 export type ContextChat = (system: string, user: string) => Promise<{ text: string; costUsd: number | null }>;
 
 async function defaultChat(system: string, user: string): Promise<{ text: string; costUsd: number | null }> {
+  // A provider-direct RLM model (`direct:gemini:…`) goes to that provider's
+  // own API with its key. Sent through the sidecar's OpenRouter route it is a
+  // 400, and every context pass wrote 0 contexts (227 wasted requests a run).
+  const { getOpenRouterSettings } = await import('../sidecars/openRouterConfig.js');
+  const { parseDirectRlmModel } = await import('../sidecars/openRouterModels.js');
+  const direct = parseDirectRlmModel(getOpenRouterSettings().rlmSandboxModel ?? '');
+  if (direct) {
+    const { callGeminiChat, callAnthropicChat } = await import('./answerSynthesis.js');
+    const text = direct.provider === 'gemini'
+      ? await callGeminiChat(direct.model, system, user, REPLY_MAX_TOKENS)
+      : await callAnthropicChat(direct.model, system, user, REPLY_MAX_TOKENS);
+    return { text, costUsd: null };
+  }
   const { openRouterChat } = await import('../sidecars/openRouterChat.js');
   const out = await openRouterChat(system, user, { maxTokens: REPLY_MAX_TOKENS, timeoutMs: 120_000, temperature: 0.1, role: 'rlm-sandbox' });
   return { text: out.text, costUsd: out.costUsd };
@@ -231,8 +244,15 @@ export async function contextualizeNodes(
   const files = [...byFile.entries()];
   let cursor = 0;
   let dirty = 0;
+  // A misconfigured model fails every request the same way. Stop the pass
+  // after this many failed requests in a row with nothing written; the
+  // nodes embed without context instead of burning hundreds of requests.
+  const MAX_CONSECUTIVE_FAILURES = 5;
+  let consecutiveFailures = 0;
+  let aborted = false;
   const worker = async (): Promise<void> => {
     for (;;) {
+      if (aborted) return;
       const i = cursor++;
       if (i >= files.length) return;
       const [filePath, fileNodes] = files[i];
@@ -259,9 +279,11 @@ export async function contextualizeNodes(
         return got;
       };
       for (let j = 0; j < fileNodes.length; j += MAX_NODES_PER_REQUEST) {
+        if (aborted) return;
         const group = fileNodes.slice(j, j + MAX_NODES_PER_REQUEST);
         try {
           const got = await ask(group);
+          consecutiveFailures = 0;
           const missing = group.filter((n) => !got.has(n.id));
           if (missing.length > 0) {
             try { for (const [k, v] of await ask(missing)) got.set(k, v); }
@@ -280,6 +302,10 @@ export async function contextualizeNodes(
         } catch (err) {
           stats.failed += group.length;
           logger.warn(`project ${projectId} ${path.basename(filePath)}: ${(err as Error).message.split('\n')[0].slice(0, 160)} — ${group.length} node(s) embed without context`);
+          if (++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES && stats.written === 0 && !aborted) {
+            aborted = true;
+            logger.error(`project ${projectId}: context pass stopped after ${consecutiveFailures} failed requests in a row with 0 contexts written — check the RLM sandbox model on the OpenRouter page`);
+          }
         }
         opts.onProgress?.(stats);
       }
@@ -288,6 +314,9 @@ export async function contextualizeNodes(
   await Promise.all(Array.from({ length: Math.min(settings.concurrency, files.length) }, worker));
   if (dirty > 0) saveContextCache(projectId, cache);
   stats.ms = Date.now() - t0;
+  if (stats.written === 0 && stats.requests > 0) {
+    logger.warn(`project ${projectId}: context pass wrote 0 contexts from ${stats.requests} request(s) — embeddings carry no LLM context this run`);
+  }
   logger.info(
     `project ${projectId}: ${stats.written} context(s) written, ${stats.cached} cached, ${stats.failed} without, `
     + `${stats.requests} request(s) over ${stats.files} file(s), $${stats.costUsd.toFixed(4)}, ${(stats.ms / 1000).toFixed(1)}s`,

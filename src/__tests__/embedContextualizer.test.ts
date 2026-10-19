@@ -151,6 +151,22 @@ describe('contextualizeNodes', () => {
     expect(r.stats.failed).toBe(1);
   });
 
+  it('stops the pass after repeated failures with nothing written', async () => {
+    const many = Array.from({ length: 40 }, (_, k) => {
+      const f = path.join(dir, `Bad${k}.fan`);
+      fs.writeFileSync(f, `class Bad${k} {}`);
+      return { id: `b${k}`, qualifiedName: `x::Bad${k}`, nodeType: 'class', filePath: f, lineStart: 1, lineEnd: 1 };
+    });
+    let calls = 0;
+    const r = await contextualizeNodes(278, many, {
+      chat: async () => { calls++; throw new Error('HTTP 400: not a valid model ID'); },
+    });
+    expect(r.stats.written).toBe(0);
+    // 40 files would be 40 requests; the guard stops after 5 plus the
+    // requests already in flight (concurrency is capped at 16).
+    expect(calls).toBeLessThanOrEqual(5 + 16);
+  });
+
   it('nodeContentHash changes with the span and the signature', () => {
     const lines = ['a', 'b', 'c'];
     const h1 = nodeContentHash({ qualifiedName: 'q', signature: 's', lineStart: 1, lineEnd: 2 }, lines);

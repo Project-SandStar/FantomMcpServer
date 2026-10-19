@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useState } from 'react';
 import { AuthProvider, useAuth } from '../contexts/AuthContext';
 import { LoginScreen } from './LoginScreen';
+import { HeavyJobBanner } from './HeavyJobBanner';
 import { Loader2 } from 'lucide-react';
 
 /**
@@ -34,7 +35,7 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
     return <LoginScreen />;
   }
 
-  return <>{children}</>;
+  return <><HeavyJobBanner />{children}</>;
 }
 
 /**

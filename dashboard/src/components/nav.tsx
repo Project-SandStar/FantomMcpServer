@@ -132,6 +132,12 @@ const VectorIcon = () => (
   </svg>
 );
 
+const WorkflowIcon = () => (
+  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+  </svg>
+);
+
 const navItems = [
   { href: '/', label: 'Home', icon: HomeIcon },
   { href: '/instances', label: 'Instances', icon: ServerIcon },
@@ -143,6 +149,7 @@ const navItems = [
   { href: '/graph-viewer', label: 'Graph Viewer', icon: GraphIcon },
   { href: '/graph-3d', label: '3D Graph', icon: GraphIcon },
   { href: '/vector-viewer', label: 'Vector Search', icon: VectorIcon },
+  { href: '/workflows', label: 'Workflows', icon: WorkflowIcon },
   { href: '/axon', label: 'Axon', icon: BeakerIcon },
   { href: '/tree-sitter-viewer', label: 'AST Viewer', icon: TreeIcon },
   { href: '/code-parser', label: 'Code Parser', icon: CodeIcon },

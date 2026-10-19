@@ -18,7 +18,8 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createLogger } from '../utils/index.js';
 import { getCachePath } from '../utils/installRoot.js';
-import { waitForHeavyJob, type HeavyJobHolder } from '../embedding/embedGate.js';
+import { waitForHeavyJob, setHeavyJobProgress, type HeavyJobHolder } from '../embedding/embedGate.js';
+import type { EmbedCache } from '../embedding/embedCache.js';
 import {
   selectAllEmbeddingProvidersWithCloud,
   embedBatchFanout, type EmbeddingProvider,
@@ -32,7 +33,7 @@ import {
 import { scanAllAxonProjects, parseAnyAxonProject, isLibraryProjectId } from './axonLibraryParser.js';
 import { AXON_EMBED_TEXT_VERSION, type AxonEmbeddingChunk } from './axonEmbeddingText.js';
 import {
-  ensureAxonTableForWrite, deleteAxonProjectVectors, countAxonVectorsByProject,
+  ensureAxonTableForWrite, deleteAxonProjectVectors, deleteAxonFunctionVectors, countAxonVectorsByProject,
   listAxonVectorIds, getAxonTableStats, type AxonVectorRow,
 } from './axonLance.js';
 
@@ -110,7 +111,90 @@ export interface AxonJob {
   cancelRequested?: boolean;
   /** While `queued`: the heavy job we are waiting for (code re-embed / forced reindex). */
   waitingFor?: HeavyJobHolder | null;
+  /** Phase 4 (3.12): unchanged projects skipped without a provider call. */
+  projectsSkipped?: number;
+  functionsSkipped?: number;
+  functionsDeleted?: number;
+  /** Per-project outcome, live (Axon page). */
+  projectStats?: AxonProjectRunStat[];
 }
+
+export interface AxonProjectRunStat {
+  projectId: string;
+  status: 'skipped' | 'embedding' | 'done' | 'error';
+  functions: number;
+  skipped: number;
+  embedded: number;
+  deleted: number;
+  /** Texts the provider embedded (embed_cache misses). */
+  providerTexts: number;
+  errors: number;
+}
+
+/** What changed in one project since its meta entry (3.12 item 1). */
+export interface AxonProjectPlan {
+  /** Functions to (re-)embed. */
+  changed: AxonFunctionRecord[];
+  /** Function names whose rows go: changed + removed. */
+  deleteNames: string[];
+  unchanged: number;
+  removed: string[];
+  /** Nothing to do. */
+  skip: boolean;
+  /** Model, dims or text layout differ: every function is changed. */
+  full: boolean;
+}
+
+/**
+ * Compare parsed records with the meta entry: per-function hash plus
+ * AXON_EMBED_TEXT_VERSION, model and dims. `vectorIds` (optional) are the
+ * node ids that have rows; a function without one counts as changed.
+ */
+export function planAxonProject(
+  records: AxonFunctionRecord[],
+  pm: AxonProjectMeta | undefined,
+  model: string,
+  dimensions: number,
+  opts: { force?: boolean; vectorIds?: Set<string> } = {},
+): AxonProjectPlan {
+  const full = !!opts.force || !pm || !pm.hashes || pm.model !== model || pm.dimensions !== dimensions
+    || pm.embedTextVersion !== AXON_EMBED_TEXT_VERSION;
+  const old = full ? {} : pm!.hashes!;
+  const names = new Set(records.map(r => r.name));
+  const changed = records.filter(r => old[r.name] !== r.hash || (opts.vectorIds !== undefined && !opts.vectorIds.has(r.id)));
+  const removed = Object.keys(pm?.hashes ?? {}).filter(n => !names.has(n));
+  return {
+    changed,
+    deleteNames: [...new Set([...changed.map(r => r.name), ...removed])],
+    unchanged: records.length - changed.length,
+    removed,
+    skip: !full && changed.length === 0 && removed.length === 0,
+    full,
+  };
+}
+
+/**
+ * Cheap boot scan (3.12 item 2): parse every project and compare hashes with
+ * the meta file. No provider, no vector table, no heavy-job lock.
+ */
+export async function scanAxonChanges(source: AxonRecordSource | 'all' = 'all'): Promise<{ changed: string[]; projects: number }> {
+  await initAxonGrammar();
+  const { model, dimensions } = resolveAxonEmbeddingModel();
+  const meta = readAxonMeta();
+  const refs = scanAllAxonProjects(source);
+  const changed: string[] = [];
+  for (const ref of refs) {
+    try {
+      if (!planAxonProject(parseAnyAxonProject(ref), meta.projects[ref.projectId], model, dimensions).skip) changed.push(ref.projectId);
+    } catch {
+      changed.push(ref.projectId);
+    }
+  }
+  return { changed, projects: refs.length };
+}
+
+/** embed_cache key space for Axon text (kept apart from code text versions). */
+const AXON_CACHE_TEXT_VERSION = 1000 + AXON_EMBED_TEXT_VERSION;
 
 const jobs = new Map<string, AxonJob>();
 let activeJobId: string | null = null;
@@ -139,11 +223,15 @@ function pruneJobs(): void {
 
 export interface AxonIndexOptions {
   projectId?: string;
+  /** Limit the run to these projects (boot scan: the changed ones). */
+  projectIds?: string[];
   /** Limit a whole-tree run to one source (default both). */
   source?: AxonRecordSource | 'all';
   force?: boolean;
   /** Test hook: bypass the sidecar registry. */
   providers?: EmbeddingProvider[];
+  /** Test hook: embed_cache (null = no cache). Default: the shared cache. */
+  cache?: EmbedCache | null;
   batchSize?: number;
 }
 
@@ -196,7 +284,9 @@ async function embedFanout(
 export function startAxonIndex(opts: AxonIndexOptions = {}): AxonJob {
   const activeStatus = activeJobId ? jobs.get(activeJobId)?.status : undefined;
   if (activeStatus === 'running' || activeStatus === 'queued') {
-    throw new Error(`an Axon index job is already ${activeStatus} (${activeJobId})`);
+    const a = jobs.get(activeJobId!)!;
+    throw new Error(`Axon indexing job ${activeJobId} is already ${activeStatus} (project ${Math.min(a.projectsDone + 1, a.projectsTotal || 1)}/${a.projectsTotal}, `
+      + `${a.functionsEmbedded}/${a.functionsTotal} functions, started ${a.startedAt.slice(11, 16)}). Wait for it or cancel it on the Axon page.`);
   }
   const { model, dimensions } = resolveAxonEmbeddingModel();
   const job: AxonJob = {
@@ -226,27 +316,42 @@ export async function runAxonIndex(job: AxonJob, opts: AxonIndexOptions = {}): P
   const projDir = getAxonProjDir(settings);
   const { model, dimensions } = resolveAxonEmbeddingModel();
   const isCancelled = () => !!job.cancelRequested;
+  const lockLabel = opts.projectId ?? (opts.projectIds ? `${opts.projectIds.length} changed project(s)` : opts.source ?? 'all');
+  job.projectsSkipped = 0; job.functionsSkipped = 0; job.functionsDeleted = 0; job.projectStats = [];
 
-  // Heavy-job lock: queue behind a code re-embed / forced reindex; the job
-  // stays `queued` (waitingFor = holder) and starts automatically on hand-over.
-  const abort = new AbortController();
-  const cancelPoll = setInterval(() => { if (job.cancelRequested) abort.abort(); }, 1000);
-  cancelPoll.unref?.();
+  // Heavy-job lock per project (3.12 item 3): taken only for a project that
+  // has work, released after it, so a waiting code embed (hand-over) or a
+  // lazy task runs between projects. While waiting the job is `queued`.
   let releaseHeavy: (() => void) | null = null;
-  try {
-    releaseHeavy = await waitForHeavyJob('axon-index', opts.projectId ?? opts.source ?? 'all', {
-      signal: abort.signal,
-      onWaiting: (h) => { job.status = 'queued'; job.waitingFor = h; },
-    });
-  } catch {
-    clearInterval(cancelPoll);
-    job.status = 'cancelled';
-    job.waitingFor = null;
-    job.finishedAt = new Date().toISOString();
-    return job;
-  }
-  clearInterval(cancelPoll);
-  job.waitingFor = null;
+  const publish = () => setHeavyJobProgress('axon-index', {
+    page: '/axon', jobId: job.id, projectsDone: job.projectsDone, projectsTotal: job.projectsTotal,
+    itemsDone: job.functionsEmbedded + (job.functionsSkipped ?? 0), itemsTotal: job.functionsTotal, itemsLabel: 'functions',
+    providers: job.providers, startedAt: job.startedAt, currentProject: job.currentProject,
+  });
+  const takeLock = async (): Promise<boolean> => {
+    const abort = new AbortController();
+    const poll = setInterval(() => { if (job.cancelRequested) abort.abort(); }, 1000);
+    poll.unref?.();
+    try {
+      releaseHeavy = await waitForHeavyJob('axon-index', lockLabel, {
+        signal: abort.signal,
+        onWaiting: (h) => { job.status = 'queued'; job.waitingFor = h; },
+      });
+      job.status = 'running';
+      return true;
+    } catch {
+      return false;
+    } finally {
+      clearInterval(poll);
+      job.waitingFor = null;
+    }
+  };
+  const dropLock = () => {
+    setHeavyJobProgress('axon-index', null);
+    const r = releaseHeavy;
+    releaseHeavy = null;
+    r?.();
+  };
 
   job.status = 'running';
   try {
@@ -266,34 +371,26 @@ export async function runAxonIndex(job: AxonJob, opts: AxonIndexOptions = {}): P
     if (all.length === 0) {
       throw new Error(`no Axon projects found under proj (${projDir}) or library (${getAxonLibraryDir(settings)}) — check axon.projectPath / axon.libraryPath`);
     }
+    const wanted = opts.projectIds ? new Set(opts.projectIds) : null;
     const refs: AxonProjectRef[] = opts.projectId
       ? all.filter(p => p.projectId === opts.projectId)
-      : all;
+      : wanted ? all.filter(p => wanted.has(p.projectId)) : all;
     if (opts.projectId && refs.length === 0) throw new Error(`unknown Axon project '${opts.projectId}'`);
     job.projectsTotal = refs.length;
     job.functionsTotal = refs.reduce((n, r) => n + r.functionCount, 0);
 
-    // Policy-aware: under "OpenRouter only" this returns the verified cloud
-    // pool (and throws CloudOnlyUnavailableError, with a named reason, when it
-    // cannot serve) rather than an empty local list. The local-only selector
-    // used to report "sidecar fleet offline?" for a fleet that was online and
-    // simply excluded by policy — no sidecar here advertises embedding at all.
-    const providers = opts.providers ?? await selectAllEmbeddingProvidersWithCloud('code', model);
-    if (providers.length === 0) {
-      throw new Error(`no embedding provider advertises model ${model} (capability embedding-code/embedding) — sidecar fleet offline?`);
-    }
-    job.providers = providers.map(providerLabel);
-    for (const p of providers) { try { await p.initialize(); } catch { /* sidecar providers are no-ops */ } }
-
-    // Table at the configured dims; refuses to drop a populated mismatched table unless force.
-    const table = await ensureAxonTableForWrite(!!opts.force);
     const batchSize = opts.batchSize ?? readBatchSize();
     const meta = readAxonMeta();
+    const cache = opts.cache !== undefined ? opts.cache : await loadEmbedCache();
+    let table: Awaited<ReturnType<typeof ensureAxonTableForWrite>> | null = null;
 
     for (const ref of refs) {
       if (isCancelled()) { job.status = 'cancelled'; break; }
       job.currentProject = ref.projectId;
       const t0 = Date.now();
+      const prev = meta.projects[ref.projectId];
+      const stat: AxonProjectRunStat = { projectId: ref.projectId, status: 'embedding', functions: 0, skipped: 0, embedded: 0, deleted: 0, providerTexts: 0, errors: 0 };
+      job.projectStats!.push(stat);
       const pm: AxonProjectMeta = {
         projectId: ref.projectId, source: ref.source, instance: ref.instance, project: ref.project,
         functionsFound: 0, vectorsWritten: 0, rowsWritten: 0, model, dimensions,
@@ -302,39 +399,89 @@ export async function runAxonIndex(job: AxonJob, opts: AxonIndexOptions = {}): P
       };
       try {
         const records = parseAnyAxonProject(ref);
-        pm.functionsFound = records.length;
-        // One embedding unit per chunk (long bodies → overlapping 40-line windows).
+        pm.functionsFound = stat.functions = records.length;
+        const plan = planAxonProject(records, prev, model, dimensions, { force: opts.force });
+        if (plan.skip) {
+          // Unchanged (3.12 item 1): no provider, no lock, no table write.
+          stat.status = 'skipped';
+          stat.skipped = records.length;
+          job.projectsSkipped!++;
+          job.functionsSkipped! += records.length;
+          job.projectsDone++;
+          continue;
+        }
+
+        // Lock for this project only (item 3).
+        if (!(await takeLock())) { job.status = 'cancelled'; stat.status = 'error'; break; }
+        // Providers refreshed per project (item 4): one that passed the vector
+        // gate mid-run joins here. Policy-aware: under "OpenRouter only" this
+        // is the verified cloud pool (it throws with a named reason when that
+        // pool cannot serve).
+        const providers = opts.providers ?? await selectAllEmbeddingProvidersWithCloud('code', model);
+        if (providers.length === 0) {
+          throw new Error(`no embedding provider advertises model ${model} (capability embedding-code/embedding) — sidecar fleet offline?`);
+        }
+        job.providers = providers.map(providerLabel);
+        for (const p of providers) { try { await p.initialize(); } catch { /* sidecar providers are no-ops */ } }
+        // Table at the configured dims; refuses to drop a populated mismatched table unless force.
+        table ??= await ensureAxonTableForWrite(!!opts.force);
+        publish();
+
+        // One embedding unit per chunk of a changed function.
         const units: Array<{ record: AxonFunctionRecord; chunk: AxonEmbeddingChunk }> = [];
-        for (const r of records) for (const c of buildAxonEmbeddingChunksFor(r)) units.push({ record: r, chunk: c });
+        for (const r of plan.changed) for (const c of buildAxonEmbeddingChunksFor(r)) units.push({ record: r, chunk: c });
         const texts = units.map(u => u.chunk.text);
         const embeddedBefore = job.functionsEmbedded;
-        const vectors = units.length
-          ? await embedFanout(texts, providers, batchSize, d => { job.functionsEmbedded = embeddedBefore + Math.round(d * records.length / units.length); }, isCancelled)
-          : [];
+        const n = plan.changed.length;
+        const fanout = (xs: string[]) => {
+          stat.providerTexts += xs.length;
+          return embedFanout(xs, providers, batchSize, d => {
+            job.functionsEmbedded = embeddedBefore + Math.round(d * n / Math.max(1, units.length));
+            publish();
+          }, isCancelled);
+        };
+        const vectors = units.length === 0 ? []
+          : cache && cache.isEnabled()
+            ? (await cache.embedThrough(model, texts, fanout, AXON_CACHE_TEXT_VERSION)).vectors
+            : await fanout(texts);
         // Validate dims before touching the table.
-        const bad = vectors.findIndex(v => v.length !== dimensions);
+        const bad = vectors.findIndex(v => !v || v.length !== dimensions);
         if (bad >= 0) {
-          throw new Error(`provider returned ${vectors[bad].length}d vectors but code model ${model} is configured at ${dimensions}d — fix semanticSearch.codeDimensions`);
+          throw new Error(`provider returned ${vectors[bad]?.length ?? 0}d vectors but code model ${model} is configured at ${dimensions}d — fix semanticSearch.codeDimensions`);
         }
-        // Replace the project's rows atomically enough: delete then add.
-        await deleteAxonProjectVectors(ref.projectId);
+        // Full (force, model/dims/layout change): replace the project's rows.
+        // Otherwise delete only the rows of changed and removed functions.
+        if (plan.full) await deleteAxonProjectVectors(ref.projectId);
+        else await deleteAxonFunctionVectors(ref.projectId, plan.deleteNames);
         const rows: AxonVectorRow[] = units.map((u, i) => toRow(u.record, u.chunk, vectors[i], model, dimensions));
         for (let i = 0; i < rows.length; i += 500) await table.add(rows.slice(i, i + 500) as unknown as Record<string, unknown>[]);
         pm.vectorsWritten = records.length;
-        pm.rowsWritten = rows.length;
+        pm.rowsWritten = rows.length; // rows written by this run
         for (const r of records) pm.hashes![r.name] = r.hash;
-        job.functionsEmbedded = embeddedBefore + records.length;
+        stat.embedded = n;
+        stat.skipped = plan.unchanged;
+        stat.deleted = plan.full ? 0 : plan.removed.length;
+        stat.status = 'done';
+        job.functionsEmbedded = embeddedBefore + n;
+        job.functionsSkipped! += plan.unchanged;
+        job.functionsDeleted! += stat.deleted;
       } catch (err) {
         const msg = (err as Error).message;
+        stat.status = 'error';
+        stat.errors++;
         pm.errors.push(msg);
         job.errors.push({ projectId: ref.projectId, message: msg, at: new Date().toISOString() });
         logger.error(`Axon index failed for ${ref.projectId}: ${msg}`);
         if (/all .* provider\(s\) faulted|cancelled|no providers left|configured at/.test(msg)) {
           pm.durationMs = Date.now() - t0;
-          meta.projects[ref.projectId] = { ...pm, hashes: meta.projects[ref.projectId]?.hashes };
+          meta.projects[ref.projectId] = { ...pm, hashes: prev?.hashes };
           writeAxonMeta(meta);
           throw err; // fleet is gone / cancelled — stop the whole run
         }
+        // Keep the old hashes: the next run retries exactly this project.
+        pm.hashes = prev?.hashes;
+      } finally {
+        dropLock(); // yield between projects
       }
       pm.durationMs = Date.now() - t0;
       meta.projects[ref.projectId] = pm;
@@ -342,6 +489,7 @@ export async function runAxonIndex(job: AxonJob, opts: AxonIndexOptions = {}): P
       job.projectsDone++;
     }
     if (job.status === 'running') job.status = 'done';
+    logger.info(`Axon index job ${job.id}: ${job.projectsSkipped} project(s) skipped, ${job.functionsEmbedded} function(s) embedded, ${job.functionsDeleted} deleted, ${job.errors.length} error(s)`);
   } catch (err) {
     const msg = (err as Error).message;
     job.status = msg === 'cancelled' ? 'cancelled' : 'error';
@@ -351,9 +499,16 @@ export async function runAxonIndex(job: AxonJob, opts: AxonIndexOptions = {}): P
   } finally {
     job.currentProject = undefined;
     job.finishedAt = new Date().toISOString();
-    releaseHeavy?.();
+    dropLock();
   }
   return job;
+}
+
+async function loadEmbedCache(): Promise<EmbedCache | null> {
+  try {
+    const { getEmbedCache } = await import('../embedding/embedCache.js');
+    return getEmbedCache();
+  } catch { return null; }
 }
 
 function readBatchSize(): number {
@@ -507,6 +662,27 @@ export function findAxonFunction(name: string, projectId?: string, source: AxonR
 export function maybeAutoIndexAtBoot(): void {
   const s = getAxonSettings();
   if (!s.enabled || !s.autoIndex) return;
+  // 3.12 item 2: cheap hash scan first. No change → no job, no lock, no
+  // provider poll. Changes → a job scoped to the changed projects.
+  void (async () => {
+    let changed: string[];
+    try {
+      const r = await scanAxonChanges('all');
+      changed = r.changed;
+      if (changed.length === 0) {
+        logger.info(`Axon autoIndex: ${r.projects} project(s) unchanged — no job`);
+        return;
+      }
+      logger.info(`Axon autoIndex: ${changed.length}/${r.projects} project(s) changed`);
+    } catch (e) {
+      logger.warn(`Axon autoIndex scan failed: ${(e as Error).message}`);
+      return;
+    }
+    pollProvidersThenIndex(changed);
+  })();
+}
+
+function pollProvidersThenIndex(projectIds: string[]): void {
   const { model } = resolveAxonEmbeddingModel();
   // Providers register over WS after boot (and cloud providers have to pass
   // verification first); poll briefly before giving up. The cloud selector
@@ -529,7 +705,7 @@ export function maybeAutoIndexAtBoot(): void {
       if (providers.length > 0) {
         clearInterval(timer);
         try {
-          const job = startAxonIndex({});
+          const job = startAxonIndex({ projectIds });
           logger.info(`Axon autoIndex started job ${job.id} with ${providers.length} provider(s)`);
         } catch (e) { logger.warn(`Axon autoIndex not started: ${(e as Error).message}`); }
       } else if (attempts >= 20) {

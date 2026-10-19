@@ -144,6 +144,17 @@ model FantomProject {
   libraries     String?                          // JSON array, e.g. ["rete","rete-vue-plugin","vuex"]
   summary       String?
 
+  // Lazy indexing (phase 1): "git" when a git root owns the project path,
+  // "scan" otherwise. Set by src/indexing/gitRoots.ts.
+  indexMode     String    @default("scan") @map("index_mode")
+
+  // Lazy indexing phase 2 (stable symbol keys, 3.8). 1 = legacy
+  // md5(absPath:qn:line) ids; 2 = nodeIdFor(projectId, symbolKey(...)).
+  // Set to 2 by the rekey task and never set back. rekeyedAt is set once the
+  // vector copy finished (src/indexing/rekeyMigration.ts).
+  keyScheme     Int       @default(1) @map("key_scheme")
+  rekeyedAt     DateTime? @map("rekeyed_at")
+
   createdAt     DateTime  @default(now()) @map("created_at")
   updatedAt     DateTime  @updatedAt @map("updated_at")
 
@@ -154,6 +165,11 @@ model FantomProject {
   indexRuns    IndexRun[]
   dependencies ProjectDependency[] @relation("DependencyFrom")
   dependents   ProjectDependency[] @relation("DependencyTo")
+  indexTasks   IndexTask[]
+  gitStates    ProjectGitState[]
+  symbolLinks  SymbolLink[]
+  pendingRefs  PendingRef[]
+  vectorStates VectorState[]
 
   @@map("fantom_projects")
 }
@@ -203,6 +219,8 @@ model IndexedFile {
   contentSha   String   @map("content_sha256")    // sha256 of file bytes
   byteSize     Int      @map("byte_size")
   symbolCount  Int      @default(0) @map("symbol_count") // # symbols last extracted from this file
+  indexVersion String   @default("") @map("index_version") // indexVersionFor(ext, parserType) at parse time; "" = before phase 0
+  keyBase      String   @default("") @map("key_base")      // git root the symbol keys are relative to; "" = project root (3.6, 3.8)
   indexedAt    DateTime @default(now()) @map("indexed_at")
 
   project FantomProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
@@ -210,6 +228,80 @@ model IndexedFile {
   @@unique([projectId, filePath])
   @@index([projectId])
   @@map("indexed_files")
+}
+
+// Stable symbol keys (lazy-incremental-indexing.md 3.8): old key → new key.
+// kind 'rekey': oldKey = legacy 16-char node id, newKey = symbol key,
+// newNodeId = the new store id. Later phases add 'rename' / 'move' links.
+model SymbolLink {
+  id        Int      @id @default(autoincrement())
+  projectId Int      @map("project_id")
+  oldKey    String   @map("old_key")
+  newKey    String   @map("new_key")
+  newNodeId String?  @map("new_node_id")
+  kind      String
+  runId     Int?     @map("run_id")
+  at        DateTime @default(now())
+
+  project FantomProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, kind, oldKey])
+  @@index([projectId, newKey])
+  @@map("symbol_links")
+}
+
+// Graph patch (lazy-incremental-indexing.md 3.4 step 4): an outgoing
+// reference whose target is not indexed yet, re-resolved when a parse adds a
+// symbol whose last name segment equals targetTail. Bounded per project
+// (graphPatch.maxPendingRefs, oldest first). src/indexing/graphPatch.ts uses
+// raw SQL, so the table works before `prisma generate` runs.
+model PendingRef {
+  id         Int      @id @default(autoincrement())
+  projectId  Int      @map("project_id")
+  sourceFile String   @map("source_file")
+  sourceKey  String   @default("") @map("source_key")
+  sourceId   String   @map("source_id")
+  targetName String   @map("target_name")
+  targetTail String   @map("target_tail")
+  edgeType   String   @map("edge_type")
+  line       Int      @default(0)
+  col        Int      @default(0)
+  confidence Float    @default(1.0)
+  className  String   @default("") @map("class_name")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  project FantomProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, sourceFile])
+  @@index([projectId, targetTail])
+  @@map("pending_refs")
+}
+
+// Incremental embedding (lazy-incremental-indexing.md 3.5, phase 4): what
+// text each code_vectors node was embedded from. A row whose textHash,
+// textVersion and model match the new text needs no embed; a row no node
+// claims is an orphan (embedPatch, vector-gc). src/indexing/embedPatch.ts
+// uses raw SQL, so the table works before `prisma generate` runs.
+model VectorState {
+  nodeId        String   @id @map("node_id")
+  projectId     Int      @map("project_id")
+  filePath      String   @map("file_path")
+  qualifiedName String   @default("") @map("qualified_name")
+  symbolKey     String   @default("") @map("symbol_key")
+  bodySha       String   @default("") @map("body_sha")
+  textHash      String   @map("text_hash")
+  textVersion   Int      @map("text_version")
+  model         String
+  chunkCount    Int      @default(1) @map("chunk_count")
+  embeddedAt    DateTime @default(now()) @map("embedded_at")
+  runId         Int?     @map("run_id")
+
+  project FantomProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, filePath])
+  @@index([projectId, bodySha])
+  @@index([projectId, textHash])
+  @@map("vector_state")
 }
 
 // ============================================
@@ -235,6 +327,14 @@ model IndexRun {
   errorMessage   String?   @map("error_message")
   gitCommit      String?   @map("git_commit")  // HEAD SHA at run time (P2.4)
   gitBranch      String?   @map("git_branch")  // current branch at run time
+  parserVersion  Int?      @map("parser_version") // PARSER_SCHEMA_VERSION for this run (null = before phase 0)
+  // Lazy indexing (phase 1): where the change set came from and the git move.
+  changeSource   String?   @map("change_source")   // git | dirty | mtime | sha | version | forced
+  gitFromCommit  String?   @map("git_from_commit") // base of the diff (project_git_state.last_indexed_commit)
+  headMove       String?   @map("head_move")       // none | edit | integrate | rewrite | switch | unknown
+  gitDirty       Boolean   @default(false) @map("git_dirty")
+  gitHeadTime    DateTime? @map("git_head_time")   // author time of gitCommit
+  checkout       Boolean   @default(false)         // headMove = switch: history records counts only
 
   project FantomProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
   changes      ApiChange[]
@@ -488,3 +588,83 @@ model OAuthSession {
 // in LadybugDB at .cache/fantom-graph.db. See src/graph/ladybugSchema.ts for
 // the Cypher schema and src/graph/ladybugQueryManager.ts for reads.
 // Pre-cutover SQLite data is preserved at .cache/fantom.db.pre-ladybug-cutover.
+
+// ============================================
+// Lazy incremental indexing (docs/proposals/lazy-incremental-indexing.md)
+// ============================================
+
+// Durable task queue (3.3). One pending row per (project, kind) through
+// dedupe_key; a claimed row drops its key so the next change makes a new row.
+model IndexTask {
+  id           Int       @id @default(autoincrement())
+  projectId    Int       @map("project_id")
+  kind         String    // phase 1: parse | full-reindex | embed
+  state        String    @default("pending") // pending | running | done | failed | cancelled | yielded
+  priority     Int       @default(50)        // lower runs first; 10 primary project, 50 default, 90 switch/full-reindex
+  payload      String    @default("{}")      // JSON: { source, rootId, paths, removed, renamed, git }
+  dedupeKey    String?   @unique @map("dedupe_key") // "<projectId>:<kind>" while pending/yielded; NULL once claimed
+  attempts     Int       @default(0)
+  maxAttempts  Int       @default(5) @map("max_attempts")
+  nextRunAt    DateTime  @default(now()) @map("next_run_at")
+  leaseOwner   String?   @map("lease_owner")   // worker id; a stale lease = a crashed worker
+  leaseUntil   DateTime? @map("lease_until")
+  parentId     Int?      @map("parent_id")     // parse → embed chain
+  runId        Int?      @map("run_id")        // index_runs row this task reports into
+  error        String?
+  result       String?                         // JSON summary
+  createdAt    DateTime  @default(now()) @map("created_at")
+  startedAt    DateTime? @map("started_at")
+  finishedAt   DateTime? @map("finished_at")
+
+  project FantomProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([state, priority, nextRunAt])
+  @@index([projectId, kind, state])
+  @@index([createdAt])
+  @@map("index_tasks")
+}
+
+// One row per repository that owns indexed paths (3.2.9). A nested repo
+// points at the nearest root above it (3.2.11).
+model GitRoot {
+  id               Int       @id @default(autoincrement())
+  root             String    @unique                     // absolute, resolved
+  gitDir           String    @map("git_dir")             // worktree and submodule aware
+  gitCommonDir     String    @map("git_common_dir")
+  parentRootId     Int?      @map("parent_root_id")      // inner repo → the root that contains it
+  lastHeadSeen     String?   @map("last_head_seen")      // HEAD at the last event, even if the run failed
+  lastReflogIdent  String?   @map("last_reflog_ident")   // "<ts> <new-sha> <line-hash>" of the last reflog line consumed
+  lastHeadMove     String?   @map("last_head_move")      // JSON HeadMove
+  hookInstalled    Boolean   @default(false) @map("hook_installed")
+  hookTokenHash    String?   @map("hook_token_hash")
+  gitError         String?   @map("git_error")           // last failure of a read-only call
+  watchMode        String    @default("fsevents") @map("watch_mode") // fsevents | poll | off
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  parent   GitRoot?  @relation("NestedRoots", fields: [parentRootId], references: [id], onDelete: SetNull)
+  children GitRoot[] @relation("NestedRoots")
+  states   ProjectGitState[]
+
+  @@index([parentRootId])
+  @@map("git_roots")
+}
+
+// Base commit of the next diff, one row per (project, root) pair (3.2.2).
+model ProjectGitState {
+  projectId          Int       @map("project_id")
+  rootId             Int       @map("root_id")
+  subPath            String    @default("") @map("sub_path") // project path relative to the root ("" = the root, or a root inside the project)
+  lastIndexedCommit  String?   @map("last_indexed_commit")   // moves only when the parse finished without hard errors
+  lastIndexedBranch  String?   @map("last_indexed_branch")
+  dirtyPaths         String    @default("[]") @map("dirty_paths") // phase 5
+  lastDirtyAt        DateTime? @map("last_dirty_at")
+  lastScanAt         DateTime? @map("last_scan_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  project FantomProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  root    GitRoot       @relation(fields: [rootId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, rootId])
+  @@index([rootId])
+  @@map("project_git_state")
+}

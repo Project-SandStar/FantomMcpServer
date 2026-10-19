@@ -61,12 +61,105 @@ export interface HeavyJobWaiter {
   since: string;
 }
 
+/**
+ * Live progress a holder publishes (3.12 item 6), so every refusal can say
+ * what is running: project N of M, functions done, providers, ETA.
+ */
+export interface HeavyJobProgress {
+  /** Link to the page that owns the job (dashboard route). */
+  page?: string;
+  /** Id the owner's cancel endpoint takes. */
+  jobId?: string;
+  projectsDone?: number;
+  projectsTotal?: number;
+  itemsDone?: number;
+  itemsTotal?: number;
+  itemsLabel?: string;
+  providers?: string[];
+  /** Run start (the lock may be re-taken per project). */
+  startedAt?: string;
+  currentProject?: string;
+}
+
+const KIND_NAMES: Record<HeavyJobKind, string> = {
+  'code-reembed': 'Code re-embedding',
+  'code-reindex': 'Code reindexing',
+  'axon-index': 'Axon indexing',
+};
+
+const progressByKind = new Map<HeavyJobKind, HeavyJobProgress>();
+
+/** Publish (or clear with null) the progress of a running heavy job. */
+export function setHeavyJobProgress(kind: HeavyJobKind, p: HeavyJobProgress | null): void {
+  if (p) progressByKind.set(kind, p); else progressByKind.delete(kind);
+}
+
+export function getHeavyJobProgress(kind: HeavyJobKind): HeavyJobProgress | null {
+  return progressByKind.get(kind) ?? null;
+}
+
+/** ETA in minutes from the run start and items done, or null. */
+export function heavyJobEtaMin(p: HeavyJobProgress, now = Date.now()): number | null {
+  if (!p.startedAt || !p.itemsDone || !p.itemsTotal || p.itemsDone >= p.itemsTotal) return null;
+  const elapsed = now - Date.parse(p.startedAt);
+  if (!(elapsed > 0)) return null;
+  return Math.max(1, Math.round((elapsed / p.itemsDone) * (p.itemsTotal - p.itemsDone) / 60_000));
+}
+
+/**
+ * One human sentence about a holder, e.g. "Axon indexing is running (project
+ * 18/121, 760/4996 functions, 1 provider, started 10:02, ETA 25 min)".
+ */
+export function describeHeavyJob(h: HeavyJobHolder, p: HeavyJobProgress | null = getHeavyJobProgress(h.kind), now = Date.now()): string {
+  const parts: string[] = [];
+  if (p?.projectsTotal) parts.push(`project ${Math.min((p.projectsDone ?? 0) + 1, p.projectsTotal)}/${p.projectsTotal}`);
+  if (p?.itemsTotal) parts.push(`${p.itemsDone ?? 0}/${p.itemsTotal} ${p.itemsLabel ?? 'items'}`);
+  if (p?.providers?.length) parts.push(`${p.providers.length} provider${p.providers.length === 1 ? '' : 's'}`);
+  parts.push(`started ${(p?.startedAt ?? h.since).slice(11, 16)}`);
+  const eta = p ? heavyJobEtaMin(p, now) : null;
+  if (eta !== null) parts.push(`ETA ${eta} min`);
+  return `${KIND_NAMES[h.kind] ?? h.kind} (${h.label}) is running (${parts.join(', ')})`;
+}
+
+/** Full refusal text for a request that hit the lock. */
+export function heavyJobRefusal(h: HeavyJobHolder, what = 'This job'): string {
+  const p = getHeavyJobProgress(h.kind);
+  const where = h.kind === 'axon-index' ? ' or cancel it on the Axon page' : p?.page ? ` or cancel it on ${p.page}` : '';
+  return `${describeHeavyJob(h, p)}. ${what} will start when it finishes${where}.`;
+}
+
+/** Snapshot for GET /admin/heavy-job and the dashboard banner. */
+export function getHeavyJobStatus(): {
+  active: boolean;
+  holder: HeavyJobHolder | null;
+  progress: HeavyJobProgress | null;
+  message: string | null;
+  etaMin: number | null;
+  queue: HeavyJobWaiter[];
+  shadowRebuild: boolean;
+} {
+  const p = holder ? getHeavyJobProgress(holder.kind) : null;
+  return {
+    active: holder !== null || shadowReembedActive,
+    holder,
+    progress: p,
+    message: holder ? describeHeavyJob(holder, p) : shadowReembedActive ? 'A vector rebuild is running' : null,
+    etaMin: p ? heavyJobEtaMin(p) : null,
+    queue: getHeavyJobQueue(),
+    shadowRebuild: shadowReembedActive,
+  };
+}
+
 export class HeavyJobBusyError extends Error {
   readonly holder: HeavyJobHolder;
+  /** Human sentence naming the holder (kind, scope, progress, ETA). */
+  readonly humanMessage: string;
   constructor(holder: HeavyJobHolder, requested: { kind: HeavyJobKind; label: string }) {
-    super(`heavy job busy: ${holder.kind} (${holder.label}) running since ${holder.since} — ${requested.kind} (${requested.label}) must wait`);
+    const human = heavyJobRefusal(holder, `${KIND_NAMES[requested.kind] ?? requested.kind} (${requested.label})`);
+    super(human);
     this.name = 'HeavyJobBusyError';
     this.holder = holder;
+    this.humanMessage = human;
   }
 }
 
@@ -178,4 +271,5 @@ export function _resetHeavyJobLockForTests(): void {
   holderToken = 0;
   for (const w of waiters.splice(0)) w.reject(new Error('reset'));
   shadowReembedActive = false;
+  progressByKind.clear();
 }

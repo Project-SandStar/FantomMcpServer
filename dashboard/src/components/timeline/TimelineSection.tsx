@@ -3,6 +3,7 @@
 import { TimelinePicker } from './TimelinePicker';
 import { IndexRunStrip } from './IndexRunStrip';
 import { HistoryPanel } from './HistoryPanel';
+import { DeleteIndexRunButton } from './DeleteIndexRunButton';
 
 interface TimelineSectionProps {
   projectId: number;
@@ -10,6 +11,8 @@ interface TimelineSectionProps {
   onChange: (iso: string | null) => void;
   compareToCurrent?: boolean;
   onCompareToggle?: (next: boolean) => void;
+  /** When set, a Delete button appears for the selected run. */
+  onRunDeleted?: (summary: string) => void;
 }
 
 // Composite for the AST viewer. One drop-in section that gives the user the
@@ -21,6 +24,7 @@ export function TimelineSection({
   onChange,
   compareToCurrent = false,
   onCompareToggle,
+  onRunDeleted,
 }: TimelineSectionProps) {
   if (!projectId || projectId <= 0) return null;
   return (
@@ -36,6 +40,9 @@ export function TimelineSection({
             />
             Compare to current
           </label>
+        )}
+        {onRunDeleted && (
+          <DeleteIndexRunButton projectId={projectId} selectedIso={atTime} onDeleted={onRunDeleted} />
         )}
       </div>
       <IndexRunStrip projectId={projectId} selectedIso={atTime} onSelect={onChange} />

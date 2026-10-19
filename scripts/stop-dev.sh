@@ -1,6 +1,6 @@
 #!/bin/bash
 # Stop the Fantom MCP dev server. Mirrors stop-server.sh's clean-shutdown
-# guarantees: SIGTERM, wait up to 30s for LadybugDB CHECKPOINT, only then
+# guarantees: SIGTERM, wait up to 50s for LadybugDB CHECKPOINT, only then
 # SIGKILL — a mid-WAL kill -9 corrupts fantom-graph.db.wal.
 
 SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -47,8 +47,8 @@ else
     kill -TERM "$DEV_PID" 2>/dev/null
 fi
 
-# Wait up to 30s for LadybugDB CHECKPOINT + clean shutdown.
-for i in $(seq 1 30); do
+# Wait up to 50s (the server gives itself 45s) for every graph CHECKPOINT + clean shutdown.
+for i in $(seq 1 50); do
     # -sTCP:LISTEN excludes outbound connections (e.g. mcp-proxy → us)
     # that share this port number.
     if ! kill -0 "$DEV_PID" 2>/dev/null && ! lsof -i :$MCP_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
@@ -59,7 +59,7 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-echo "WARNING: dev server did not exit in 30s; sending SIGKILL (WAL may corrupt)"
+echo "WARNING: dev server did not exit in 50s; sending SIGKILL (WAL may corrupt)"
 if [ -n "$PGID" ]; then
     kill -9 -"$PGID" 2>/dev/null
 fi

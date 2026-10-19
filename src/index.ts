@@ -215,6 +215,7 @@ import * as path from 'path';
 import { WorkflowManager } from './workflows/workflowManager.js';
 import { getSemanticSearchService, getDocsVectorStore } from './embedding/index.js';
 import { getLadybugQueryManager } from './graph/ladybugQueryManager.js';
+import { REPORT_CHANGES_TOOL } from './indexing/reportChangesTool.js';
 
 const logger = createLogger('main');
 
@@ -326,7 +327,7 @@ class FantomMCPServer {
     this.server = new Server(
       {
         name: 'mcp-fantom',
-        version: '1.1.0',
+        version: '1.1.1',
       },
       {
         capabilities: {
@@ -565,6 +566,12 @@ class FantomMCPServer {
         this.initStatus.codeIndexReadyAt = Date.now();
         const totalTime = this.initStatus.codeIndexReadyAt - this.initStatus.startTime;
         this.log(`Background code indexing complete in ${totalTime}ms`);
+
+        // Lazy incremental indexing (src/indexing/): idle unless
+        // indexing.lazy.enabled; started after the boot drain.
+        void import('./indexing/runtime.js')
+          .then(m => m.startLazyIndexing(getPrismaClient()))
+          .catch(err => this.log(`Lazy indexing start failed: ${err}`));
 
         // After code indexing completes, generate embeddings
         return this.initializeEmbeddings();
@@ -1496,7 +1503,7 @@ class FantomMCPServer {
         };
       })(),
       initialized: this.initializationComplete,
-      version: '1.1.0',
+      version: '1.1.1',
       serverPath: path.resolve(dirname(fileURLToPath(import.meta.url)), 'index.js'),
       port: getServerPort(),
       stats: {
@@ -1654,6 +1661,7 @@ class FantomMCPServer {
     };
 
     return {
+      getWorkflowManager: () => this.workflowManager,
       getServerStatus: () => this.getServerStatus(),
       getCacheInfo: () => this.getCacheInfo(),
       clearCache: async (name?: string) => {
@@ -2014,6 +2022,7 @@ class FantomMCPServer {
               required: ['paths'],
             },
           },
+          REPORT_CHANGES_TOOL,
           {
             name: 'whatChangedRecently',
             description: 'Convenience wrapper: "what changed in this project in the last N hours?" Returns ApiChange events grouped by file. Default window: 24 hours. Supports kind filter (added | modified | removed). Best first stop for "what broke today".',
@@ -2787,7 +2796,7 @@ class FantomMCPServer {
 
           // Create a NEW Server instance for this session
           const sessionServer = new Server(
-            { name: 'mcp-fantom', version: '1.1.0' },
+            { name: 'mcp-fantom', version: '1.1.1' },
             { capabilities: { tools: {}, resources: {} } }
           );
 
@@ -3669,6 +3678,7 @@ class FantomMCPServer {
             required: ['paths'],
           },
         },
+        REPORT_CHANGES_TOOL,
         {
           name: 'whatChangedRecently',
           description: 'Convenience wrapper: what changed in this project in the last N hours? Returns ApiChange events grouped by file. Default 24h. Optional kind filter.',
@@ -4142,7 +4152,9 @@ class FantomMCPServer {
           durationMs: Date.now() - startTime,
           success,
           errorMessage,
-          sessionId: (request as any).sessionId,
+          // HTTP transport: the SDK passes the mcp-session-id in `extra`;
+          // `request.sessionId` is never set (0 of 707 rows had one).
+          sessionId: extra?.sessionId ?? (request as any).sessionId,
         });
       } catch (e) {
         // Don't fail the tool call if tracking fails
@@ -4928,11 +4940,19 @@ class FantomMCPServer {
             };
           }
 
+          // Focus set (lazy indexing 3.11): re-parse a changed focus file first.
+          const focus = await import('./indexing/focusTools.js');
+          const fx = await focus.focusCheck(func.filePath, func.projectId);
+          if (fx.refreshed) func = codeIndexer.getFunction(func.id) ?? func;
+          const related = fx.focus ? await focus.focusRelated({ projectId: fx.projectId, nodeId: func.id, filePath: func.filePath }) : undefined;
+
           return {
             content: [
               {
                 type: 'text',
                 text: JSON.stringify({
+                  ...(fx.stale ? { stale: true } : {}),
+                  ...(related ? { related } : {}),
                   function: {
                     id: func.id,
                     name: func.name,
@@ -4971,10 +4991,11 @@ class FantomMCPServer {
             offset?: number;
           };
           const { listFunctionsInFile } = await import('./fantom-code/fileSymbols.js');
+          const fx = atTime ? null : await (await import('./indexing/focusTools.js')).focusCheck(filePath, projectId);
           const result = await listFunctionsInFile(getPrismaClient(), {
             filePath, projectId, atTime, limit, offset,
           });
-          return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify(fx?.stale ? { stale: true, ...result } : result, null, 2) }] };
         }
 
         case 'getCodeNeighbors': {
@@ -5455,6 +5476,12 @@ class FantomMCPServer {
           };
         }
 
+        case 'reportChanges': {
+          const { reportChanges } = await import('./indexing/focusTools.js');
+          const result = await reportChanges({ ...(args as Record<string, unknown>), files: (args as { files?: unknown }).files, client: 'mcp' });
+          return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        }
+
         case 'reindexChangedFiles': {
           const { paths, projectId: explicitPid } = args as {
             paths: string[];
@@ -5463,6 +5490,7 @@ class FantomMCPServer {
           if (!Array.isArray(paths) || paths.length === 0) {
             throw new Error('paths must be a non-empty array');
           }
+          await (await import('./indexing/focusTools.js')).focusTouch(paths, explicitPid);
           this.log(`reindexChangedFiles: ${paths.length} path(s)${explicitPid ? `, projectId=${explicitPid}` : ' (auto-resolve)'}`);
 
           const { getPrismaClient } = await import('./db/prisma.js');
@@ -6272,12 +6300,13 @@ class FantomMCPServer {
             };
           }
 
+          const focusLines = await (await import('./indexing/focusTools.js')).focusForSymbol({ projectId, nodeId, qualifiedName, suggest: true });
           const callers = await queryManager.getCallers(nodeId, maxDepth);
 
           if (callers.length === 0) {
             await trackTool(true);
             return {
-              content: [{ type: 'text', text: 'No callers found for this function.' }],
+              content: [{ type: 'text', text: ['No callers found for this function.', ...focusLines].join('\n') }],
             };
           }
 
@@ -6286,6 +6315,7 @@ class FantomMCPServer {
             lines.push(`- [depth ${caller.depth}] ${caller.qualifiedName}`);
             lines.push(`  File: ${caller.filePath}${caller.lineNumber ? `:${caller.lineNumber}` : ''}`);
           }
+          lines.push(...focusLines);
 
           await trackTool(true);
           return {
@@ -6322,12 +6352,13 @@ class FantomMCPServer {
             };
           }
 
+          const focusLines = await (await import('./indexing/focusTools.js')).focusForSymbol({ projectId, nodeId, qualifiedName });
           const callees = await queryManager.getCallees(nodeId, maxDepth);
 
           if (callees.length === 0) {
             await trackTool(true);
             return {
-              content: [{ type: 'text', text: 'No callees found for this function.' }],
+              content: [{ type: 'text', text: ['No callees found for this function.', ...focusLines].join('\n') }],
             };
           }
 
@@ -6336,6 +6367,7 @@ class FantomMCPServer {
             lines.push(`- [depth ${callee.depth}] ${callee.qualifiedName}`);
             lines.push(`  File: ${callee.filePath}${callee.lineNumber ? `:${callee.lineNumber}` : ''}`);
           }
+          lines.push(...focusLines);
 
           await trackTool(true);
           return {
@@ -6369,6 +6401,7 @@ class FantomMCPServer {
             };
           }
 
+          const focusLines = await (await import('./indexing/focusTools.js')).focusForSymbol({ projectId, nodeId, qualifiedName });
           const impact = await queryManager.getImpact(nodeId, maxDepth);
 
           const lines = [
@@ -6394,6 +6427,7 @@ class FantomMCPServer {
               lines.push(`  ... and ${impact.affectedNodes.length - 20} more`);
             }
           }
+          lines.push(...focusLines);
 
           await trackTool(true);
           return {
@@ -6733,8 +6767,16 @@ async function gracefulShutdown(signal: string): Promise<void> {
   const timeout = setTimeout(() => {
     logger.error('Shutdown timeout exceeded; forcing exit');
     process.exit(1);
-  }, 25_000);
+  }, 45_000);
   try {
+    await import('./indexing/runtime.js').then(m => m.stopLazyIndexing()).catch(() => undefined);
+    // Per-project graph stores run with autoCheckpoint off, so their WAL is
+    // folded only on close. Closing just the shared DB here left every open
+    // project WAL half-written: each tsx restart quarantined 271/275 as
+    // "Corrupted wal file" (2026-10-16/17). Close (drain + CHECKPOINT) them all.
+    await import('./graph/projectGraphConnection.js')
+      .then(m => m.closeAllProjectConnections())
+      .catch(err => logger.error(`Error closing project graph stores: ${err}`));
     await closeLadybugConnection();
   } catch (err) {
     logger.error(`Error during LadybugDB close: ${err}`);

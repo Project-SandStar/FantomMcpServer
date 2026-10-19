@@ -1079,6 +1079,11 @@ export default function FantomPodsPage() {
                           <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded font-mono">
                             {pod.buildFile}
                           </span>
+                          {(pod.languages ?? []).map((lang) => (
+                            <span key={lang} className="text-xs px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">
+                              {lang}
+                            </span>
+                          ))}
                           <DependencyCounts
                             projectId={podProjectId}
                             summary={depSummary}
@@ -1174,9 +1179,11 @@ export default function FantomPodsPage() {
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-1 flex-wrap">
                           <h3 className="font-semibold text-gray-900 truncate">{proj.name}</h3>
-                          <span className="text-xs px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">
-                            {proj.language}
-                          </span>
+                          {(proj.languages?.length ? proj.languages : [proj.language]).map((lang) => (
+                            <span key={lang} className="text-xs px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">
+                              {lang}
+                            </span>
+                          ))}
                           <span className="text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
                             {proj.parserType === 'tree-sitter-wasm' || proj.parserType === 'tree-sitter'
                               ? 'Tree-sitter'

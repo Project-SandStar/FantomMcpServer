@@ -92,7 +92,13 @@ async function apiRequest<T>(endpoint: string, options: ApiOptions = {}): Promis
     if (response.status === 401) {
       throw new Error('Authentication required');
     }
-    throw new Error(`API error: ${response.statusText}`);
+    // Keep the server's own `error` text (e.g. a 409's reason) when it sent one.
+    let detail = '';
+    try {
+      const j = await response.json();
+      if (j && typeof j.error === 'string') detail = ` — ${j.error}`;
+    } catch { /* not JSON */ }
+    throw new Error(`API error: ${response.statusText}${detail}`);
   }
 
   return response.json();
@@ -101,6 +107,46 @@ async function apiRequest<T>(endpoint: string, options: ApiOptions = {}): Promis
 // ============================================
 // Type Definitions
 // ============================================
+
+/** GET /code-projects/:id/index-runs/:runId/delete-preview */
+export interface IndexRunDeletePreview {
+  projectId: number;
+  runId: number;
+  run: {
+    startedAt: string;
+    finishedAt: string | null;
+    trigger: string;
+    force: boolean;
+    isSeedingRun: boolean;
+    errorMessage: string | null;
+  };
+  isLatest: boolean;
+  isOnly: boolean;
+  unfinished: boolean;
+  apiChanges: { added: number; modified: number; removed: number; total: number; capped: boolean };
+  edgeChanges: number;
+  vectorSymbols: number;
+  /** Vector rows (all chunks); null when LanceDB could not be counted. */
+  vectorRows: number | null;
+  vectorSkipReason: string | null;
+  reparseFiles: string[];
+  refusal: string | null;
+}
+
+export interface WorkflowListItem {
+  id: string;
+  uri: string;
+  title: string;
+  description: string;
+  mtimeMs: number;
+  sizeBytes: number;
+  lines: number;
+}
+
+export interface WorkflowDetail {
+  workflow: WorkflowListItem;
+  fullContent: string;
+}
 
 export interface ServerStatus {
   status: 'running' | 'starting' | 'error';
@@ -311,6 +357,11 @@ export interface AxonJob {
   cancelRequested?: boolean;
   /** While queued: the heavy job (code re-embed / forced reindex) it waits for. */
   waitingFor?: HeavyJobHolder | null;
+  projectsSkipped?: number;
+  functionsSkipped?: number;
+  functionsDeleted?: number;
+  /** Per-project outcome, live. */
+  projectStats?: Array<{ projectId: string; status: 'skipped' | 'embedding' | 'done' | 'error'; functions: number; skipped: number; embedded: number; deleted: number; providerTexts: number; errors: number }>;
 }
 
 export interface AxonStatusResponse {
@@ -1110,6 +1161,7 @@ export interface FantomPod {
   compatMinVersion?: string;  // Minimum compatible version e.g., "3.1.10"
   compatMaxVersion?: string;  // Maximum compatible version e.g., "3.1.12"
   compatVersions?: string[];  // Specific compatible versions e.g., ["3.1.10", "3.1.11", "3.1.12"]
+  languages?: string[];       // From indexed files, most files first
   createdAt: string;
   updatedAt: string;
 }
@@ -1123,6 +1175,7 @@ export interface OrphanProject {
   podName: string | null;
   instanceId: number | null;
   language: string;
+  languages?: string[];       // From indexed files, most files first
   parserType: string;
   description: string | null;
   autoIndex: boolean;
@@ -1479,6 +1532,19 @@ export interface ExtractFunctionsResponse {
 export const api = {
   // Status
   getStatus: () => apiRequest<ServerStatus>('/status'),
+
+  // MCP workflow resources (workflows/*.md → workflow://<id>)
+  listWorkflows: () => apiRequest<{ count: number; workflows: WorkflowListItem[] }>('/workflows'),
+  getWorkflow: (id: string) => apiRequest<WorkflowDetail>(`/workflows/${encodeURIComponent(id)}`),
+  saveWorkflow: (id: string, content: string) =>
+    apiRequest<WorkflowDetail>(`/workflows/${encodeURIComponent(id)}`, { method: 'PUT', body: { content } }),
+  createWorkflow: (id: string, content: string) =>
+    apiRequest<WorkflowDetail>('/workflows', { method: 'POST', body: { id, content } }),
+  deleteWorkflow: (id: string) =>
+    apiRequest<{ success: boolean }>(`/workflows/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  optimizeWorkflow: (id: string, content: string, instructions?: string) =>
+    apiRequest<{ proposed: string; model: string; costUsd: number | null }>(
+      `/workflows/${encodeURIComponent(id)}/optimize`, { method: 'POST', body: { content, instructions } }),
 
   // Axon MCP server integration
   axonStatus: () => apiRequest<AxonStatusResponse>('/axon/status'),
@@ -2246,6 +2312,21 @@ export const api = {
         gitBranch: string | null;
       }>;
     }>(`/code-projects/${projectId}/index-runs?limit=${limit}`),
+
+  // "Delete this parse": what goes, then the delete (src/fantom-code/indexRunDelete.ts).
+  getIndexRunDeletePreview: (projectId: number, runId: number) =>
+    apiRequest<IndexRunDeletePreview>(`/code-projects/${projectId}/index-runs/${runId}/delete-preview`),
+
+  deleteIndexRun: (projectId: number, runId: number) =>
+    apiRequest<{
+      success: boolean;
+      runId: number;
+      isLatest: boolean;
+      apiChangesDeleted: number;
+      edgeChangesDeleted: number;
+      vectorsDeleted: number;
+      indexedFilesCleared: number;
+    }>(`/code-projects/${projectId}/index-runs/${runId}`, { method: 'DELETE' }),
 
   getProjectDiff: (projectId: number, from: string, to?: string, scope?: string) => {
     const params = new URLSearchParams({ from });

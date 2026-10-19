@@ -161,6 +161,15 @@ export class FantomFileScanner {
   }
 
   /**
+   * True when scanDirectory would list this file by name (include patterns
+   * only; exclude dirs and .gitignore are the caller's). Used by the lazy
+   * indexing git diff (src/indexing/changeDetector.ts).
+   */
+  accepts(filePath: string): boolean {
+    return this.matchesPattern(path.basename(filePath));
+  }
+
+  /**
    * Check if a filename matches include patterns
    */
   private matchesPattern(filename: string): boolean {

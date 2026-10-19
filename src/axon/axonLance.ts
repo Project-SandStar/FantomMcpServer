@@ -244,6 +244,17 @@ export async function countAxonVectorsByProject(): Promise<Map<string, { functio
   return out;
 }
 
+/** Delete the rows (all chunks) of the named functions of one project (3.12). */
+export async function deleteAxonFunctionVectors(projectId: string, names: string[]): Promise<void> {
+  if (names.length === 0 || !(await axonTableExists())) return;
+  const t = await getAxonLanceTable();
+  const pid = projectId.replace(/'/g, "''");
+  for (let i = 0; i < names.length; i += 200) {
+    const list = names.slice(i, i + 200).map(n => `'${n.replace(/'/g, "''")}'`).join(',');
+    await t.delete(`project_id = '${pid}' AND name IN (${list})`);
+  }
+}
+
 export async function deleteAxonProjectVectors(projectId: string): Promise<void> {
   if (!(await axonTableExists())) return;
   const t = await getAxonLanceTable();

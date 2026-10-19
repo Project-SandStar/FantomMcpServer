@@ -3,6 +3,39 @@
 All notable changes to FantomMcpServer. Public releases are snapshots; see
 `scripts/release-public.sh`.
 
+## 1.1.1 — 2026-10-18
+
+### Claude Code plugin
+- **`claudePlugin/`.** One install covers every registered project. Hooks
+  report edits (`PostToolUse`), inject the current project's index state
+  and tool routing at session start, and add a one-line tool hint per
+  prompt. Skills: `fantom-mcp` (routing), `/fantom-mcp:doctor`, `status`,
+  `ask`, `impact`, `add-project`, plus one `wf-*` skill per workflow file.
+  CLI `dist/bin/fantom-mcp.mjs`: `setup`, `doctor`, `status`, `token`,
+  `clean-legacy`, `disconnect`. `npm run plugin:{build,test,install}`.
+- **`GET /admin/indexing/context?cwd=`** (hook token): the project for a
+  directory, its index state and the registered roots.
+- Usage tracker records the HTTP `mcp-session-id` per tool call.
+
+### Lazy incremental indexing (phases 0 to 4)
+- Durable task queue, git-triggered change detection, memory guard.
+- Focus set and `reportChanges` tool; `POST /admin/indexing/report` with a
+  per-install report token, no Basic Auth.
+- Stable symbol keys without line numbers, embed cache, per-project rekey.
+- File-level graph patch by key, `pending_refs`, vectors kept across a
+  partial reindex.
+- Incremental embedding (`vector_state`, `embedPatch`, vector GC, cache
+  prune); incremental Axon embedding, boot only on change, named 409s.
+- Parser/extractor version in the hash gate; every source language scanned;
+  markdown heading sections, named callbacks and test blocks as symbols.
+
+### Graph and server
+- Per-project buffer pool sized from the store file (5 x MiB, 24 to 128);
+  CHECKPOINT around edge builds; every project store closed on shutdown.
+- AST viewer can delete one index run (history rows and its vectors).
+- Workflows: dashboard editor and admin routes for the MCP workflow resources.
+- Contextualizer: direct provider models use the provider's own API.
+
 ## 1.1.0 — 2026-10-01
 
 ### Retrieval quality

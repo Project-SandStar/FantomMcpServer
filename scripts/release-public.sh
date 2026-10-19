@@ -61,9 +61,9 @@ declare -a AUDIT_NAMES=(
   "real credentials"
 )
 declare -a AUDIT_PATTERNS=(
-  '(10\.10\.[0-9]+\.[0-9]+|192\.168\.88\.[0-9]+|100\.(1[0-9]|[6-9][0-9])\.[0-9]+\.[0-9]+)'
+  '(10\.10\.[0-9]+\.[0-9]+|192\.168\.88\.[0-9]+|100\.(1[0-9]|6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+)'
   '/(home|Users)/(mahmoud|alper)'
-  'bas\.co'
+  '(bas\.co|bassg\.com)'
   '(sk-or-v1-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|"passwordHash"\s*:)'
 )
 

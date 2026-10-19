@@ -419,4 +419,7 @@ export interface AdminContext {
 
   // OAuth Token Grant (for auto-authentication)
   getOAuthProvider?: () => import('../auth/oauthProvider.js').FantomOAuthProvider | null;
+
+  // MCP workflow resources (workflows/*.md), edited from the dashboard
+  getWorkflowManager?: () => import('../workflows/workflowManager.js').WorkflowManager;
 }

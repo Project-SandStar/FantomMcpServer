@@ -20,9 +20,9 @@ fi
 echo "Stopping server (PID: $PID)..."
 kill $PID
 
-# Wait up to 30s for LadybugDB CHECKPOINT + clean shutdown.
+# Wait up to 50s (the server gives itself 45s) for every graph CHECKPOINT + clean shutdown.
 # Mid-WAL kill -9 corrupts fantom-graph.db.wal — do not shorten this.
-for i in $(seq 1 30); do
+for i in $(seq 1 50); do
     if ! lsof -i :$MCP_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
         echo "Server stopped cleanly after ${i}s"
         exit 0
@@ -30,6 +30,6 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-echo "WARNING: server did not exit in 30s; sending SIGKILL (WAL may corrupt)"
+echo "WARNING: server did not exit in 50s; sending SIGKILL (WAL may corrupt)"
 kill -9 $PID
 echo "Server stopped (forced)"

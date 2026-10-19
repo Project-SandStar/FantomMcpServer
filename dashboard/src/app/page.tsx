@@ -7,6 +7,7 @@ import { GlobalProgressPanel } from '@/components/GlobalProgressPanel';
 import { ProjectVectorTable } from '@/components/ProjectVectorTable';
 import { EmbeddingActivityConsole } from '@/components/EmbeddingActivityConsole';
 import { AxonStatusCard } from '@/components/AxonStatusCard';
+import { useHeavyJob } from '@/lib/heavyJob';
 
 function formatUptime(seconds: number): string {
   const days = Math.floor(seconds / 86400);
@@ -83,6 +84,7 @@ export default function Home() {
   const [loadingTooLong, setLoadingTooLong] = useState(false);
   const [resumeMsg, setResumeMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
   const queryClient = useQueryClient();
+  const heavyJob = useHeavyJob();
 
   const resumeEmbedMutation = useMutation({
     mutationFn: () => api.buildMissingAll(),
@@ -264,9 +266,11 @@ export default function Home() {
           <div className="ml-auto flex items-center gap-2">
             <button
               onClick={() => resumeEmbedMutation.mutate()}
-              disabled={resumeEmbedMutation.isPending}
+              disabled={resumeEmbedMutation.isPending || !!heavyJob.data?.active}
               className="px-4 py-2 bg-emerald-600 text-white rounded-md hover:bg-emerald-700 disabled:opacity-50 transition-colors text-sm"
-              title="Embed only projects/files missing vectors — picks up where a crashed run left off."
+              title={heavyJob.data?.active && heavyJob.data.message
+                ? `${heavyJob.data.message}. Resume embed will be possible when it finishes.`
+                : 'Embed only projects/files missing vectors — picks up where a crashed run left off.'}
             >
               {resumeEmbedMutation.isPending ? 'Resuming...' : 'Resume Embed'}
             </button>
@@ -300,6 +304,11 @@ export default function Home() {
             </button>
           </div>
         </div>
+        {heavyJob.data?.active && heavyJob.data.message && (
+          <div className="mt-3 px-3 py-2 rounded-md text-sm bg-amber-50 text-amber-800 border border-amber-200">
+            Resume embed is disabled: {heavyJob.data.message}.
+          </div>
+        )}
         {resumeMsg && (
           <div className={`mt-3 px-3 py-2 rounded-md text-sm ${resumeMsg.kind === 'ok' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
             {resumeMsg.text}

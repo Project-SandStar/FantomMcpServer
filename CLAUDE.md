@@ -139,5 +139,5 @@ scripts/release-public.sh <ver> [--publish]
 - `AGENTS.md` — full architecture, storage layout, MCP tool list, admin endpoints, env vars,
   ast-grep setup, release procedure.
 - `specs/` — design, requirements, roadmap, per-project graph migration.
-- `docs/` — runbooks and reports (`docs/tasks/` and `docs/reports/` are internal-only); `docs/JEV_BROWSER.md` — jev-browser setup, usage, and the dev-mode sign-in hook.
+- `docs/` — runbooks and reports (`docs/tasks/` and `docs/reports/` are internal-only); `docs/JEV_BROWSER.md` — jev-browser setup, usage, and the dev-mode sign-in hook; `docs/CLAUDE_PLUGIN.md` — install the Claude Code plugin (MCP via mcp-proxy `:9191`, hooks direct to `:3848`).
 - `workflows/*.md` — MCP workflow resources (`workflow://create-pod` etc.).

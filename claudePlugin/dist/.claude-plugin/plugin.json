@@ -1,0 +1,39 @@
+{
+  "name": "fantom-mcp",
+  "version": "1.1.1",
+  "description": "Working knowledge of Fantom, Axon, Haxall and SkySpark code from the Fantom MCP server: semantic search, call graph, impact, change history, docs, SkySpark 3.x to 4.0 migration. Hooks report your edits to the server and inject the current project's context at session start.",
+  "author": {
+    "name": "Project Sandstar"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "keywords": [
+    "mcp",
+    "fantom",
+    "axon",
+    "haxall",
+    "skyspark",
+    "xeto",
+    "code-graph",
+    "semantic-search"
+  ],
+  "userConfig": {
+    "mcp_url": {
+      "type": "string",
+      "title": "Fantom MCP endpoint",
+      "description": "Streamable HTTP MCP URL. Default goes through the local mcp-proxy on :9191 so the connector stays up while the server restarts.",
+      "default": "http://localhost:9191/fantom/mcp"
+    },
+    "server_url": {
+      "type": "string",
+      "title": "Fantom MCP server URL",
+      "description": "Base URL of the server itself (health, change reports, session context). No trailing slash.",
+      "default": "http://localhost:3848"
+    },
+    "report_token": {
+      "type": "string",
+      "title": "Report token",
+      "description": "Token from Dashboard > Indexing > Report token (or claudePlugin/scripts/install-local.sh). Lets the hooks report edits and read project context. Falls back to FANTOM_REPORT_TOKEN or ~/.fantom-mcp/report-token.",
+      "sensitive": true
+    }
+  }
+}

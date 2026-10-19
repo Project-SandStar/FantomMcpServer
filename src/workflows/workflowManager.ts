@@ -21,6 +21,16 @@ export interface Workflow {
   uri: string;
   metadata: WorkflowMetadata;
   fullContent: string;
+  /** File mtime (ms), so the dashboard can show when it last changed. */
+  mtimeMs: number;
+  sizeBytes: number;
+}
+
+/** Workflow ids become file names: keep them to a safe slug. */
+const WORKFLOW_ID_RE = /^[a-z0-9][a-z0-9_-]{0,79}$/i;
+
+export function isValidWorkflowId(id: string): boolean {
+  return WORKFLOW_ID_RE.test(id);
 }
 
 /**
@@ -55,6 +65,7 @@ export class WorkflowManager {
       try {
         const filePath = path.join(this.workflowDir, file);
         const content = fs.readFileSync(filePath, 'utf-8');
+        const stat = fs.statSync(filePath);
 
         // Generate ID from filename (remove .md extension)
         const id = file.replace(/\.md$/, '');
@@ -72,7 +83,9 @@ export class WorkflowManager {
             title,
             description
           },
-          fullContent: content
+          fullContent: content,
+          mtimeMs: stat.mtimeMs,
+          sizeBytes: stat.size,
         };
 
         this.workflows.set(id, workflow);
@@ -173,6 +186,42 @@ export class WorkflowManager {
   }
 
   /**
+   * Write a workflow file and reload at once, so MCP clients see the change
+   * without waiting for the watcher. The write goes to a temp file first and
+   * is renamed into place, so a reader never sees half a file.
+   * `mustExist` true = update only, false = create only.
+   */
+  saveWorkflow(id: string, content: string, mustExist: boolean): Workflow {
+    if (!isValidWorkflowId(id)) throw new Error(`Invalid workflow id "${id}" (letters, digits, - and _ only)`);
+    const exists = this.workflows.has(id);
+    if (mustExist && !exists) throw new Error(`Workflow "${id}" not found`);
+    if (!mustExist && exists) throw new Error(`Workflow "${id}" already exists`);
+    if (!fs.existsSync(this.workflowDir)) fs.mkdirSync(this.workflowDir, { recursive: true });
+    const filePath = path.join(this.workflowDir, `${id}.md`);
+    const tmpPath = path.join(this.workflowDir, `.${id}.md.${process.pid}.tmp`);
+    fs.writeFileSync(tmpPath, content.endsWith('\n') ? content : content + '\n', 'utf-8');
+    fs.renameSync(tmpPath, filePath);
+    this.reload();
+    this.notifyChange();
+    return this.workflows.get(id)!;
+  }
+
+  /** Delete a workflow file and reload. Returns false when it did not exist. */
+  deleteWorkflow(id: string): boolean {
+    if (!isValidWorkflowId(id) || !this.workflows.has(id)) return false;
+    fs.unlinkSync(path.join(this.workflowDir, `${id}.md`));
+    this.reload();
+    this.notifyChange();
+    return true;
+  }
+
+  private notifyChange(): void {
+    for (const l of this.onChangeListeners) {
+      try { l(); } catch (err) { console.error('workflow onChange listener failed:', err); }
+    }
+  }
+
+  /**
    * Subscribe to "workflows changed" events. Used by the MCP server to
    * emit a `notifications/resources/list_changed` message when an .md
    * file is added, removed, or edited on disk.
@@ -204,9 +253,7 @@ export class WorkflowManager {
         this.reloadTimer = setTimeout(() => {
           this.reloadTimer = null;
           this.reload();
-          for (const l of this.onChangeListeners) {
-            try { l(); } catch (err) { console.error('workflow onChange listener failed:', err); }
-          }
+          this.notifyChange();
         }, 250);
       });
     } catch (err) {

@@ -18,7 +18,7 @@ export interface IndexHealthReport {
   project: { id: number; name: string; path: string; language: string };
   prisma: { functions: number; types: number };
   ladybug: { nodes: number; edges: number; byLanguage: Array<{ language: string; count: number }> };
-  lance: { vectors: number; coverage: number };
+  lance: { vectors: number; coverage: number; orphans: { vectors: number; state: number } };
   flexsearch: { symbols: number };
   indexRun: {
     latestId: number | null;
@@ -82,11 +82,17 @@ export async function getIndexHealth(
 
   // ---------- LanceDB vectors ----------
   let vectorCount = 0;
+  let orphans = { vectors: 0, state: 0 };
   try {
     const { getVectorStore } = await import('../embedding/vectorStore.js');
     const vs = getVectorStore(prisma);
     const ids = await vs.getNodeIdsForProject(projectId);
     vectorCount = ids.size;
+    // Phase 4 (3.5): vector rows / vector_state rows no graph node claims.
+    const { findOrphans, liveOrphanDeps } = await import('../indexing/embedPatch.js');
+    const o = await findOrphans({ ...liveOrphanDeps(prisma), vectorIds: async () => ids }, projectId);
+    orphans = { vectors: o.vectorOrphans.length, state: o.stateOrphans.length };
+    if (orphans.vectors > 0) warnings.push(`${orphans.vectors} orphan vector rows (no graph node) — the vector-gc task deletes them`);
   } catch (err) {
     warnings.push(`vector check failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -207,6 +213,7 @@ export async function getIndexHealth(
         ladybugNodeCount > 0
           ? Math.round((vectorCount / ladybugNodeCount) * 100) / 100
           : 0,
+      orphans,
     },
     flexsearch: { symbols: flexSymbols },
     indexRun,

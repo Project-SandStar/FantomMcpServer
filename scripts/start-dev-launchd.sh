@@ -26,7 +26,7 @@ cat > "$PLIST" <<PL
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array>
     <string>/bin/bash</string><string>-lc</string>
-    <string>export PATH="/opt/homebrew/bin:/usr/local/bin:\$PATH"; export FANTOM_GRAPH_MAX_OPEN="${FANTOM_GRAPH_MAX_OPEN:-16}"; cd "$SERVER_DIR" &amp;&amp; exec bash scripts/start-dev.sh</string>
+    <string>export PATH="/opt/homebrew/bin:/usr/local/bin:\$PATH"; export FANTOM_GRAPH_MAX_OPEN="${FANTOM_GRAPH_MAX_OPEN:-16}"; ${FANTOM_GRAPH_DB_BUFFER_MIB:+export FANTOM_GRAPH_DB_BUFFER_MIB="$FANTOM_GRAPH_DB_BUFFER_MIB";} cd "$SERVER_DIR" &amp;&amp; exec bash scripts/start-dev.sh</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>

@@ -42,6 +42,9 @@ const logger = createLogger('tree-sitter-adapter');
 // File Scanner for Multi-Language Support
 // ============================================
 
+/** Test-framework calls whose callback is extracted as a named symbol. */
+const TEST_BLOCK_CALLEES = new Set(['describe', 'it', 'test', 'suite', 'beforeEach', 'afterEach', 'beforeAll', 'afterAll']);
+
 const LANGUAGE_EXTENSIONS: Record<SupportedLanguage, string[]> = {
   typescript: ['ts', 'tsx', 'mts', 'cts'],
   javascript: ['js', 'jsx', 'mjs', 'cjs'],
@@ -82,7 +85,24 @@ export class MultiLanguageScanner {
         ...LANGUAGE_EXTENSIONS.css
       ];
     } else {
-      this.extensions = LANGUAGE_EXTENSIONS[language] || [];
+      this.extensions = [...(LANGUAGE_EXTENSIONS[language] || [])];
+    }
+
+    // Mixed repos (a TS server with a Vue UI and .mjs scripts) lost every file
+    // outside the primary language. Scan every source language; parseFile
+    // routes each file to its own grammar by extension. Markup/data
+    // (html, css, json) stay opt-in through the primary language.
+    for (const [lang, exts] of Object.entries(LANGUAGE_EXTENSIONS) as [SupportedLanguage, string[]][]) {
+      if (lang === 'html' || lang === 'css' || lang === 'json') continue;
+      for (const ext of exts) {
+        if (!this.extensions.includes(ext)) this.extensions.push(ext);
+      }
+    }
+
+    // Project docs (README, design notes) carry intent the code doesn't;
+    // parseFile splits them into heading sections so they embed and search.
+    for (const ext of ['md', 'mdx']) {
+      if (!this.extensions.includes(ext)) this.extensions.push(ext);
     }
 
     // Always include .fan, .xeto, and .axon files — this is a Fantom MCP server
@@ -95,6 +115,12 @@ export class MultiLanguageScanner {
     if (language !== 'axon' && !this.extensions.includes('axon')) {
       this.extensions.push('axon');
     }
+  }
+
+  /** True when scanDirectory would list this file by extension (lazy indexing git diff). */
+  accepts(filePath: string): boolean {
+    const ext = path.basename(filePath).split('.').pop()?.toLowerCase();
+    return !!ext && this.extensions.includes(ext);
   }
 
   async scanDirectory(dirPath: string): Promise<{
@@ -346,6 +372,10 @@ export class TreeSitterCodeParser {
       // Route .vue files to Vue parser
       if (ext === '.vue') {
         return this.parseVueFile(filePath, fileContent);
+      }
+
+      if (ext === '.md' || ext === '.mdx') {
+        return this.parseMarkdownFile(filePath, fileContent);
       }
 
       // For mixed-language projects (e.g., .ts in a Vue project), detect per-file language
@@ -614,8 +644,28 @@ export class TreeSitterCodeParser {
           assigned = parent.childForFieldName('name');
         }
       }
-      if (!assigned) return null;
-      name = (assigned as { text: string }).text;
+      // Two callbacks-as-arguments that ARE symbols: composition calls
+      // assigned to a name (`const badge = computed(() => …)`, watch, useMemo)
+      // and test blocks (`it('rejects a bad token', () => …)`).
+      let callbackName: string | null = null;
+      if (!assigned && parent?.type === 'arguments') {
+        const call = (parent as { parent?: { type: string; childForFieldName: (n: string) => unknown | null; parent?: { type: string; childForFieldName: (n: string) => unknown | null } | null } | null }).parent ?? null;
+        if (call?.type === 'call_expression') {
+          const callee = call.childForFieldName('function') as { type: string; text: string; childForFieldName: (n: string) => unknown | null } | null;
+          const calleeName = callee?.type === 'member_expression'
+            ? (callee.childForFieldName('object') as { text: string } | null)?.text   // it.only / describe.each
+            : callee?.text;
+          if (calleeName && TEST_BLOCK_CALLEES.has(calleeName)) {
+            const firstArg = (parent.children as Array<{ type: string; text: string }>).find(c => /string|template/.test(c.type));
+            const title = firstArg ? firstArg.text.slice(1, -1).trim() : '';
+            callbackName = title ? `${calleeName}: ${title}` : calleeName;
+          } else if (call.parent?.type === 'variable_declarator') {
+            callbackName = (call.parent.childForFieldName('name') as { text: string } | null)?.text ?? null;
+          }
+        }
+      }
+      if (!assigned && !callbackName) return null;
+      name = callbackName ?? (assigned as { text: string }).text;
     } else {
       const nameNode = tsNode.childForFieldName('name') || this.findChildByType(tsNode.children, ['identifier', 'property_identifier']);
       if (!nameNode) return null;
@@ -1040,6 +1090,66 @@ export class TreeSitterCodeParser {
   /**
    * Basic regex-based parsing for unsupported languages
    */
+  /**
+   * Split a markdown file into one symbol per heading section. The section's
+   * line span (heading → line before the next heading of any level) is what
+   * the embedder slices, so each section embeds its own prose. Headings inside
+   * fenced code blocks are ignored. A file with no headings is one section
+   * named after the file.
+   */
+  private parseMarkdownFile(filePath: string, content: string): ParsedFile {
+    const result: ParsedFile = { filePath, types: [], functions: [], imports: [], usings: [], errors: [] };
+    const lines = content.split('\n');
+    const headings: { line: number; level: number; title: string }[] = [];
+    let inFence = false;
+    for (let i = 0; i < lines.length; i++) {
+      if (/^\s*(```|~~~)/.test(lines[i])) inFence = !inFence;
+      if (inFence) continue;
+      const m = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(lines[i]);
+      if (m) headings.push({ line: i + 1, level: m[1].length, title: m[2] });
+    }
+    if (headings.length === 0) {
+      if (content.trim().length === 0) return result;
+      headings.push({ line: 1, level: 1, title: path.basename(filePath) });
+    }
+
+    // Qualify each section with its parent headings: "Setup > OAuth > Tokens".
+    const stack: { level: number; title: string }[] = [];
+    headings.forEach((h, idx) => {
+      while (stack.length && stack[stack.length - 1].level >= h.level) stack.pop();
+      stack.push({ level: h.level, title: h.title });
+      const lineEnd = idx + 1 < headings.length ? headings[idx + 1].line - 1 : lines.length;
+      const sectionText = lines.slice(h.line, lineEnd).join('\n').trim();
+      if (!sectionText && idx + 1 < headings.length && headings[idx + 1].level > h.level) {
+        // Pure parent heading; its children carry the content.
+        return;
+      }
+      const qualifiedName = this.buildQualifiedName(stack.map(s => s.title).join(' > '));
+      result.functions.push({
+        id: generateFunctionId(filePath, qualifiedName, h.line),
+        projectId: this.projectId,
+        name: h.title,
+        qualifiedName,
+        type: 'field',
+        filePath,
+        lineNumber: h.line,
+        lineEnd,
+        signature: `${'#'.repeat(h.level)} ${h.title}`,
+        documentation: sectionText.slice(0, 800) || undefined,
+        parameters: [],
+        category: FantomCategory.OTHER,
+        tags: ['markdown', 'docs'],
+        isPublic: true,
+        isStatic: false,
+        isAbstract: false,
+        isOverride: false,
+        isVirtual: false,
+        facets: [],
+      });
+    });
+    return result;
+  }
+
   private parseWithRegex(filePath: string, content: string): ParsedFile {
     const result: ParsedFile = {
       filePath,

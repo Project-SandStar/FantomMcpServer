@@ -1,0 +1,19 @@
+{
+  "version": "1.1.1",
+  "workflows": [
+    "ai-coding-loop",
+    "api-migration-reference",
+    "connector-workflow",
+    "create-pod",
+    "create-skyspark-extension",
+    "explore-code-relations",
+    "haxall-basics",
+    "haxall-coding-standards",
+    "haxall-methods-workflow",
+    "setup-fantom-mcp",
+    "skyspark-4x-migration",
+    "unit-testing",
+    "use-fanr",
+    "xeto-spec-guide"
+  ]
+}

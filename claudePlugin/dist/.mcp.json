@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fantom": {
+      "type": "http",
+      "url": "${user_config.mcp_url}"
+    }
+  }
+}

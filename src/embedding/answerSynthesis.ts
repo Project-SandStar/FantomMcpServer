@@ -827,7 +827,7 @@ async function callGroqChat(model: string, system: string, user: string, maxToke
   return json.choices?.[0]?.message?.content ?? '';
 }
 
-async function callAnthropicChat(model: string, system: string, user: string, maxTokens: number): Promise<string> {
+export async function callAnthropicChat(model: string, system: string, user: string, maxTokens: number): Promise<string> {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) throw new Error('ANTHROPIC_API_KEY not set');
   const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -852,7 +852,7 @@ async function callAnthropicChat(model: string, system: string, user: string, ma
   return '';
 }
 
-async function callGeminiChat(model: string, system: string, user: string, maxTokens: number): Promise<string> {
+export async function callGeminiChat(model: string, system: string, user: string, maxTokens: number): Promise<string> {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY not set');
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;

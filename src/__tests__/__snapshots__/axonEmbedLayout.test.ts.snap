@@ -1,0 +1,24 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`Axon embed text layout v2 is version 2 and produces exactly this text 1`] = `
+[
+  {
+    "chunkCount": 1,
+    "chunkIndex": 0,
+    "lineEnd": 7,
+    "lineStart": 3,
+    "text": "kind: axon-function
+project: demo | instance: local | file: local demo add it | tags: sparkRule
+local demo addIt
+addIt(a, b = 2)
+context: calls: helper; called by: caller
+uses: hisRead
+doc: Adds.
+(a, b: 2) => do
+  // add them
+  x: a + b
+  hisRead(x)
+end",
+  },
+]
+`;

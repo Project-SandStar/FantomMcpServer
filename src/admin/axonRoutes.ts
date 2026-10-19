@@ -29,10 +29,14 @@ import {
 import { axonSearch, type AxonSearchMode } from '../axon/axonSearch.js';
 import { AXON_EMBED_TEXT_VERSION } from '../axon/axonEmbeddingText.js';
 import { getHeavyJob, getHeavyJobQueue } from '../embedding/embedGate.js';
+import { registerHeavyJobRoutes } from './heavyJobRoutes.js';
 
 function errMsg(e: unknown): string { return e instanceof Error ? e.message : String(e); }
 
 export function registerAxonRoutes(router: Router): void {
+  // /admin/heavy-job (3.12 item 6) is registered here to keep routes.ts untouched.
+  registerHeavyJobRoutes(router);
+
   router.get('/axon/status', async (_req: Request, res: Response): Promise<void> => {
     try {
       const settings = getAxonSettings();
@@ -175,6 +179,28 @@ export function registerAxonRoutes(router: Router): void {
       res.json({ name, isError: out.isError, text: out.text });
     } catch (e) {
       res.status(502).json({ error: errMsg(e) });
+    }
+  });
+
+  // 3.12 item 5: the exact chunks a function embeds from, by project + function name.
+  router.get('/axon/embed-text', async (req: Request, res: Response): Promise<void> => {
+    try {
+      const projectId = String(req.query.project ?? '');
+      const fn = String(req.query.fn ?? '');
+      if (!projectId || !fn) { res.status(400).json({ error: 'project and fn are required' }); return; }
+      await initAxonGrammar();
+      const ref = scanAllAxonProjects('all').find(p => p.projectId === projectId);
+      if (!ref) { res.status(404).json({ error: `unknown project ${projectId}` }); return; }
+      const rec = parseAnyAxonProject(ref).find(r => r.name === fn);
+      if (!rec) { res.status(404).json({ error: `unknown function ${fn} in ${projectId}` }); return; }
+      const chunks = buildAxonEmbeddingChunksFor(rec);
+      res.json({
+        project: projectId, fn: rec.name, id: rec.id, hash: rec.hash,
+        embedTextVersion: AXON_EMBED_TEXT_VERSION, grammar: axonGrammarStatus(),
+        chunkCount: chunks.length, chunks,
+      });
+    } catch (e) {
+      res.status(500).json({ error: errMsg(e) });
     }
   });
 

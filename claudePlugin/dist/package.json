@@ -1,0 +1,13 @@
+{
+  "name": "fantom-mcp-plugin",
+  "version": "1.1.1",
+  "description": "Working knowledge of Fantom, Axon, Haxall and SkySpark code from the Fantom MCP server: semantic search, call graph, impact, change history, docs, SkySpark 3.x to 4.0 migration. Hooks report your edits to the server and inject the current project's context at session start.",
+  "license": "SEE LICENSE IN LICENSE",
+  "type": "module",
+  "bin": {
+    "fantom-mcp": "bin/fantom-mcp.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

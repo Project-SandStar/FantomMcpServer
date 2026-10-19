@@ -20,7 +20,7 @@ import type {
   FunctionCall,
   ParsedFile
 } from '../fantom-code/types.js';
-import type { NodeType, GraphBuildResult } from './types.js';
+import type { NodeType, GraphBuildResult, UnresolvedRef } from './types.js';
 import { ladybugExecute } from './ladybugConnection.js';
 import { initLadybugSchema, clearProjectGraph } from './ladybugSchema.js';
 import { invalidateProjectNodeCount } from './projectNodeCounts.js';
@@ -71,7 +71,7 @@ function esc(val: string | undefined | null): string {
 // Pending edge type
 // ============================================
 
-interface PendingEdge {
+export interface PendingEdge {
   sourceId: string;
   targetName: string;
   edgeType: string;
@@ -89,7 +89,12 @@ interface PendingEdge {
 export class LadybugGraphBuilder {
   private projectId: number;
   private nodeByQualifiedName = new Map<string, string>();
+  // Qualified names of nodes created by THIS run (preloaded names excluded),
+  // so a top-level function is not skipped because another file has the qn.
+  private createdQns = new Set<string>();
   private pendingEdges: PendingEdge[] = [];
+  // References no node resolved (graph patch stores them in pending_refs).
+  private unresolvedEdges: PendingEdge[] = [];
   // Build-wide edge dedup (survives across queued + direct createEdge calls)
   private emittedEdgeKeys = new Set<string>();
   // Deferred write buffers — populated as nodes/edges are *registered* in the
@@ -113,13 +118,96 @@ export class LadybugGraphBuilder {
   }
 
   /**
+   * Seed the name index with nodes already in the store (graph patch,
+   * lazy-incremental-indexing.md 3.4 step 1), so references from the parsed
+   * files resolve against symbols of files outside this run. Call before
+   * planFiles; nodes of the parsed files override the preloaded entries.
+   */
+  preloadExistingNames(entries: Iterable<[qualifiedName: string, id: string]>): number {
+    let n = 0;
+    for (const [qn, id] of entries) {
+      if (!qn || !id) continue;
+      this.nodeByQualifiedName.set(qn, id);
+      n++;
+    }
+    return n;
+  }
+
+  /**
+   * Register nodes and resolve edges for the parsed files without writing
+   * anything (the graph patch writes the result itself). Same passes as
+   * buildFromFiles.
+   */
+  async planFiles(parsedFiles: ParsedFile[]): Promise<{
+    nodeRows: LadybugNodeInput[];
+    edgeRows: LadybugEdgeInput[];
+    unresolved: PendingEdge[];
+  }> {
+    await this.registerNodes(parsedFiles);
+    await this.createPendingEdges();
+    return { nodeRows: this.nodeRows, edgeRows: this.edgeRows, unresolved: this.unresolvedEdges };
+  }
+
+  /** Unresolved references as pending_refs rows (source file / key from the node rows). */
+  unresolvedRefRows(): UnresolvedRef[] {
+    const byId = new Map(this.nodeRows.map(n => [n.id, n]));
+    const out: UnresolvedRef[] = [];
+    for (const e of this.unresolvedEdges) {
+      const src = byId.get(e.sourceId);
+      if (!src) continue;
+      out.push({
+        sourceId: e.sourceId,
+        sourceFile: src.filePath,
+        sourceKey: src.symbolKey ?? '',
+        targetName: e.targetName,
+        edgeType: e.edgeType,
+        line: e.lineNumber ?? 0,
+        col: e.colNumber ?? 0,
+        confidence: e.confidence,
+        className: e.context?.className ?? '',
+      });
+    }
+    return out;
+  }
+
+  /** Resolve one name against the (preloaded + registered) index. */
+  resolveName(name: string, context?: { className?: string }): string | undefined {
+    return this.resolveReference(name, context);
+  }
+
+  /** First three passes of a build: type nodes, members, top-level functions. */
+  private async registerNodes(parsedFiles: ParsedFile[]): Promise<void> {
+    for (const file of parsedFiles) {
+      for (const typeDef of file.types) {
+        await this.createTypeNode(typeDef);
+      }
+    }
+    for (const file of parsedFiles) {
+      for (const typeDef of file.types) {
+        await this.createMemberNodes(typeDef);
+      }
+    }
+    // Top-level / module-scoped functions (no parent type). These dominate
+    // TypeScript / JavaScript / Python codebases, and were previously dropped
+    // from the graph because we only walked file.types.
+    for (const file of parsedFiles) {
+      if (!file.functions || file.functions.length === 0) continue;
+      for (const func of file.functions) {
+        // Skip if a same-qualifiedName node was already created as a member.
+        if (this.createdQns.has(func.qualifiedName)) continue;
+        await this.createFunctionNode(func, '');
+      }
+    }
+  }
+
+  /**
    * Build graph from multiple parsed files
    */
   async buildFromFiles(
     parsedFiles: ParsedFile[],
-    options: { clearProject?: boolean } = {},
+    options: { clearProject?: boolean; collectUnresolved?: boolean } = {},
   ): Promise<GraphBuildResult> {
-    const { clearProject = true } = options;
+    const { clearProject = true, collectUnresolved = false } = options;
     const startTime = Date.now();
     logger.info(`[LadybugDB] Building graph for project ${this.projectId} from ${parsedFiles.length} files (clearProject=${clearProject})`);
 
@@ -134,31 +222,9 @@ export class LadybugGraphBuilder {
         await clearProjectGraph(this.projectId);
       }
 
-      // First pass: create all type nodes
-      for (const file of parsedFiles) {
-        for (const typeDef of file.types) {
-          await this.createTypeNode(typeDef);
-        }
-      }
-
-      // Second pass: create member nodes + containment edges
-      for (const file of parsedFiles) {
-        for (const typeDef of file.types) {
-          await this.createMemberNodes(typeDef);
-        }
-      }
-
-      // Third pass: top-level / module-scoped functions (no parent type).
-      // These dominate TypeScript / JavaScript / Python codebases, and were
-      // previously dropped from the graph because we only walked file.types.
-      for (const file of parsedFiles) {
-        if (!file.functions || file.functions.length === 0) continue;
-        for (const func of file.functions) {
-          // Skip if a same-qualifiedName node was already created as a member.
-          if (this.nodeByQualifiedName.has(func.qualifiedName)) continue;
-          await this.createFunctionNode(func, '');
-        }
-      }
+      // Passes 1-3: type nodes, member nodes + containment edges, top-level
+      // functions (registered in memory; written below).
+      await this.registerNodes(parsedFiles);
 
       // Flush all collected node rows in batched UNWIND writes. Nodes must
       // land before edges so the per-edge MATCH can resolve both endpoints.
@@ -180,7 +246,8 @@ export class LadybugGraphBuilder {
         edgeCount: this.stats.edgesCreated,
         unresolvedCount: this.stats.unresolvedCount,
         durationMs: Date.now() - startTime,
-        errors: this.stats.errors
+        errors: this.stats.errors,
+        ...(collectUnresolved ? { unresolvedRefs: this.unresolvedRefRows() } : {}),
       };
 
       logger.info(
@@ -243,9 +310,12 @@ export class LadybugGraphBuilder {
       isOverride: false,
       isExported: false,
       language: langFromPath(typeDef.filePath),
+      symbolKey: typeDef.symbolKey,
+      bodySha: typeDef.bodySha,
     });
 
     this.nodeByQualifiedName.set(typeDef.qualifiedName, id);
+    this.createdQns.add(typeDef.qualifiedName);
 
     // Queue inheritance edges
     if (typeDef.extends) {
@@ -320,9 +390,12 @@ export class LadybugGraphBuilder {
       isOverride: func.isOverride ?? false,
       isExported: false,
       language: langFromPath(func.filePath),
+      symbolKey: func.symbolKey,
+      bodySha: func.bodySha,
     });
 
     this.nodeByQualifiedName.set(func.qualifiedName, id);
+    this.createdQns.add(func.qualifiedName);
 
     // Containment edge: type -> member. Skip for top-level/module-scoped
     // functions where there is no parent type (parentTypeId === '').
@@ -448,6 +521,7 @@ export class LadybugGraphBuilder {
       const targetId = this.resolveReference(edge.targetName, edge.context);
       if (!targetId) {
         this.stats.unresolvedCount++;
+        this.unresolvedEdges.push(edge);
         continue;
       }
       const key = `${edge.sourceId}|${targetId}|${edge.edgeType}|${edge.lineNumber ?? 0}`;
@@ -571,7 +645,7 @@ export class LadybugGraphBuilder {
 export async function buildLadybugGraph(
   projectId: number,
   parsedFiles: ParsedFile[],
-  options: { clearProject?: boolean } = {},
+  options: { clearProject?: boolean; collectUnresolved?: boolean } = {},
 ): Promise<GraphBuildResult> {
   const builder = new LadybugGraphBuilder(projectId);
   try {
@@ -615,6 +689,9 @@ export interface LadybugNodeInput {
   isOverride?: boolean | null;
   isExported?: boolean | null;
   language?: string | null;
+  /** Stable symbol key / body sha (3.8); only a re-keyed project sets them. */
+  symbolKey?: string | null;
+  bodySha?: string | null;
 }
 
 export interface LadybugEdgeInput {
@@ -633,10 +710,23 @@ export interface LadybugEdgeInput {
 // while still capturing >95% of the UNWIND speedup (see probe: 100 nodes in
 // 32ms via UNWIND vs 806ms via single CREATE — 25× improvement).
 const BATCH_UNWIND_SIZE = 200;
+/** Edge batches between WAL folds during a build (see createEdgesFromBatch). */
+const CHECKPOINT_EVERY = 25;
+
+export async function checkpointQuietly(projectId: number): Promise<void> {
+  try {
+    await ladybugExecute(projectId, 'CHECKPOINT;');
+  } catch (err) {
+    logger.warn(`[LadybugDB] project ${projectId}: CHECKPOINT during build failed: ${String(err).slice(0, 160)}`);
+  }
+}
 
 /** Render a row object as a Cypher map literal with the full CodeNode shape. */
-function renderNodeRow(n: LadybugNodeInput): string {
+function renderNodeRow(n: LadybugNodeInput, keyed = false): string {
   const language = n.language ?? langFromPath(n.filePath);
+  const keyProps = keyed
+    ? `,\n    symbol_key: '${esc(n.symbolKey ?? '')}',\n    body_sha: '${esc(n.bodySha ?? '')}'`
+    : '';
   return `{
     id: '${esc(n.id)}',
     project_id: ${n.projectId},
@@ -660,8 +750,23 @@ function renderNodeRow(n: LadybugNodeInput): string {
     is_virtual: ${n.isVirtual ?? false},
     is_override: ${n.isOverride ?? false},
     is_exported: ${n.isExported ?? false},
-    language: '${esc(language)}'
+    language: '${esc(language)}'${keyProps}
   }`;
+}
+
+/**
+ * Add the symbol_key / body_sha properties to CodeNode when missing (3.8).
+ * Additive (ALTER ... ADD with a default), never a drop; called only by a
+ * build that writes keyed nodes, i.e. the re-key rebuild and later builds of
+ * a re-keyed project. A legacy-id project never gets the columns.
+ */
+export async function ensureSymbolKeyColumns(projectId: number): Promise<void> {
+  const { ladybugQuery } = await import('./ladybugConnection.js');
+  const rows = await ladybugQuery<{ name: string }>(projectId, `CALL TABLE_INFO('CodeNode') RETURN name`);
+  const have = new Set(rows.map(r => r.name));
+  for (const col of ['symbol_key', 'body_sha']) {
+    if (!have.has(col)) await ladybugExecute(projectId, `ALTER TABLE CodeNode ADD ${col} STRING DEFAULT ''`);
+  }
 }
 
 /**
@@ -702,11 +807,14 @@ export async function createNodesFromBatch(
   }
 
   const toCreate = deduped.filter(n => !existingIds.has(n.id));
+  const keyed = toCreate.some(n => !!n.symbolKey);
+  if (keyed) await ensureSymbolKeyColumns(projectId);
+  const keyAssign = keyed ? `,\n          symbol_key: row.symbol_key,\n          body_sha: row.body_sha` : '';
 
   let created = 0;
   for (let i = 0; i < toCreate.length; i += BATCH_UNWIND_SIZE) {
     const batch = toCreate.slice(i, i + BATCH_UNWIND_SIZE);
-    const rowsCypher = batch.map(renderNodeRow).join(',\n    ');
+    const rowsCypher = batch.map(n => renderNodeRow(n, keyed)).join(',\n    ');
     try {
       await ladybugExecute(
         projectId,
@@ -736,7 +844,7 @@ export async function createNodesFromBatch(
           is_virtual: row.is_virtual,
           is_override: row.is_override,
           is_exported: row.is_exported,
-          language: row.language
+          language: row.language${keyAssign}
         })`
       );
       created += batch.length;
@@ -748,7 +856,7 @@ export async function createNodesFromBatch(
       if (msg.includes('duplicated primary key') || msg.includes('already exists')) {
         for (const n of batch) {
           try {
-            await ladybugExecute(projectId, `CREATE (n:CodeNode ${renderNodeRow(n)})`);
+            await ladybugExecute(projectId, `CREATE (n:CodeNode ${renderNodeRow(n, keyed)})`);
             created++;
           } catch { /* skip duplicates */ }
         }
@@ -805,7 +913,14 @@ export async function createEdgesFromBatch(
   // to it, so the rest of the batch still lands.
   let crossLangSupported = true;
   let created = 0;
+  // autoCheckpoint is off (projectGraphConnection.ts), so a large build keeps
+  // every node page dirty in the 24 MiB pool and the edge inserts that follow
+  // fail with "buffer pool is full" — SoundSuite (21.7k nodes) rebuilt with 0
+  // edges. Fold the WAL before the edges and every CHECKPOINT_EVERY batches.
+  await checkpointQuietly(projectId);
+  let retriedAfterCheckpoint = false;
   for (let i = 0; i < deduped.length; i += BATCH_UNWIND_SIZE) {
+    if (i > 0 && (i / BATCH_UNWIND_SIZE) % CHECKPOINT_EVERY === 0) await checkpointQuietly(projectId);
     const batch = deduped.slice(i, i + BATCH_UNWIND_SIZE);
     const rowsCypher = batch.map(e => renderEdgeRow(e, crossLangSupported)).join(',\n    ');
     const propsBlock = crossLangSupported
@@ -832,12 +947,20 @@ export async function createEdgesFromBatch(
         CREATE (a)-[:CodeEdge { ${propsBlock} }]->(b)`
       );
       created += batch.length;
+      retriedAfterCheckpoint = false;
     } catch (err) {
       const msg = String(err).toLowerCase();
       if (crossLangSupported && /cross_language|property.*not.*exist|unknown.*propert/.test(msg)) {
         logger.warn(`[LadybugDB] project ${projectId}: cross_language column missing — disabling for this run`);
         crossLangSupported = false;
         i -= BATCH_UNWIND_SIZE; // retry this batch without cross_language
+        continue;
+      }
+      // A full pool is not a bad row: fold the WAL and retry the batch once.
+      if (/buffer pool is full|unable to allocate memory/.test(msg) && !retriedAfterCheckpoint) {
+        retriedAfterCheckpoint = true;
+        await checkpointQuietly(projectId);
+        i -= BATCH_UNWIND_SIZE;
         continue;
       }
       // Fall back to per-row so bad rows don't poison the chunk.
@@ -854,6 +977,9 @@ export async function createEdgesFromBatch(
       }
     }
   }
+  // Leave the store folded: a 24 MB WAL left behind made later getCallers
+  // reads hit the same pool-full error.
+  await checkpointQuietly(projectId);
   return { created, skipped: deduped.length - created };
 }
 

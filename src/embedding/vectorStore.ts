@@ -352,6 +352,27 @@ export class VectorStore {
   }
 
   /**
+   * Delete the rows (all chunks) of these nodes in one project. The graph
+   * patch (src/indexing/graphPatch.ts) calls it for nodes whose text changed
+   * or that are gone, so the embed pass, which skips ids that have a vector,
+   * re-embeds exactly those. Returns the rows deleted.
+   */
+  async deleteNodeVectors(projectId: number, nodeIds: string[]): Promise<number> {
+    if (nodeIds.length === 0) return 0;
+    const table = await getLanceTable();
+    const { enqueueTableWrite } = await import('./vectorWriteQueue.js');
+    return enqueueTableWrite(table, async () => {
+      let deleted = 0;
+      for (let i = 0; i < nodeIds.length; i += 200) {
+        const where = `project_id = ${projectId} AND node_id IN (${nodeIds.slice(i, i + 200).map(id => `'${escSql(id)}'`).join(', ')})`;
+        const n = await table.countRows(where);
+        if (n > 0) { await table.delete(where); deleted += n; }
+      }
+      return deleted;
+    });
+  }
+
+  /**
    * Search for similar vectors using cosine similarity via LanceDB ANN
    */
   async search(

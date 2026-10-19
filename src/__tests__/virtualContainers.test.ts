@@ -24,7 +24,7 @@ function status(overrides: Partial<{ masters: unknown[] }> = {}) {
     hostname: '7a531233e3e0',
     masters: [
       {
-        serverUrl: 'http://100.114.170.238:3000',
+        serverUrl: 'http://localhost:3000',
         wsPort: 3002,
         virtualInference: {
           openrouter: 'configured',
@@ -36,7 +36,7 @@ function status(overrides: Partial<{ masters: unknown[] }> = {}) {
         ],
       },
       {
-        serverUrl: 'http://100.114.170.238:3848',
+        serverUrl: 'http://localhost:3848',
         wsPort: 3003,
         virtualInference: { openrouter: 'unset', modeByRole: {} },
         virtualContainers: [],
@@ -109,7 +109,7 @@ describe('master-slot ownership', () => {
   it('matches on an explicit serverUrl when given', () => {
     const m = parseOwnVirtualContainers(status(), SIDECAR, {
       wsPort: 9999,
-      masterServerUrl: 'http://100.114.170.238:3000',
+      masterServerUrl: 'http://localhost:3000',
     });
     expect(m.rows).toHaveLength(2);
   });

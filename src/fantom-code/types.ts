@@ -67,6 +67,10 @@ export interface FunctionCall {
 
 export interface FantomFunction {
   id: string;
+  /** Stable symbol key (symbolKey.ts), set for a re-keyed project. */
+  symbolKey?: string;
+  /** sha256 of the whitespace-normalized source span. */
+  bodySha?: string;
   projectId: number;
   name: string;
   qualifiedName: string;
@@ -100,6 +104,10 @@ export interface FantomFunction {
 
 export interface FantomTypeDef {
   id: string;
+  /** Stable symbol key (symbolKey.ts), set for a re-keyed project. */
+  symbolKey?: string;
+  /** sha256 of the whitespace-normalized source span. */
+  bodySha?: string;
   projectId: number;
   name: string;
   qualifiedName: string;

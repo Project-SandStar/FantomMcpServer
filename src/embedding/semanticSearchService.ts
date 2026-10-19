@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createLogger } from '../utils/index.js';
 import { selectEmbeddingProvider, isSidecarUsable, embedBatchFanout, type EmbeddingProvider } from './providers/embeddingProvider.js';
+import { getEmbedCache } from './embedCache.js';
 import { getHeavyJob } from './embedGate.js';
 import { getSidecar } from '../sidecars/registry.js';
 import { VectorStore, getVectorStore, type VectorSearchResult } from './vectorStore.js';
@@ -1137,7 +1138,9 @@ export class SemanticSearchService {
         if (useFanout) {
           // Speed-weighted split with per-chunk failover (shared helper; the
           // GPU host takes proportionally more of each batch than a Mac).
-          embeddings = await embedBatchFanout(fanout, texts, (p, n) => credit(p, n));
+          // embed_cache (3.5): only texts the cache does not hold reach a provider.
+          embeddings = (await getEmbedCache().embedThrough(desiredModel, texts,
+            miss => embedBatchFanout(fanout, miss, (p, n) => credit(p, n)))).vectors;
         } else {
           // Unreachable under "OpenRouter only": `useFanout` is
           // `fanout.length >= 1` there and the selector throws rather than
@@ -1151,8 +1154,12 @@ export class SemanticSearchService {
               + 'policy — refusing to embed rather than write local vectors into a cloud-built index.',
             );
           }
-          embeddings = await projectProvider.embedBatch(texts);
-          credit(projectProvider, texts.length);
+          const single = projectProvider;
+          embeddings = (await getEmbedCache().embedThrough(desiredModel, texts, async miss => {
+            const v = await single.embedBatch(miss);
+            credit(single, miss.length);
+            return v;
+          })).vectors;
         }
         const embedMs = Date.now() - embedStart;
         crashLine(`BATCH EMBED OK ${batchNo}/${totalBatches} ms=${embedMs}`);

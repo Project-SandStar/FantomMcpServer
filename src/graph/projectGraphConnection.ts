@@ -490,8 +490,15 @@ async function openProjectConnection(
     // during boot hydration. 24 MiB × 16 ≈ 384 MiB is the balance — small
     // enough to survive Jetsam, and transient pool-full errors now self-heal
     // via projectQuery's free-idle-and-retry. Override via FANTOM_GRAPH_DB_BUFFER_MIB.
+    // 24 MiB is too small for the big stores: SoundSuite (21.7k nodes, 20 MB
+    // file) wrote 0 of 48.6k edges at 24 and all of them at 96 (2026-10-17).
+    // Size the pool from the store file instead — 5 × its MiB, 24..128 — so
+    // the ~330 stores under 5 MB keep 24 and only the dozen large ones grow.
     const bufMiBEnv = Number(process.env.FANTOM_GRAPH_DB_BUFFER_MIB);
-    const PROJECT_DB_BUFFER_SIZE = (Number.isFinite(bufMiBEnv) && bufMiBEnv > 0 ? bufMiBEnv : 24) * 1024 * 1024;
+    let fileMiB = 0;
+    try { fileMiB = fs.statSync(dbPath).size / 1024 / 1024; } catch { /* new store */ }
+    const sizedMiB = Math.min(128, Math.max(24, Math.ceil(fileMiB * 5)));
+    const PROJECT_DB_BUFFER_SIZE = (Number.isFinite(bufMiBEnv) && bufMiBEnv > 0 ? bufMiBEnv : sizedMiB) * 1024 * 1024;
     // autoCheckpoint OFF. We CHECKPOINT ourselves on every close (below) and
     // at shutdown; the engine's own checkpoint fires INSIDE a running query
     // (`TransactionManager::checkpoint ← Transaction::getNextTuplesInternal`)
@@ -647,7 +654,7 @@ async function runSerialized<R>(
         logger.error(
           `[projectGraph] buffer-pool OOM on project ${projectId} even under ` +
             `serialization — a single query's working set exceeds the ` +
-            `${process.env.FANTOM_GRAPH_DB_BUFFER_MIB ?? 24} MiB pool.`,
+            `project pool (24..128 MiB by store size; FANTOM_GRAPH_DB_BUFFER_MIB overrides).`,
         );
       } else if (isIoError(err)) {
         markProjectDegraded(projectId, err);

@@ -4,6 +4,9 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { registerAxonRoutes } from './axonRoutes.js';
+import { registerIndexRunRoutes } from './indexRunRoutes.js';
+import { registerIndexingHookRoute, registerIndexingRoutes } from './indexingRoutes.js';
+import { registerWorkflowRoutes } from './workflowRoutes.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -344,6 +347,42 @@ function detectProjectLanguage(dirPath: string): { language: string; parserType:
 }
 
 /**
+ * Re-detect a project's language from its files and fix a stale row. A pod
+ * added with an unexpanded `~/…` path was detected against an empty tree and
+ * fell back to fantom/regex, which then stuck forever. On a change it also
+ * clears the project's file hashes, so the next (incremental) reindex
+ * re-parses every file with the new grammar. Returns true when it changed.
+ */
+async function syncProjectLanguage(
+  db: { updateProject: (id: number, input: { language?: string; parserType?: string }) => Promise<unknown> },
+  project: { id: number; name: string; path: string; language?: string | null; parserType?: string | null },
+): Promise<boolean> {
+  let detected: { language: string; parserType: string };
+  try {
+    const dir = normalizePath(project.path);
+    if (!fs.existsSync(dir)) return false;
+    detected = detectProjectLanguage(dir);
+  } catch {
+    return false;
+  }
+  const current = project.language || 'fantom';
+  if (detected.language === current) return false;
+  // An empty or unreadable tree detects as fantom; never downgrade a
+  // non-Fantom project on that.
+  if (detected.language === 'fantom' && current !== 'fantom') return false;
+  await db.updateProject(project.id, { language: detected.language, parserType: detected.parserType });
+  // Drop the file hashes so an incremental run re-parses every file with the
+  // new grammar — a forced run would need the heavy-job lock.
+  const { getPrismaClient } = await import('../db/prisma.js');
+  await getPrismaClient().indexedFile.deleteMany({ where: { projectId: project.id } });
+  console.log(
+    `[Admin] Project ${project.id} (${project.name}) language ${current}/${project.parserType ?? 'regex'} → ` +
+    `${detected.language}/${detected.parserType} (re-detected from files)`,
+  );
+  return true;
+}
+
+/**
  * Basic Auth middleware using UserStore
  * Authenticates users and attaches user info to the request
  */
@@ -430,8 +469,13 @@ export function createAdminRouter(context: AdminContext): Router {
   const router = Router();
   const userStore = getUserStore(context.configDir);
 
+  // POST /indexing/report authenticates by X-Fantom-Hook-Token, not Basic
+  // Auth: registered before the middleware, it always answers itself.
+  registerIndexingHookRoute(router);
+
   // Apply Basic Auth using UserStore to all admin routes
   router.use(basicAuthWithUserStore(userStore));
+  registerIndexingRoutes(router);
 
   // Pretty-print JSON for all admin routes
   router.use((_req: Request, res: Response, next: NextFunction) => {
@@ -547,6 +591,8 @@ export function createAdminRouter(context: AdminContext): Router {
           'PUT /admin/code-projects/:id': 'Update a code project',
           'DELETE /admin/code-projects/:id': 'Delete a code project',
           'POST /admin/code-projects/:id/reindex': 'Re-index a code project',
+          'GET /admin/code-projects/:id/index-runs/:runId/delete-preview': 'What deleting one index run would remove',
+          'DELETE /admin/code-projects/:id/index-runs/:runId': 'Delete one index run: history rows + its vectors (graph kept)',
           'GET /admin/code-projects/:id/languages': 'Detect languages in a code project',
           'GET /admin/code-projects/:id/dependencies': 'Project dependencies (dependsOn/dependents/declared/scope)',
           'POST /admin/code-projects/:id/dependencies': 'Add a manual dependency { toProjectId }',
@@ -2695,11 +2741,37 @@ export function createAdminRouter(context: AdminContext): Router {
           lastIndexed: p.lastIndexed ?? null,
         }));
 
+      // Language tags from the files actually indexed, most files first. One
+      // project can hold several (a TS server with a Vue UI).
+      const languagesByProject = new Map<number, string[]>();
+      try {
+        const { getPrismaClient } = await import('../db/prisma.js');
+        const rows = await getPrismaClient().indexedFile.findMany({ select: { projectId: true, filePath: true } });
+        const counts = new Map<number, Map<string, number>>();
+        for (const r of rows) {
+          const lang = EXTENSION_TO_LANGUAGE[path.extname(r.filePath).toLowerCase()];
+          if (!lang) continue;
+          let m = counts.get(r.projectId);
+          if (!m) counts.set(r.projectId, (m = new Map()));
+          m.set(lang, (m.get(lang) ?? 0) + 1);
+        }
+        for (const [id, m] of counts) {
+          languagesByProject.set(id, [...m.entries()].sort((a, b) => b[1] - a[1]).map(([l]) => l));
+        }
+      } catch {
+        // Tags are cosmetic; never fail the list on them.
+      }
+      const projectByPath = new Map(allProjects.map(p => [normalizePath(p.path), p]));
+      const podsWithLanguages = pods.map(pod => {
+        const proj = projectByPath.get(normalizePath(pod.path));
+        return { ...pod, languages: proj ? languagesByProject.get(proj.id) ?? [] : [] };
+      });
+
       res.json({
         count: pods.length,
-        pods,
+        pods: podsWithLanguages,
         compatibleWith,
-        projects: orphanProjects,
+        projects: orphanProjects.map(p => ({ ...p, languages: languagesByProject.get(p.id) ?? [] })),
         projectCount: orphanProjects.length,
       });
     } catch (error) {
@@ -2753,7 +2825,7 @@ export function createAdminRouter(context: AdminContext): Router {
 
       const pod = await db.createPod({
         name,
-        path: podPath,
+        path: normalizePath(podPath),
         buildFile,
         description,
         defaultInstanceId,
@@ -2789,7 +2861,7 @@ export function createAdminRouter(context: AdminContext): Router {
 
       const pod = await db.updatePod(id, {
         name,
-        path: podPath,
+        path: podPath ? normalizePath(podPath) : undefined,
         buildFile,
         description,
         defaultInstanceId,
@@ -3776,13 +3848,14 @@ export function createAdminRouter(context: AdminContext): Router {
       }
 
       const force = req.query.force === 'true' || req.body?.force === true;
+      await syncProjectLanguage(db, project);
       const result = await context.reindexProject(id, { force });
       invalidateProjectNodeCount(id); // graph node count may have changed
       res.json(result);
     } catch (error) {
       const { HeavyJobBusyError } = await import('../embedding/embedGate.js');
       if (error instanceof HeavyJobBusyError) {
-        res.status(409).json({ error: `Another heavy job is running: ${error.holder.kind} (${error.holder.label}) since ${error.holder.since}. Retry when it finishes.`, heavyJob: error.holder });
+        res.status(409).json({ error: error.humanMessage, heavyJob: error.holder });
         return;
       }
       console.error('[Admin] Failed to reindex code project:', error);
@@ -5031,6 +5104,7 @@ export function createAdminRouter(context: AdminContext): Router {
         // If project exists, reindex it
         if (existingProject) {
           if (context.reindexProject) {
+            await syncProjectLanguage(db, existingProject);
             const indexResult = await context.reindexProject(existingProject.id);
             res.json({
               success: true,
@@ -5065,6 +5139,7 @@ export function createAdminRouter(context: AdminContext): Router {
           if (isSourceProject) {
             existingProject = projects.find(p => p.id === id);
             if (existingProject && context.reindexProject) {
+              await syncProjectLanguage(db, existingProject);
               const indexResult = await context.reindexProject(existingProject.id);
               res.json({
                 success: true,
@@ -5105,6 +5180,7 @@ export function createAdminRouter(context: AdminContext): Router {
       const projectByName = projects.find(p => p.name === pod!.name);
       if (projectByName) {
         if (context.reindexProject) {
+          await syncProjectLanguage(db, projectByName);
           const indexResult = await context.reindexProject(projectByName.id);
           res.json({
             success: true,
@@ -5122,13 +5198,13 @@ export function createAdminRouter(context: AdminContext): Router {
         return;
       }
 
-      // Detect project language
-      const detected = detectProjectLanguage(pod.path);
+      // Detect project language (expand `~` first, or the scan sees no files)
+      const detected = detectProjectLanguage(normalizePath(pod.path));
 
       // Create new code project
       const project = await db.createProject({
         name: pod.name,
-        path: pod.path,
+        path: normalizePath(pod.path),
         podName: pod.name,
         instanceId: pod.defaultInstanceId || undefined,
         description: pod.description || `AST cache for ${pod.name}`,
@@ -9144,10 +9220,10 @@ export function createAdminRouter(context: AdminContext): Router {
     // index owns the sidecar fleet (2026-09-14: a build-missing job launched
     // beside the v3 shadow rebuild raced through 235 projects, each aborting).
     {
-      const { getHeavyJob } = await import('../embedding/embedGate.js');
+      const { getHeavyJob, heavyJobRefusal } = await import('../embedding/embedGate.js');
       const heavy = getHeavyJob();
       if (heavy) {
-        res.status(409).json({ error: `Another heavy job is running: ${heavy.kind} (${heavy.label}) since ${heavy.since}`, heavyJob: heavy });
+        res.status(409).json({ error: heavyJobRefusal(heavy), heavyJob: heavy });
         return;
       }
     }
@@ -9300,7 +9376,7 @@ export function createAdminRouter(context: AdminContext): Router {
       releaseHeavy = acquireHeavyJob('code-reembed', projectId === 0 || !Number.isFinite(projectId) ? 'full' : `project ${projectId}`);
     } catch (e) {
       if (e instanceof HeavyJobBusyError) {
-        res.status(409).json({ error: `Another heavy job is running: ${e.holder.kind} (${e.holder.label}) since ${e.holder.since}. Wait for it to finish.`, heavyJob: e.holder });
+        res.status(409).json({ error: e.humanMessage, heavyJob: e.holder });
         return;
       }
       throw e;
@@ -10358,10 +10434,10 @@ export function createAdminRouter(context: AdminContext): Router {
     // index owns the sidecar fleet (2026-09-14: a build-missing job launched
     // beside the v3 shadow rebuild raced through 235 projects, each aborting).
     {
-      const { getHeavyJob } = await import('../embedding/embedGate.js');
+      const { getHeavyJob, heavyJobRefusal } = await import('../embedding/embedGate.js');
       const heavy = getHeavyJob();
       if (heavy) {
-        res.status(409).json({ error: `Another heavy job is running: ${heavy.kind} (${heavy.label}) since ${heavy.since}`, heavyJob: heavy });
+        res.status(409).json({ error: heavyJobRefusal(heavy), heavyJob: heavy });
         return;
       }
     }
@@ -10418,7 +10494,8 @@ export function createAdminRouter(context: AdminContext): Router {
         heavy = getHeavyJob();
       }
       if (heavy) {
-        res.status(409).json({ error: `Another heavy job is running: ${heavy.kind} (${heavy.label}) since ${heavy.since}. Pass {force:true} to cancel it and resume.`, heavyJob: heavy });
+        const { heavyJobRefusal } = await import('../embedding/embedGate.js');
+        res.status(409).json({ error: `${heavyJobRefusal(heavy, 'Resume embed')} Pass {force:true} to cancel it and resume.`, heavyJob: heavy });
         return;
       }
     }
@@ -12624,6 +12701,12 @@ export function createAdminRouter(context: AdminContext): Router {
 
   // Axon MCP server integration: /admin/axon/* (src/admin/axonRoutes.ts)
   registerAxonRoutes(router);
+
+  // Delete one index run: /admin/code-projects/:id/index-runs/:runId (src/admin/indexRunRoutes.ts)
+  registerIndexRunRoutes(router);
+
+  // MCP workflow resources: /admin/workflows/* (src/admin/workflowRoutes.ts)
+  registerWorkflowRoutes(router, () => context.getWorkflowManager?.(), requireAdmin);
 
   return router;
 }

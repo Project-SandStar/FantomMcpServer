@@ -1421,6 +1421,12 @@ function AstDetailView({
           onChange={setAsOf}
           compareToCurrent={compareToCurrent}
           onCompareToggle={setCompareToCurrent}
+          onRunDeleted={(summary) => {
+            // The run is gone: drop the anchor and report what went.
+            setAsOf(null);
+            setError(null);
+            setSuccess(summary);
+          }}
         />
       ) : null}
 

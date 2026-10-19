@@ -518,7 +518,13 @@ export default function AxonPage() {
                 )}
                 {active.currentProject && <div className={T.dim}>→ {active.currentProject}</div>}
                 <div className={T.dim}>providers: {active.providers.join(', ') || '—'}</div>
-                <Bar pct={active.functionsTotal ? (active.functionsEmbedded / active.functionsTotal) * 100 : 0} />
+                <Bar pct={active.functionsTotal ? ((active.functionsEmbedded + (active.functionsSkipped ?? 0)) / active.functionsTotal) * 100 : 0} />
+                <div className={T.dim}>skipped {active.projectsSkipped ?? 0} projects / {active.functionsSkipped ?? 0} fns · embedded {active.functionsEmbedded} · deleted {active.functionsDeleted ?? 0} · errors {active.errors.length}</div>
+                {(active.projectStats ?? []).filter(p => p.status !== 'skipped').slice(-20).map(p => (
+                  <div key={p.projectId} className={p.status === 'error' ? T.warn : T.dim}>
+                    {p.projectId}: {p.status} · skipped {p.skipped} · embedded {p.embedded} · deleted {p.deleted} · errors {p.errors}
+                  </div>
+                ))}
               </div>
             )}
             {(jobs.data?.jobs ?? []).filter(j => j.id !== active?.id).slice(0, 12).map(j => (
