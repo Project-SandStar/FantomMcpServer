@@ -3,6 +3,22 @@
 All notable changes to FantomMcpServer. Public releases are snapshots; see
 `scripts/release-public.sh`.
 
+## 1.1.2 — 2026-10-19
+
+### Claude Code plugin
+- **Install from git.** `claudePlugin/dist` is committed and the repo root
+  has a marketplace, so the plugin installs straight from this repository.
+  It is also listed in the public Project Sandstar MCP marketplace
+  (`Project-SandStar/project-sandstar-mcp-marketplace`) with `axon-mcp`.
+- **Docs.** README: install steps. `docs/CLAUDE_PLUGIN.md`: setup, the
+  mcp-proxy, how users update and how maintainers ship a change.
+
+### Release
+- **Stricter audit.** `scripts/release-public.sh` checks the whole
+  overlay (CGNAT) address range and internal company hosts.
+- `scripts/diag-sidecar-host.sh`: read-only WS tunnel report for a sidecar
+  host; `MASTER` is required.
+
 ## 1.1.1 — 2026-10-18
 
 ### Claude Code plugin

@@ -66,6 +66,22 @@ npm run dev          # stdio, tsx watch
 
 For HTTP mode, point the client at `http://localhost:3847/mcp`.
 
+### Claude Code plugin
+
+For Claude Code, install the plugin instead of a manual MCP entry. It adds
+the MCP server, skills for every workflow, and hooks that keep the index live
+and tell the model which project it is in.
+
+```bash
+claude plugin marketplace add Project-SandStar/project-sandstar-mcp-marketplace
+claude plugin install fantom-mcp@project-sandstar-mcp
+claude plugin configure fantom-mcp@project-sandstar-mcp   # mcp_url, server_url, report_token
+```
+
+The same marketplace has `axon-mcp` for the Axon MCP server. Update with
+`claude plugin marketplace update project-sandstar-mcp`. Setup, the proxy,
+and troubleshooting: [`docs/CLAUDE_PLUGIN.md`](docs/CLAUDE_PLUGIN.md).
+
 ### Dashboard
 
 ```bash

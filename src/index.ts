@@ -327,7 +327,7 @@ class FantomMCPServer {
     this.server = new Server(
       {
         name: 'mcp-fantom',
-        version: '1.1.1',
+        version: '1.1.2',
       },
       {
         capabilities: {
@@ -1503,7 +1503,7 @@ class FantomMCPServer {
         };
       })(),
       initialized: this.initializationComplete,
-      version: '1.1.1',
+      version: '1.1.2',
       serverPath: path.resolve(dirname(fileURLToPath(import.meta.url)), 'index.js'),
       port: getServerPort(),
       stats: {
@@ -2796,7 +2796,7 @@ class FantomMCPServer {
 
           // Create a NEW Server instance for this session
           const sessionServer = new Server(
-            { name: 'mcp-fantom', version: '1.1.1' },
+            { name: 'mcp-fantom', version: '1.1.2' },
             { capabilities: { tools: {}, resources: {} } }
           );
 
