@@ -12,6 +12,7 @@ import { createHash } from 'crypto';
 import * as fsp from 'fs/promises';
 import { createLogger } from '../utils/index.js';
 import { FantomCodeIndexer, getFantomCodeIndexer } from './indexer.js';
+import { getFantomFunctionSearchIndex } from './searchIndex.js';
 import { FantomFileScanner } from './scanner.js';
 import { FantomCodeParser } from './codeParser.js';
 import { buildLadybugGraph } from '../graph/ladybugGraphBuilder.js';
@@ -163,6 +164,36 @@ export class CodeIndexingService {
    * FlexSearch (which rebuilds from the indexer) doesn't lose visibility
    * of symbols just because no files changed since the last process boot.
    */
+  /**
+   * Whole-project symbol totals from the graph. An incremental run parses only
+   * the changed files, so its own counters are partial (a 9,234-symbol project
+   * was stored as 20 functions / 4 types). The graph holds every file after
+   * the patch, so count there. Falls back to the run counters on error or an
+   * empty graph.
+   */
+  private async projectSymbolTotals(
+    projectId: number,
+    fallback: { functionCount: number; typeCount: number },
+  ): Promise<{ functionCount: number; typeCount: number }> {
+    try {
+      const rows = await ladybugQuery<{ nt: string; c: number }>(projectId,
+        `MATCH (n:CodeNode {project_id: ${projectId}}) RETURN n.node_type AS nt, count(n) AS c`,
+      );
+      let functionCount = 0;
+      let typeCount = 0;
+      for (const r of rows) {
+        const c = Number(r.c) || 0;
+        if (['class', 'mixin', 'enum', 'facet', 'type'].includes(r.nt)) typeCount += c;
+        else if (r.nt !== 'parameter') functionCount += c;
+      }
+      if (functionCount + typeCount === 0) return fallback;
+      return { functionCount, typeCount };
+    } catch (err) {
+      logger.warn(`projectSymbolTotals(${projectId}) failed: ${err instanceof Error ? err.message : String(err)}`);
+      return fallback;
+    }
+  }
+
   async hydrateIndexerFromLadybug(project: ExtendedProject): Promise<number> {
     const rows = await ladybugQuery<{
       id: string; name: string; qn: string; nt: string; fp: string;
@@ -709,7 +740,15 @@ export class CodeIndexingService {
     const symbolsPerFile = new Map<string, number>();
     let seedSymbolsTotal = 0;
 
+    // Give the event loop a turn every few files, so HTTP (dashboard,
+    // login, /health) is not starved while a big project parses.
+    const PARSE_YIELD_EVERY = Math.max(1, Number(process.env.FANTOM_PARSE_YIELD_EVERY ?? '8') || 8);
+    let sinceYield = 0;
     for (const filePath of files) {
+      if (++sinceYield >= PARSE_YIELD_EVERY) {
+        sinceYield = 0;
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
       const sizeBytes = (() => {
         try { return parseFs?.statSync(filePath).size ?? 0; } catch { return 0; }
       })();
@@ -893,10 +932,15 @@ export class CodeIndexingService {
       }
     }
 
-    // Update project in database
-    await this.updateProjectStats(project.id, {
+    // Update project in database. Totals come from the graph: on an
+    // incremental run functionsIndexed/typesIndexed cover only parsed files.
+    const totals = await this.projectSymbolTotals(project.id, {
       functionCount: functionsIndexed,
       typeCount: typesIndexed,
+    });
+    await this.updateProjectStats(project.id, {
+      functionCount: totals.functionCount,
+      typeCount: totals.typeCount,
       lastIndexed: new Date(),
       podMeta
     });
@@ -1001,7 +1045,8 @@ export class CodeIndexingService {
           mtimeMs: BigInt(s.mtimeMs),
           contentSha: s.sha,
           byteSize: s.size,
-          symbolCount: symbolsPerFile.get(s.path) ?? 0,
+          // Files this run did not parse keep their earlier count.
+          symbolCount: symbolsPerFile.get(s.path) ?? indexedMap.get(s.path)?.symbolCount ?? 0,
           indexVersion: s.version,
           keyBase: s.keyBase,
           indexedAt: new Date(),
@@ -1051,7 +1096,7 @@ export class CodeIndexingService {
       try {
         await this.prisma.fantomProject.update({
           where: { id: project.id },
-          data: { functionCount: functionsIndexed, typeCount: typesIndexed },
+          data: { functionCount: totals.functionCount, typeCount: totals.typeCount },
         });
       } catch (err) {
         logger.warn(`Failed to update fantomProject counts for ${project.name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -1654,6 +1699,23 @@ export class CodeIndexingService {
       edgeCount: result.edgeCount,
     });
     logger.info(`[LadybugDB] rebuildGraph: ${result.nodeCount} nodes, ${result.edgeCount} edges`);
+    if (result.success && result.nodeCount > 0) {
+      const totals = await this.projectSymbolTotals(projectId, { functionCount: 0, typeCount: 0 });
+      if (totals.functionCount + totals.typeCount > 0) {
+        await this.prisma.fantomProject.update({
+          where: { id: projectId },
+          data: { functionCount: totals.functionCount, typeCount: totals.typeCount },
+        }).catch(err => logger.warn(`rebuildGraph count update failed: ${String(err)}`));
+      }
+      // Name search reads the in-memory indexer, which still held the old
+      // symbols (new and renamed ones were missing). Reload it from the graph.
+      try {
+        await this.hydrateIndexerFromLadybug(project as unknown as ExtendedProject);
+        getFantomFunctionSearchIndex().rebuild(this.indexer);
+      } catch (err) {
+        logger.warn(`rebuildGraph search refresh failed for project ${projectId}: ${String(err)}`);
+      }
+    }
     return result;
   }
 

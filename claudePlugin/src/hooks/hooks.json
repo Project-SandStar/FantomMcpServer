@@ -1,5 +1,5 @@
 {
-  "description": "Fantom MCP hooks: SessionStart project context, PostToolUse edit reports, UserPromptSubmit tool hints. Every hook fails open: a server that is down never blocks an edit or a prompt.",
+  "description": "Fantom MCP hooks: SessionStart project context, PreToolUse search tip (grep/rg/find in a registered project), PostToolUse edit reports, UserPromptSubmit tool hints. Every hook fails open: a server that is down never blocks an edit, a search or a prompt.",
   "hooks": {
     "SessionStart": [
       {
@@ -32,6 +32,28 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/prompt-hint.mjs\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Grep|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/search-hint.mjs\"",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*fantom.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/search-hint.mjs\"",
             "timeout": 3
           }
         ]

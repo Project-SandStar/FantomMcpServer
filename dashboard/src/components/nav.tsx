@@ -161,9 +161,33 @@ const navItems = [
   { href: '/users', label: 'Users', icon: ShieldIcon },
   { href: '/sessions', label: 'OAuth Sessions', icon: KeyIcon },
   { href: '/backups', label: 'Backups', icon: HardDriveIcon },
+  { href: '/sidecar-sync', label: 'fileSystem sidecar sync', icon: ServerIcon },
 ];
 
 const bottomNavItem = { href: '/documentation', label: 'Documentation', icon: AcademicCapIcon };
+
+type NavItem = { href: string; label: string; icon: typeof HomeIcon };
+
+function NavLink({ item, pathname }: { item: NavItem; pathname: string | null }) {
+  const isActive = pathname === item.href ||
+    (item.href !== '/' && !!pathname?.startsWith(item.href));
+  const Icon = item.icon;
+  return (
+    <li>
+      <Link
+        href={item.href}
+        className={`flex items-center gap-3 px-4 py-2.5 rounded-lg transition-colors ${
+          isActive
+            ? 'bg-blue-600 text-white'
+            : 'text-gray-300 hover:bg-gray-800 hover:text-white'
+        }`}
+      >
+        <Icon />
+        <span>{item.label}</span>
+      </Link>
+    </li>
+  );
+}
 
 export function Nav() {
   const pathname = usePathname();
@@ -181,28 +205,11 @@ export function Nav() {
         <InstanceSelector compact />
       </div>
 
-      <ul className="space-y-1 flex-1">
-        {navItems.map((item) => {
-          const isActive = pathname === item.href ||
-            (item.href !== '/' && pathname?.startsWith(item.href));
-          const Icon = item.icon;
-          return (
-            <li key={item.href}>
-              <Link
-                href={item.href}
-                className={`flex items-center gap-3 px-4 py-2.5 rounded-lg transition-colors ${
-                  isActive
-                    ? 'bg-blue-600 text-white'
-                    : 'text-gray-300 hover:bg-gray-800 hover:text-white'
-                }`}
-              >
-                <Icon />
-                <span>{item.label}</span>
-              </Link>
-            </li>
-          );
-        })}
-      </ul>
+      <div className="flex-1">
+        <ul className="space-y-1">
+          {navItems.map((item) => <NavLink key={item.href} item={item} pathname={pathname} />)}
+        </ul>
+      </div>
 
       {/* Bottom Navigation - Documentation */}
       <div className="mt-auto pt-4 border-t border-gray-700">

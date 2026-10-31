@@ -42,7 +42,7 @@ before(async () => {
       const hit = PROJECTS.find(p => cwd === p.path || cwd.startsWith(p.path + '/')) || null;
       const project = hit ? {
         ...hit, parserType: 'regex', versionGroup: { key: 'haxall/4.0.6', label: 'Haxall 4.0.6' }, lazy: true, autoIndex: true,
-        indexMode: 'scan', functionCount: 12, typeCount: 3, lastIndexed: ISO,
+        indexMode: 'scan', functionCount: 12, typeCount: 3, symbolCount: 9234, fileCount: 512, lastIndexed: ISO,
         lastRun: { id: 1, trigger: 'report', startedAt: ISO, finishedAt: ISO, filesParsed: 1, changeSource: 'report', error: null },
         focusFiles: 2,
       } : null;
@@ -113,6 +113,9 @@ test('session-start: registered project gets context, caches projects and sessio
   assert.match(ctx, /2 files in focus/);
   assert.match(ctx, /ToolSearch\("fantom", 30\)/);
   assert.match(ctx, /versionGroup "haxall\/4\.0\.6"/);
+  assert.match(ctx, /9,234 symbols in 512 files/);
+  assert.match(ctx, /BEFORE Grep/);
+  assert.match(ctx, /subagent/);
   const pj = JSON.parse(fs.readFileSync(path.join(data, 'projects.json'), 'utf8'));
   assert.equal(pj.projects.length, 2);
   const sj = JSON.parse(fs.readFileSync(path.join(data, 'session-s1.json'), 'utf8'));
@@ -220,6 +223,33 @@ test('doctor: server down exits 1 with a start hint', async () => {
   assert.equal(r.code, 1, r.out + r.err);
   assert.match(r.out, /✖ server: .*not reachable/);
   assert.match(r.out, /npm run start:dev/);
+});
+
+test('search-hint: tip on first grep in a known session, then throttled', async () => {
+  const hook = path.join(HOOKS, 'search-hint.mjs');
+  const a = await run(hook, { input: { session_id: 's1', hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'cd src && rg -n ConnTuning' } } });
+  assert.equal(a.code, 0, a.err);
+  const ctx = ctxOf(a.out, 'PreToolUse');
+  assert.match(ctx, /projectId 7/);
+  assert.match(ctx, /askCodebase/);
+  const b = await run(hook, { input: { session_id: 's1', hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'x' } } });
+  assert.equal(b.out.trim(), '', 'second search within the gap is silent');
+});
+
+test('search-hint: silent for non-search commands, unknown sessions, and after a Fantom tool call', async () => {
+  const hook = path.join(HOOKS, 'search-hint.mjs');
+  for (const input of [
+    { session_id: 'h1', tool_name: 'Bash', tool_input: { command: 'git status' } },
+    { session_id: 'nope', tool_name: 'Grep', tool_input: { pattern: 'x' } },
+  ]) {
+    const r = await run(hook, { input });
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out.trim(), '', JSON.stringify(input));
+  }
+  fs.writeFileSync(path.join(data, 'session-h2.json'), JSON.stringify({ project: { id: 7, name: 'demo' } }));
+  await run(hook, { input: { session_id: 'h2', hook_event_name: 'PostToolUse', tool_name: 'mcp__plugin_fantom-mcp_fantom__askCodebase', tool_input: {} } });
+  const r = await run(hook, { input: { session_id: 'h2', tool_name: 'Grep', tool_input: { pattern: 'x' } } });
+  assert.equal(r.out.trim(), '');
 });
 
 test('build output: manifest, skills and hooks are consistent', () => {

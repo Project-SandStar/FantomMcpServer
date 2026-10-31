@@ -3,8 +3,8 @@
 # calling app. On macOS 15 the Local Network permission is decided by the
 # *responsible app* of the process; a server started from IntelliJ's terminal
 # (or any unsigned launcher) inherits that app's denial and every fetch to the
-# LAN (192.168.88.x — the Mac sidecars) fails with EHOSTUNREACH, while
-# NetBird (100.x) and the 10.10.20.x subnet route keep working. A launchd job has no
+# LAN (the Mac sidecars) fails with EHOSTUNREACH, while NetBird (100.x)
+# and the routed office subnet keep working. A launchd job has no
 # app ancestor, and measured 2026-09-29 it reaches the LAN.
 #
 #   bash scripts/start-dev-launchd.sh        # start (idempotent); FANTOM_GRAPH_MAX_OPEN defaults to 16 here

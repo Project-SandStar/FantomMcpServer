@@ -21,6 +21,7 @@ import {
   type AxonParam, type AxonEmbeddingChunk,
 } from './axonEmbeddingText.js';
 import { extractAxonCallNames } from './axonTreeSitter.js';
+import { resolveAxonProjDir } from './axonSettings.js';
 
 export type AxonRecordSource = 'proj' | 'library';
 
@@ -474,6 +475,8 @@ export function validateAxonProjectPath(projectPath: string): {
   packageJson: boolean;
   serverEntry: boolean;
   projDir: string;
+  /** Which folder rule matched: `<path>/proj` or the path is proj/ itself. */
+  layout: 'contains-proj' | 'is-proj' | 'none';
   projExists: boolean;
   instances: string[];
   projects: Array<{ projectId: string; instance: string; project: string; functionCount: number; lastSync?: string }>;
@@ -484,11 +487,10 @@ export function validateAxonProjectPath(projectPath: string): {
   const exists = fs.existsSync(projectPath) && fs.statSync(projectPath).isDirectory();
   const packageJson = exists && fs.existsSync(path.join(projectPath, 'package.json'));
   const serverEntry = exists && fs.existsSync(path.join(projectPath, 'dist', 'index.js'));
-  const projDir = path.join(projectPath, 'proj');
+  const { projDir, layout } = resolveAxonProjDir(projectPath);
   const scan = scanAxonProj(projDir);
   if (!exists) problems.push('Path does not exist or is not a directory');
-  if (exists && !packageJson) problems.push('No package.json — is this the axon-mcp-server checkout?');
-  if (exists && !serverEntry) problems.push('dist/index.js missing — run `npm run build` in the Axon server first');
+  // A synced proj/ folder (Docker mount) has no server checkout: that is fine.
   if (exists && !scan.exists) problems.push('proj/ folder missing — no synced SkySpark projects to index');
   if (scan.exists && scan.projects.length === 0) problems.push('proj/ contains no <instance>/<project>/func folders');
   return {
@@ -497,6 +499,7 @@ export function validateAxonProjectPath(projectPath: string): {
     packageJson,
     serverEntry,
     projDir,
+    layout,
     projExists: scan.exists,
     instances: scan.instances,
     projects: scan.projects.map(p => ({

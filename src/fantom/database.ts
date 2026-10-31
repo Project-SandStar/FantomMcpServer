@@ -5,6 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getCachePath } from '../utils/installRoot.js';
+import { mapPath } from '../utils/pathMapping.js';
 import { getPrismaClient, type Instance, type Pod, type CompileLog as PrismaCompileLog, type FantomProject, type DocIndex, type FantomBuild as PrismaFantomBuild } from '../db/index.js';
 import type {
   FantomInstance,
@@ -1001,7 +1002,7 @@ export class FantomDatabase {
    * Get the Fantom source folder setting
    */
   async getFantomSourceFolder(): Promise<string | null> {
-    return this.getSetting('fantom_source_folder');
+    return mapPath(await this.getSetting('fantom_source_folder')) ?? null;
   }
 
   /**
@@ -1057,14 +1058,14 @@ export class FantomDatabase {
     return {
       id: instance.id,
       name: instance.name,
-      path: instance.path,
+      path: mapPath(instance.path),
       type: instance.type as FantomInstance['type'],
       version: instance.version || undefined,
       fanExecutable: instance.fanExecutable || 'bin/fan',
       description: instance.description || undefined,
-      sourcePath: instance.sourcePath || undefined,
+      sourcePath: mapPath(instance.sourcePath) || undefined,
       fantomVersion: instance.fantomVersion || undefined,
-      fantomSourcePath: instance.fantomSourcePath || undefined,
+      fantomSourcePath: mapPath(instance.fantomSourcePath) || undefined,
       docSourceInstanceId: instance.docSourceInstanceId || undefined,
       isValid: instance.isValid,
       createdAt: instance.createdAt.toISOString(),
@@ -1089,7 +1090,7 @@ export class FantomDatabase {
     return {
       id: pod.id,
       name: pod.name,
-      path: pod.path,
+      path: mapPath(pod.path),
       buildFile: pod.buildFile,
       description: pod.description || undefined,
       defaultInstanceId: pod.defaultInstanceId || undefined,
@@ -1126,7 +1127,7 @@ export class FantomDatabase {
     return {
       id: project.id,
       name: project.name,
-      path: project.path,
+      path: mapPath(project.path),
       instanceId: project.instanceId || undefined,
       buildId: project.buildId || undefined,
       podName: project.podName || undefined,
@@ -1386,7 +1387,7 @@ export class FantomDatabase {
     return {
       id: build.id,
       version: build.version,
-      path: build.path,
+      path: mapPath(build.path),
       hasSource: build.hasSource,
       podCount: build.podCount,
       functionCount: build.functionCount,

@@ -151,7 +151,8 @@ export async function getIndexHealth(
   const prismaTotal = project.functionCount + project.typeCount;
   const missingFromGraph = Math.max(0, prismaTotal - ladybugNodeCount);
   const missingFromVectors = Math.max(0, ladybugNodeCount - vectorCount);
-  const missingFromSearch = Math.max(0, prismaTotal - flexSymbols);
+  // flexSymbols counts functions only (indexer byProject); types are kept apart.
+  const missingFromSearch = Math.max(0, project.functionCount - flexSymbols);
 
   // ---------- Top missing examples ----------
   const topMissingExamples: Array<{ qualifiedName: string; missingFrom: string[] }> = [];

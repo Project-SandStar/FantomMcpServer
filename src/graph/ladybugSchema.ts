@@ -149,8 +149,11 @@ export async function clearProjectGraph(projectId: number): Promise<{
     throw err;
   }
 
-  // Per-project DB: scoped delete is just MATCH (n:CodeNode), no project_id
-  // filter needed. Edges first (Kuzu rel-table FK rule).
+  // Do NOT delete and recreate the store file here. Tried 2026-10-26: the
+  // old native DB can finish closing after the new one opens at the same path
+  // and remove the new WAL by name, so a "successful" rebuild of project 375
+  // left a 4 KB file and the graph was gone after the next restart.
+  // Edges first (Kuzu rel-table FK rule).
   await ladybugExecute(projectId, `MATCH (n:CodeNode)-[e:CodeEdge]->() DELETE e`);
   await ladybugExecute(projectId, `MATCH ()-[e:CodeEdge]->(n:CodeNode) DELETE e`);
   await ladybugExecute(projectId, `MATCH (n:CodeNode) DELETE n`);

@@ -17,7 +17,8 @@
  */
 
 import type { Router, Request, Response } from 'express';
-import { getAxonSettings, resolveAxonEmbeddingModel } from '../axon/axonSettings.js';
+import { getAxonSettingsWithSources, resolveAxonEmbeddingModel, axonPathWarnings } from '../axon/axonSettings.js';
+import { gitlabView, saveGitlabSettings, clearLocalLibraryPathIfGitlab, testGitlab, pullGitlabLibrary, scheduleGitlabRefresh } from '../axon/axonGitlab.js';
 import { axonGrammarStatus, initAxonGrammar } from '../axon/axonTreeSitter.js';
 import { validateAxonProjectPath, buildAxonEmbeddingChunksFor } from '../axon/axonProjParser.js';
 import { validateAxonLibraryPath, scanAllAxonProjects, parseAnyAxonProject } from '../axon/axonLibraryParser.js';
@@ -34,12 +35,53 @@ import { registerHeavyJobRoutes } from './heavyJobRoutes.js';
 function errMsg(e: unknown): string { return e instanceof Error ? e.message : String(e); }
 
 export function registerAxonRoutes(router: Router): void {
+  const adminOnly = (req: Request, res: Response): boolean => {
+    const u = (req as any).user;
+    if (res.locals.apiTokenOk || u?.role === 'admin') return true;
+    res.status(u ? 403 : 401).json({ error: u ? 'Admin access required' : 'Authentication required' });
+    return false;
+  };
+  const onLibraryChanged = (): void => {
+    try { startAxonIndex({ source: 'library' }); } catch (e) { console.warn(`[axon] library changed; index not started: ${errMsg(e)}`); }
+  };
+
+  // GitLab library source. The token is never returned (hasToken + tokenLast4).
+  router.get('/axon/gitlab', (_req: Request, res: Response): void => {
+    res.json(gitlabView());
+  });
+  router.put('/axon/gitlab', (req: Request, res: Response): void => {
+    if (!adminOnly(req, res)) return;
+    try {
+      saveGitlabSettings(req.body ?? {});
+      scheduleGitlabRefresh(onLibraryChanged, (m) => console.log(`[axon] ${m}`));
+      res.json(gitlabView());
+    } catch (e) {
+      res.status(400).json({ error: errMsg(e) });
+    }
+  });
+  router.post('/axon/gitlab/test', async (req: Request, res: Response): Promise<void> => {
+    if (!adminOnly(req, res)) return;
+    res.json(await testGitlab());
+  });
+  router.post('/axon/gitlab/pull', async (req: Request, res: Response): Promise<void> => {
+    if (!adminOnly(req, res)) return;
+    try {
+      const r = await pullGitlabLibrary({ onChanged: onLibraryChanged });
+      res.json({ success: true, ...r, gitlab: gitlabView() });
+    } catch (e) {
+      res.status(502).json({ success: false, error: errMsg(e), gitlab: gitlabView() });
+    }
+  });
+  scheduleGitlabRefresh(onLibraryChanged, (m) => console.log(`[axon] ${m}`));
+  // Boot: GitLab clone in use → drop a stale saved local library folder.
+  if (clearLocalLibraryPathIfGitlab()) console.log('[axon] GitLab library in use: cleared the saved local axon.libraryPath');
+
   // /admin/heavy-job (3.12 item 6) is registered here to keep routes.ts untouched.
   registerHeavyJobRoutes(router);
 
   router.get('/axon/status', async (_req: Request, res: Response): Promise<void> => {
     try {
-      const settings = getAxonSettings();
+      const { settings, sources } = getAxonSettingsWithSources();
       // Warm it here too: the preview routes (`sample-text`, `functions`) are
       // sync, and a cold grammar would show them line-window chunks while the
       // indexer produced statement chunks.
@@ -53,6 +95,9 @@ export function registerAxonRoutes(router: Router): void {
       const status = await getAxonProjectsStatus();
       res.json({
         settings,
+        sources,
+        pathWarnings: axonPathWarnings(settings, sources),
+        gitlab: gitlabView(),
         mcp: client.getStatus(),
         embedding: {
           ...resolveAxonEmbeddingModel(),
@@ -74,8 +119,12 @@ export function registerAxonRoutes(router: Router): void {
 
   router.get('/axon/validate', (req: Request, res: Response): void => {
     const kind = req.query.kind === 'library' ? 'library' : 'proj';
-    const fallback = kind === 'library' ? getAxonSettings().libraryPath : getAxonSettings().projectPath;
-    const p = typeof req.query.path === 'string' && req.query.path.trim() ? req.query.path.trim() : fallback;
+    const { settings: cur, sources: curSrc } = getAxonSettingsWithSources();
+    const fallback = kind === 'library' ? cur.libraryPath : cur.projectPath;
+    // GitLab clone in use: always check the clone, never a local folder.
+    const p = kind === 'library' && curSrc.libraryPath === 'gitlab'
+      ? cur.libraryPath
+      : typeof req.query.path === 'string' && req.query.path.trim() ? req.query.path.trim() : fallback;
     try {
       res.json(kind === 'library' ? { kind, ...validateAxonLibraryPath(p) } : { kind, ...validateAxonProjectPath(p) });
     } catch (e) {

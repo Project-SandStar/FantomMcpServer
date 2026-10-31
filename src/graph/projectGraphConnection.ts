@@ -92,6 +92,10 @@ function getMaxOpen(): number {
 
 function isIoError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
+  // A CHECKPOINT with no WAL on disk fails with "Error renaming file <id>.db.wal".
+  // Nothing is damaged, so this must not mark the project degraded: on a new
+  // store (2026-10-26, project 375) it blocked every edge write of a rebuild.
+  if (/Error renaming file .*\.wal\b/i.test(msg)) return false;
   return /IO exception|Cannot read from file|Could not set lock|Corrupted wal/i.test(
     msg,
   );
@@ -262,6 +266,13 @@ export function preflightAllProjectGraphStores(): { checked: number; quarantined
  * auto-embed pipeline consumes this to self-heal (rebuild then embed).
  */
 const projectsNeedingGraphRebuild = new Set<number>();
+
+/**
+ * Size of a project's store just before a reset deleted it. The buffer pool is
+ * sized from the store file, so a fresh (empty) file would get the 24 MiB
+ * minimum and the rebuild that refills it would run out of pool.
+ */
+const resetSizeHintMiB = new Map<number, number>();
 export function projectNeedsGraphRebuild(projectId: number): boolean {
   return projectsNeedingGraphRebuild.has(projectId);
 }
@@ -497,6 +508,7 @@ async function openProjectConnection(
     const bufMiBEnv = Number(process.env.FANTOM_GRAPH_DB_BUFFER_MIB);
     let fileMiB = 0;
     try { fileMiB = fs.statSync(dbPath).size / 1024 / 1024; } catch { /* new store */ }
+    fileMiB = Math.max(fileMiB, resetSizeHintMiB.get(projectId) ?? 0);
     const sizedMiB = Math.min(128, Math.max(24, Math.ceil(fileMiB * 5)));
     const PROJECT_DB_BUFFER_SIZE = (Number.isFinite(bufMiBEnv) && bufMiBEnv > 0 ? bufMiBEnv : sizedMiB) * 1024 * 1024;
     // autoCheckpoint OFF. We CHECKPOINT ourselves on every close (below) and
@@ -862,12 +874,46 @@ export async function closeAllProjectConnections(): Promise<void> {
  * full-reindex flows. Closes the connection first, then `rm -rf`s the
  * Kuzu directory + pidfile.
  */
-export async function resetProjectGraphDatabase(projectId: number): Promise<void> {
+/**
+ * Tell the next open how big this store will get. A store that was cleared
+ * (or quarantined) is a tiny file, so the pool would be sized at 24 MiB and a
+ * full rebuild of a big project fails with "buffer pool is full". The boot
+ * drain passes the expected size from Prisma's symbol counts (~1 KiB/node).
+ */
+export function hintProjectGraphSizeMiB(projectId: number, mib: number): void {
+  if (!Number.isFinite(mib) || mib <= 0) return;
+  resetSizeHintMiB.set(projectId, Math.max(mib, resetSizeHintMiB.get(projectId) ?? 0));
+}
+
+export async function resetProjectGraphDatabase(projectId: number): Promise<boolean> {
+  await pendingOpen(projectId);
   await closeProjectConnection(projectId);
+  // closeProjectConnection leaves the DB open when a query is still running.
+  // Deleting the files under an open DB is the native-crash class, so refuse.
+  if (entries.has(projectId)) {
+    logger.warn(`Project ${projectId}: graph DB still busy — not removing its files`);
+    return false;
+  }
+  const dbPath = getProjectDbPath(projectId);
+  try {
+    const mib = fs.statSync(dbPath).size / 1024 / 1024;
+    resetSizeHintMiB.set(projectId, Math.max(mib, resetSizeHintMiB.get(projectId) ?? 0));
+  } catch { /* no store yet */ }
   // Remove the DB AND all Kuzu sidecars (.wal/.shadow/.tmp/.pid) — leaving a
   // stale .wal behind would make the next open fail to recover.
   purgeProjectDbFiles(projectId);
-  logger.info(`Project ${projectId} graph DB + sidecars removed (${getProjectDbPath(projectId)})`);
+  logger.info(`Project ${projectId} graph DB + sidecars removed (${dbPath})`);
+  return true;
+}
+
+async function pendingOpen(projectId: number): Promise<void> {
+  const p = opening.get(projectId);
+  if (p) { try { await p; } catch { /* open failed: nothing to close */ } }
+}
+
+/** True when the project's store has a WAL to fold (CHECKPOINT fails without one). */
+export function projectHasWal(projectId: number): boolean {
+  return fs.existsSync(`${getProjectDbPath(projectId)}.wal`);
 }
 
 /** Snapshot for /admin/graph/connection-pool — surfaces LRU state. */

@@ -7,6 +7,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
+import AdmZip from 'adm-zip';
 import { createLogger } from '../../utils/index.js';
 import type { ScanResult, PodInfo } from './types.js';
 
@@ -63,7 +65,56 @@ export function getDocPath(instancePath: string, instanceType: string): string |
     }
   }
 
+  // Docs shipped only as {path}/doc.zip (e.g. SkySpark 3.1.8): unpack once
+  // into the cache. The instance folder may be read-only (sidecar mirror).
+  const zipPath = path.join(instancePath, 'doc.zip');
+  if (fs.existsSync(zipPath)) {
+    return extractDocZip(zipPath);
+  }
+
   return null;
+}
+
+/** Folder for unpacked doc.zip files (FANTOM_DOC_ZIP_DIR or .cache/doc-zips). */
+export function docZipCacheDir(): string {
+  return process.env.FANTOM_DOC_ZIP_DIR || path.join(process.cwd(), '.cache', 'doc-zips');
+}
+
+/**
+ * Unpack {instance}/doc.zip to the cache and return the folder that holds
+ * the pod folders. Re-unpacks when the zip size or mtime changes. Skips
+ * __MACOSX entries and any entry that would escape the target folder.
+ */
+export function extractDocZip(zipPath: string): string | null {
+  try {
+    const st = fs.statSync(zipPath);
+    const key = crypto.createHash('sha1').update(path.resolve(zipPath)).digest('hex').slice(0, 12);
+    const target = path.join(docZipCacheDir(), key);
+    const stamp = `${st.size}:${Math.round(st.mtimeMs)}`;
+    const stampFile = path.join(target, '.stamp');
+    const docRoot = () => (fs.existsSync(path.join(target, 'doc')) ? path.join(target, 'doc') : target);
+    if (fs.existsSync(stampFile) && fs.readFileSync(stampFile, 'utf-8') === stamp) return docRoot();
+
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.mkdirSync(target, { recursive: true });
+    const zip = new AdmZip(zipPath);
+    let n = 0;
+    for (const e of zip.getEntries()) {
+      const name = e.entryName.replace(/\\/g, '/');
+      if (e.isDirectory || name.startsWith('__MACOSX/') || name.split('/').some(s => s === '..' || s.startsWith('._'))) continue;
+      const out = path.resolve(target, name);
+      if (!out.startsWith(target + path.sep)) continue;
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      fs.writeFileSync(out, e.getData());
+      n++;
+    }
+    fs.writeFileSync(stampFile, stamp);
+    logger.info(`Unpacked ${n} doc files from ${zipPath} to ${target}`);
+    return docRoot();
+  } catch (error) {
+    logger.warn(`Failed to unpack ${zipPath}: ${error}`);
+    return null;
+  }
 }
 
 /**

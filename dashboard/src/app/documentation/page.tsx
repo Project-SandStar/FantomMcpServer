@@ -26,6 +26,7 @@ const DOC_FILES: DocFile[] = [
   { name: 'setup', path: `${BASE_PATH}/docs/setup.md`, label: 'Setup Guide' },
   { name: 'installation', path: `${BASE_PATH}/docs/installation.md`, label: 'Installation' },
   { name: 'sidecars', path: `${BASE_PATH}/docs/sidecars.md`, label: 'Sidecars (GPU)' },
+  { name: 'netbird', path: `${BASE_PATH}/docs/netbird.md`, label: 'NetBird' },
   { name: 'tool-status', path: `${BASE_PATH}/docs/tool-status.md`, label: 'Tool Status' },
   { name: 'documentation', path: `${BASE_PATH}/docs/documentation.md`, label: 'Documentation Tools' },
   { name: 'code-analysis', path: `${BASE_PATH}/docs/code-analysis.md`, label: 'Code Analysis' },

@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
+import { PathInput } from '@/components/ui/FolderPicker';
 import { api, FantomInstance, CreateInstanceInput, InstanceType, DocStatus, SourceStatus, FantomVersion, DetectFantomVersionResult, SkySarkInstancesResponse } from '@/lib/api';
 
 // ============================================
@@ -621,12 +622,12 @@ export default function InstancesPage() {
               <label className="block text-sm font-medium text-gray-700 mb-1">
                 Path *
               </label>
-              <input
-                type="text"
+              <PathInput
                 value={formData.path}
-                onChange={(e) => setFormData({ ...formData, path: e.target.value })}
-                placeholder="e.g., ~/skyspark/skyspark-3.1.12"
-                className="w-full rounded-md border border-gray-300 py-2 px-3 text-sm font-mono focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                onChange={(v) => setFormData({ ...formData, path: v })}
+                placeholder="e.g., /mirror/mac-user/skyspark/skyspark-4.0.6"
+                pickerTitle="Choose the installation folder (home)"
+                inputClassName="flex-1 min-w-0 rounded-md border border-gray-300 py-2 px-3 text-sm font-mono focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
               />
               <p className="mt-1 text-xs text-gray-500">
                 Full path to the Fantom/SkySpark/Haxall installation directory
@@ -682,12 +683,12 @@ export default function InstancesPage() {
                 <label className="block text-sm font-medium text-gray-700 mb-1">
                   Source Path
                 </label>
-                <input
-                  type="text"
-                  value={formData.sourcePath}
-                  onChange={(e) => setFormData({ ...formData, sourcePath: e.target.value })}
-                  placeholder="e.g., ~/haxall/src"
-                  className="w-full rounded-md border border-gray-300 py-2 px-3 text-sm font-mono focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                <PathInput
+                  value={formData.sourcePath ?? ''}
+                  onChange={(v) => setFormData({ ...formData, sourcePath: v })}
+                  placeholder="e.g., /mirror/mac-user/haxall/src"
+                  pickerTitle="Choose the source folder"
+                  inputClassName="flex-1 min-w-0 rounded-md border border-gray-300 py-2 px-3 text-sm font-mono focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                 />
                 <p className="mt-1 text-xs text-gray-500">
                   Path to Haxall/SkySpark source code for indexing (optional)

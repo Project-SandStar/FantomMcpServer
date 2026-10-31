@@ -265,6 +265,15 @@ export function extractDocFile(
   const items: LocalDocItem[] = [];
   const fileType = getFileType(filePath);
 
+  // SkySpark/Haxall 4.0.6+ docs use <xetodoc-*> tags (no table.defc-props).
+  if (fileType === 'type') {
+    let html = '';
+    try { html = fs.readFileSync(filePath, 'utf-8'); } catch { /* handled below */ }
+    if (html.includes('<xetodoc-main')) {
+      return extractXetodocType(html, filePath, podName, instanceId, version);
+    }
+  }
+
   switch (fileType) {
     case 'type':
       const typeItem = extractTypeDoc(filePath, podName, instanceId, version);
@@ -315,6 +324,109 @@ export function extractDocFile(
   }
 
   return items;
+}
+
+/**
+ * Parse a 4.0.6+ xetodoc type page. Layout:
+ *   <xetodoc-tab id='doc-header'>class</xetodoc-tab>
+ *   <xetodoc-section><h1>Str</h1><xetodoc-slot><code>sig</code></xetodoc-slot><p>doc</p></xetodoc-section>
+ *   <xetodoc-tab id='doc-methods'>...summary table...
+ *   <xetodoc-tab id='compare'>compare</xetodoc-tab>
+ *   <xetodoc-section><xetodoc-slot><code>sig</code></xetodoc-slot><p>doc</p></xetodoc-section>
+ * A pod's "Funcs" mixin page (e.g. axon/Funcs.html) holds all its Axon
+ * functions; its slots become 'function' items with the same ids as the
+ * old func~name.html pages.
+ */
+export function extractXetodocType(
+  html: string,
+  filePath: string,
+  podName: string,
+  instanceId: number,
+  version?: string
+): LocalDocItem[] {
+  try {
+    const $ = load(html);
+    const basename = path.basename(filePath, '.html');
+    const typeName = $('h1').first().text().trim() || basename;
+    const qualifiedName = `${podName}::${typeName}`;
+    const header = $('xetodoc-tab#doc-header').next('xetodoc-section');
+    const kind = $('xetodoc-tab#doc-header').text().trim();
+    const signature = header.find('xetodoc-slot code').first().text().trim().replace(/\s+/g, ' ') || undefined;
+    const description = header.find('p').text().trim().replace(/\s+/g, ' ') || `${typeName} from ${podName}`;
+    const isFuncs = typeName === 'Funcs' && kind === 'mixin';
+
+    const slots: Array<{ name: string; signature?: string; description: string }> = [];
+    $('xetodoc-tab').each((_, el) => {
+      const id = $(el).attr('id') ?? '';
+      if (!id || id.startsWith('doc-')) return;
+      const sec = $(el).next('xetodoc-section');
+      const name = $(el).text().trim() || id;
+      if (!name || name.includes(' ')) return;
+      slots.push({
+        name,
+        signature: sec.find('xetodoc-slot code').first().text().trim().replace(/\s+/g, ' ') || undefined,
+        description: sec.find('p').text().trim().replace(/\s+/g, ' ').substring(0, 1000),
+      });
+    });
+
+    const items: LocalDocItem[] = [{
+      id: sanitizeId(qualifiedName),
+      name: typeName,
+      qualifiedName,
+      type: 'type',
+      pod: podName,
+      signature,
+      description,
+      url: `file://${filePath}`,
+      version,
+      instanceId,
+      language: isFuncs ? 'axon' : 'fantom',
+      runtime: 'fantom',
+      keywords: [typeName, podName, ...slots.map(s => s.name)].slice(0, 20),
+    }];
+
+    for (const s of slots) {
+      if (isFuncs) {
+        items.push({
+          id: sanitizeId(`axon-${s.name}`),
+          name: s.name,
+          qualifiedName: `func:${s.name}`,
+          type: 'function',
+          pod: podName,
+          signature: s.signature ? `${s.name}${s.signature.replace(/\s*=>.*$/, '')}` : undefined,
+          description: s.description || `Axon function: ${s.name}`,
+          url: `file://${filePath}#${s.name}`,
+          version,
+          instanceId,
+          language: 'axon',
+          runtime: 'fantom',
+          keywords: [s.name, 'axon', 'function', podName],
+        });
+      } else {
+        const q = `${podName}::${typeName}.${s.name}`;
+        items.push({
+          id: sanitizeId(q),
+          name: s.name,
+          qualifiedName: q,
+          type: 'slot',
+          pod: podName,
+          parent: typeName,
+          signature: s.signature,
+          description: s.description,
+          url: `file://${filePath}#${s.name}`,
+          version,
+          instanceId,
+          language: 'fantom',
+          runtime: 'fantom',
+          keywords: [s.name, typeName, podName],
+        });
+      }
+    }
+    return items;
+  } catch (error) {
+    logger.warn(`Failed to extract xetodoc type from ${filePath}: ${error}`);
+    return [];
+  }
 }
 
 /**

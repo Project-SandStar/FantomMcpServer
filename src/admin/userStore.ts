@@ -15,6 +15,18 @@ import * as path from 'path';
 
 export type UserRole = 'admin' | 'user';
 
+/**
+ * "Sidecar sync login" of a user. The sync password is write-only: the
+ * receiver keeps its Argon2 hash in receiver.toml; Fantom keeps no hash.
+ */
+export interface SidecarSyncLogin {
+  enabled: boolean;
+  /** Root names this login may send. Empty = all roots. Kept in Fantom only. */
+  roots: string[];
+  /** When the login was linked to (or made on) the receiver. */
+  linkedAt?: string;
+}
+
 export interface User {
   id: string;
   username: string;
@@ -22,6 +34,9 @@ export interface User {
   role: UserRole;
   createdAt: string;     // ISO timestamp
   lastLogin?: string;    // ISO timestamp
+  /** false = no dashboard login (sync-only user). Missing = true. */
+  dashboardLogin?: boolean;
+  sidecarSync?: SidecarSyncLogin;
 }
 
 export interface UserPublic {
@@ -30,6 +45,8 @@ export interface UserPublic {
   role: UserRole;
   createdAt: string;
   lastLogin?: string;
+  dashboardLogin: boolean;
+  sidecarSync?: SidecarSyncLogin;
 }
 
 interface UsersFile {
@@ -163,6 +180,8 @@ export class UserStore {
       role: user.role,
       createdAt: user.createdAt,
       lastLogin: user.lastLogin,
+      dashboardLogin: user.dashboardLogin !== false,
+      ...(user.sidecarSync ? { sidecarSync: { ...user.sidecarSync, roots: [...user.sidecarSync.roots] } } : {}),
     };
   }
 
@@ -176,20 +195,41 @@ export class UserStore {
    */
   authenticate(username: string, password: string): User | null {
     const user = this.users.get(username.toLowerCase());
-    if (!user) {
+    if (!user || user.dashboardLogin === false) {
       return null;
     }
 
-    if (!verifyPassword(password, user.passwordHash)) {
-      return null;
+    // The dashboard sends Basic auth on EVERY request. A full PBKDF2 check
+    // (100k rounds, sync) plus a users.json rewrite per request blocks the
+    // event loop and makes login and page loads slow. Keep a short-lived
+    // cache of verified credentials. The key includes the stored hash, so a
+    // password change makes old entries miss.
+    const cacheKey = crypto.createHash('sha256')
+      .update(`${user.username}\0${password}\0${user.passwordHash}`).digest('hex');
+    const now = Date.now();
+    const hit = this.authCache.get(cacheKey);
+    if (!(hit && hit > now)) {
+      if (!verifyPassword(password, user.passwordHash)) {
+        return null;
+      }
+      if (this.authCache.size > 1000) this.authCache.clear();
+      this.authCache.set(cacheKey, now + UserStore.AUTH_CACHE_TTL_MS);
     }
 
-    // Update last login timestamp
-    user.lastLogin = new Date().toISOString();
-    this.saveUsers();
+    // Update last login timestamp, but write users.json at most once a minute
+    const last = user.lastLogin ? Date.parse(user.lastLogin) : 0;
+    if (!Number.isFinite(last) || now - last > UserStore.LAST_LOGIN_WRITE_MS) {
+      user.lastLogin = new Date(now).toISOString();
+      this.saveUsers();
+    }
 
     return user;
   }
+
+  /** Verified credential cache: sha256(user, password, hash) → expiry ms. */
+  private authCache: Map<string, number> = new Map();
+  static AUTH_CACHE_TTL_MS = 10 * 60 * 1000;
+  static LAST_LOGIN_WRITE_MS = 60 * 1000;
 
   /**
    * Authenticate and return public user info (for API responses)
@@ -261,6 +301,39 @@ export class UserStore {
 
     console.log(`[UserStore] Created user: ${username} (role: ${role})`);
     return this.toPublic(user);
+  }
+
+  /**
+   * Create a sync-only user for an existing receiver account: role "user",
+   * dashboard login off, a random dashboard password nobody knows.
+   * Returns null if the user exists.
+   */
+  createSyncOnlyUser(username: string, sync: SidecarSyncLogin): UserPublic | null {
+    const key = username.toLowerCase();
+    if (this.users.has(key)) return null;
+    const user: User = {
+      id: crypto.randomUUID(),
+      username: key,
+      passwordHash: hashPassword(crypto.randomBytes(24).toString('hex')).hash,
+      role: 'user',
+      createdAt: new Date().toISOString(),
+      dashboardLogin: false,
+      sidecarSync: { enabled: sync.enabled, roots: [...sync.roots], ...(sync.linkedAt ? { linkedAt: sync.linkedAt } : {}) },
+    };
+    this.users.set(key, user);
+    this.saveUsers();
+    console.log(`[UserStore] Created sync-only user: ${key}`);
+    return this.toPublic(user);
+  }
+
+  /** Save the sidecar sync login settings (never a password). */
+  setSidecarSync(username: string, sync: SidecarSyncLogin | undefined): boolean {
+    const user = this.users.get(username.toLowerCase());
+    if (!user) return false;
+    if (sync) user.sidecarSync = { enabled: sync.enabled, roots: [...sync.roots], ...(sync.linkedAt ? { linkedAt: sync.linkedAt } : {}) };
+    else delete user.sidecarSync;
+    this.saveUsers();
+    return true;
   }
 
   /**

@@ -14,6 +14,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { getOpenRouterSettings } from '../sidecars/openRouterConfig.js';
+import { getGitlabSettings, gitlabLibraryPath } from './axonGitlab.js';
 import { isCloudOnlyPolicy, sanitizePolicies } from '../sidecars/routingPolicy.js';
 
 export type AxonTransport = 'stdio' | 'http';
@@ -41,8 +42,8 @@ export const DEFAULT_AXON_SETTINGS: AxonSettings = {
   // Axon page or via AXON_PROJECT_PATH / AXON_LIBRARY_PATH. They used to
   // default to one developer's home directory, which is both wrong for every
   // other install and not something to publish.
-  projectPath: process.env.AXON_PROJECT_PATH ?? '',
-  libraryPath: process.env.AXON_LIBRARY_PATH ?? '',
+  projectPath: '',
+  libraryPath: '',
   // The MCP client is internal (no dashboard controls): enabled by default,
   // connects lazily on first use to the Axon daemon over HTTP. Indexing and
   // search never depend on it — only callers/callees enrichment does.
@@ -66,18 +67,61 @@ function readRuntimeConfig(): any {
   }
 }
 
-/** Merge persisted `axon` section over the defaults. Always returns a full object. */
-export function getAxonSettings(): AxonSettings {
-  const raw = readRuntimeConfig()?.axon ?? {};
-  const merged: AxonSettings = { ...DEFAULT_AXON_SETTINGS, ...raw };
+export type AxonSettingSource = 'env' | 'saved' | 'empty' | 'gitlab';
+
+/** Where each path setting came from (env wins over the saved config). */
+export interface AxonSettingSources {
+  projectPath: AxonSettingSource;
+  libraryPath: AxonSettingSource;
+  url: AxonSettingSource;
+}
+
+function envValue(env: NodeJS.ProcessEnv, key: string): string {
+  const v = env[key];
+  return typeof v === 'string' ? v.trim() : '';
+}
+
+/**
+ * Merge env and the persisted `axon` section over the defaults.
+ * AXON_PROJECT_PATH, AXON_LIBRARY_PATH and AXON_MCP_URL win over the saved
+ * config (Docker: the compose file is the truth, not a path saved on a Mac).
+ */
+export function getAxonSettings(env: NodeJS.ProcessEnv = process.env, raw: any = readRuntimeConfig()?.axon ?? {}): AxonSettings {
+  return getAxonSettingsWithSources(env, raw).settings;
+}
+
+export function getAxonSettingsWithSources(
+  env: NodeJS.ProcessEnv = process.env,
+  raw: any = readRuntimeConfig()?.axon ?? {},
+): { settings: AxonSettings; sources: AxonSettingSources } {
+  const merged: AxonSettings = { ...DEFAULT_AXON_SETTINGS, projectPath: '', libraryPath: '', ...(raw ?? {}) };
   if (!Array.isArray(merged.args)) merged.args = DEFAULT_AXON_SETTINGS.args;
   if (merged.transport !== 'http') merged.transport = 'stdio';
   // An unset path stays unset — `scanAllAxonProjects` reports "no Axon projects
   // found … check axon.projectPath", which is the truth. Substituting a
   // fallback here would have the indexer scan some unrelated directory.
-  if (typeof merged.projectPath !== 'string') merged.projectPath = DEFAULT_AXON_SETTINGS.projectPath;
-  if (typeof merged.libraryPath !== 'string') merged.libraryPath = DEFAULT_AXON_SETTINGS.libraryPath;
-  return merged;
+  if (typeof merged.projectPath !== 'string') merged.projectPath = '';
+  if (typeof merged.libraryPath !== 'string') merged.libraryPath = '';
+  if (typeof merged.url !== 'string' || !merged.url.trim()) merged.url = DEFAULT_AXON_SETTINGS.url;
+  const pick = (key: 'projectPath' | 'libraryPath' | 'url', envKey: string): AxonSettingSource => {
+    const e = envValue(env, envKey);
+    if (e) { merged[key] = e; return 'env'; }
+    const savedRaw = raw?.[key];
+    return typeof savedRaw === 'string' && savedRaw.trim() ? 'saved' : (key === 'url' ? 'saved' : 'empty');
+  };
+  const sources: AxonSettingSources = {
+    projectPath: pick('projectPath', 'AXON_PROJECT_PATH'),
+    libraryPath: pick('libraryPath', 'AXON_LIBRARY_PATH'),
+    url: pick('url', 'AXON_MCP_URL'),
+  };
+  // GitLab library (enabled + cloned) wins over a saved folder, not over env.
+  if (sources.libraryPath !== 'env') {
+    try {
+      const g = gitlabLibraryPath(getGitlabSettings(env).settings);
+      if (g) { merged.libraryPath = g; sources.libraryPath = 'gitlab'; }
+    } catch { /* no GitLab config */ }
+  }
+  return { settings: merged, sources };
 }
 
 /** Absolute path to the offline Axon library root. */
@@ -85,12 +129,52 @@ export function getAxonLibraryDir(settings: AxonSettings = getAxonSettings()): s
   return settings.libraryPath;
 }
 
+/**
+ * The `proj/` folder for a project path. Accepts both layouts: a folder that
+ * contains `proj/` (the Axon checkout) and a folder that is itself `proj/`
+ * (the synced mirror mounted at /axon). Returns which rule matched.
+ */
+export function resolveAxonProjDir(projectPath: string): { projDir: string; layout: 'contains-proj' | 'is-proj' | 'none' } {
+  if (!projectPath.trim()) return { projDir: '', layout: 'none' };
+  const inner = path.join(projectPath, 'proj');
+  if (isDir(inner)) return { projDir: inner, layout: 'contains-proj' };
+  if (path.basename(path.resolve(projectPath)) === 'proj' || looksLikeProjDir(projectPath)) {
+    return { projDir: projectPath, layout: 'is-proj' };
+  }
+  return { projDir: inner, layout: 'none' };
+}
+
+function isDir(p: string): boolean {
+  try { return fs.statSync(p).isDirectory(); } catch { return false; }
+}
+
+/** `<instance>/<project>/func` below it: the folder is a proj/ folder. */
+function looksLikeProjDir(p: string): boolean {
+  try {
+    for (const inst of fs.readdirSync(p, { withFileTypes: true })) {
+      if (!inst.isDirectory() || inst.name.startsWith('.')) continue;
+      for (const proj of fs.readdirSync(path.join(p, inst.name), { withFileTypes: true })) {
+        if (proj.isDirectory() && isDir(path.join(p, inst.name, proj.name, 'func'))) return true;
+      }
+    }
+  } catch { /* not readable */ }
+  return false;
+}
+
 /** Absolute path to the synced SkySpark projects folder ('' when unconfigured). */
 export function getAxonProjDir(settings: AxonSettings = getAxonSettings()): string {
   // Not `path.join('', 'proj')` — that yields the RELATIVE './proj', which the
   // scanner would happily read from whatever the process cwd happens to be.
-  if (!settings.projectPath.trim()) return '';
-  return path.join(settings.projectPath, 'proj');
+  return resolveAxonProjDir(settings.projectPath).projDir;
+}
+
+/** Boot check: warn when a configured path does not exist in this container. */
+export function axonPathWarnings(settings: AxonSettings = getAxonSettings(), sources?: AxonSettingSources): string[] {
+  const out: string[] = [];
+  if (settings.projectPath && !isDir(settings.projectPath)) out.push(`Axon project path does not exist: ${settings.projectPath}`);
+  // GitLab clone in use: the local folder is not used, so it is not checked.
+  if (sources?.libraryPath !== 'gitlab' && settings.libraryPath && !isDir(settings.libraryPath)) out.push(`Axon library path does not exist: ${settings.libraryPath}`);
+  return out;
 }
 
 /**

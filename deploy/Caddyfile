@@ -1,0 +1,15 @@
+# TLS for Fantom MCP. Caddy gets a certificate for {$FANTOM_HOST}.
+# For a LAN host without public DNS, add `tls internal` inside the block.
+#   https://{host}/fantom/mcp      -> fantom:3848/mcp
+#   https://{host}/fantom/admin/*  -> fantom:3848/admin/*
+#   https://{host}/fantom/health   -> fantom:3848/health
+{$FANTOM_HOST} {
+	handle_path /fantom/* {
+		reverse_proxy fantom:3848 {
+			flush_interval -1
+		}
+	}
+	handle {
+		respond "Not found" 404
+	}
+}

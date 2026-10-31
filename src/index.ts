@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
 // ═══════ CRASH FORENSICS — must be first, before any other code ═══════
+import { SERVER_INSTRUCTIONS } from './utils/serverInstructions.js';
 import * as nodeFs from 'node:fs';
 import * as v8 from 'node:v8';
 import { crashWrite as logSinkCrashWrite, invalidateLogSinkCache } from './utils/logSink.js';
 // Axon MCP server integration (settings section `axon`, proxy tools, indexer boot hook)
-import { getAxonSettings } from './axon/axonSettings.js';
+import { getAxonSettings, getAxonSettingsWithSources, axonPathWarnings } from './axon/axonSettings.js';
 import { AXON_TOOL_DEFINITIONS, handleAxonTool, isAxonTool } from './axon/axonTools.js';
 import { getAxonMcpClient } from './axon/axonMcpClient.js';
 import { maybeAutoIndexAtBoot as maybeAxonAutoIndexAtBoot } from './axon/axonIndexer.js';
@@ -132,6 +133,13 @@ function resolveRssGuardMb(): number {
       if (typeof cfg?.rssGuardMb === 'number' && Number.isFinite(cfg.rssGuardMb)) return cfg.rssGuardMb;
     }
   } catch { /* fallthrough */ }
+  // In a container, scale with the cgroup memory limit (75%), so an 8 GB
+  // limit does not trip a fixed 4000 MB guard while indexing runs.
+  try {
+    const raw = nodeFs.readFileSync('/sys/fs/cgroup/memory.max', 'utf-8').trim();
+    const bytes = Number(raw);
+    if (Number.isFinite(bytes) && bytes > 0) return Math.max(4000, Math.round(bytes / 1024 / 1024 * 0.75));
+  } catch { /* not cgroup v2 or not a container */ }
   return 4000;
 }
 const RSS_GUARD_MB = resolveRssGuardMb();
@@ -174,7 +182,7 @@ import { createLogger } from './utils/index.js';
 import { SkySpark4xMigrator, type MigrationConfig } from './migration/index.js';
 import { generateClass, generateMethod, generatePod, validateFantomCode } from './tools/generateFantom.js';
 import { createAgentFramework, type AgentFramework, getAgentInfo } from './agents/index.js';
-import { createAdminRouter } from './admin/routes.js';
+import { createAdminRouter, detectProjectLanguage } from './admin/routes.js';
 import type { AdminContext, ServerStatus, CacheInfo, PrimaryProjectContext, McpTool, FantomSettings } from './admin/types.js';
 import { getBackupManager } from './backup/index.js';
 import { getUserStore } from './admin/userStore.js';
@@ -212,7 +220,9 @@ import { promises as fs } from 'fs';
 import * as fsSync from 'fs';
 import { join } from 'path';
 import * as path from 'path';
-import { WorkflowManager } from './workflows/workflowManager.js';
+import { WorkflowManager, resolveWorkflowsDir, resolveBuiltinWorkflowsDir, seedWorkflowsDir } from './workflows/workflowManager.js';
+import { WorkflowAcl, type WorkflowUser } from './workflows/workflowAccess.js';
+import { WORKFLOW_TOOL_DEFS, listWorkflowsForUser, getWorkflowForUser } from './workflows/workflowTools.js';
 import { getSemanticSearchService, getDocsVectorStore } from './embedding/index.js';
 import { getLadybugQueryManager } from './graph/ladybugQueryManager.js';
 import { REPORT_CHANGES_TOOL } from './indexing/reportChangesTool.js';
@@ -318,6 +328,9 @@ class FantomMCPServer {
 
   // Workflow Manager for dynamic resource loading
   private workflowManager: WorkflowManager;
+  private workflowAcl!: WorkflowAcl;
+  /** projectId → instanceId, for instance-scope workflow access (refreshed from the DB). */
+  private projectInstanceMap = new Map<string, string>();
 
   // OAuth 2.1 Support
   private oauthProvider: FantomOAuthProvider | null = null;
@@ -327,13 +340,14 @@ class FantomMCPServer {
     this.server = new Server(
       {
         name: 'mcp-fantom',
-        version: '1.1.2',
+        version: '1.1.5',
       },
       {
         capabilities: {
           tools: {},
           resources: {},
         },
+        instructions: SERVER_INSTRUCTIONS,
       }
     );
 
@@ -341,7 +355,17 @@ class FantomMCPServer {
     this.searchIndex = new SearchIndex();
 
     // Initialize WorkflowManager and load workflows dynamically (before agent framework)
-    this.workflowManager = new WorkflowManager(join(process.cwd(), 'workflows'));
+    // FANTOM_WORKFLOWS_DIR (Docker: on the cache volume) holds the editable
+    // copies; built-in files are copied in when missing, never over an edit.
+    const workflowsDir = resolveWorkflowsDir();
+    try {
+      const seeded = seedWorkflowsDir(resolveBuiltinWorkflowsDir(), workflowsDir);
+      if (seeded.length > 0) this.log(`Workflows: copied ${seeded.length} built-in file(s) into ${workflowsDir}`);
+    } catch (err) {
+      this.log(`Workflows: seed copy into ${workflowsDir} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    this.workflowManager = new WorkflowManager(workflowsDir, resolveBuiltinWorkflowsDir());
+    this.workflowAcl = new WorkflowAcl(workflowsDir, (pid) => this.projectInstanceMap.get(pid) ?? null);
     this.workflowManager.loadWorkflows();
     // Watch the workflows/ directory so adding a new .md file makes it
     // available as an MCP resource without restarting the server.
@@ -487,13 +511,13 @@ class FantomMCPServer {
     });
 
     // List available resources
-    server.setRequestHandler(ListResourcesRequestSchema, async () => {
-      return this.handleListResources();
+    server.setRequestHandler(ListResourcesRequestSchema, async (_request, extra) => {
+      return this.handleListResources(this.workflowUserFor(extra));
     });
 
     // Read resource content
-    server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      return this.handleReadResource(request);
+    server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
+      return this.handleReadResource(request, this.workflowUserFor(extra));
     });
   }
 
@@ -614,6 +638,39 @@ class FantomMCPServer {
         this.log(`migrateProjectPaths failed (non-fatal): ${err}`);
       }
 
+      // Sidecar mirror folders as projects (FANTOM_MIRROR_PROJECTS; src/indexing/mirror.ts).
+      try {
+        // Admin-edited list (Dashboard > Sidecar sync) wins; FANTOM_MIRROR_PROJECTS is the seed.
+        const { registerMirrorSpecs } = await import('./indexing/mirror.js');
+        const { readMirrorSettings, effectiveMirrorSpecs } = await import('./indexing/mirrorStore.js');
+        const { runtimeConfigPath } = await import('./indexing/lazyConfig.js');
+        const mirrorSpecs = effectiveMirrorSpecs(readMirrorSettings(runtimeConfigPath()));
+        const created = await registerMirrorSpecs({
+          listPaths: async () => (await db.getAllProjects()).map(p => p.path),
+          create: async (s) => {
+            const lang = detectProjectLanguage(s.path);
+            await db.createProject({ name: s.name, path: s.path, autoIndex: true, ...lang });
+          },
+        }, mirrorSpecs);
+        if (created.length > 0) this.log(`Registered mirror project(s): ${created.join(', ')}`);
+      } catch (err) {
+        this.log(`registerMirrorProjects failed (non-fatal): ${err}`);
+      }
+
+      // Instance source pods (e.g. Haxall src/<category>/<pod>) into the pods
+      // table, so the Fantom Pods page lists them without manual entry.
+      try {
+        const { syncInstanceSourcePods } = await import('./fantom/sourcePods.js');
+        const createdPods = await syncInstanceSourcePods({
+          listInstances: async () => db.getAllInstances(),
+          listPodPaths: async () => (await db.getAllPods()).map(p => p.path),
+          createPod: async (input) => db.createPod(input),
+        });
+        if (createdPods.length > 0) this.log(`Registered ${createdPods.length} source pod(s) from instance sourcePath`);
+      } catch (err) {
+        this.log(`syncInstanceSourcePods failed (non-fatal): ${err}`);
+      }
+
       // Enable autoIndex for all projects (ensures projects get indexed on startup)
       const enabled = await db.enableAutoIndexForAll();
       if (enabled > 0) {
@@ -661,7 +718,7 @@ class FantomMCPServer {
       // `force`: the graph store was quarantined (corrupt on disk) and recreated
       // empty, so the hash-gate must not skip the re-parse — file hashes are
       // unchanged but the graph is gone.
-      const pendingFirstParse: Array<{ id: number; name: string; path: string; force?: boolean }> = [];
+      const pendingFirstParse: Array<{ id: number; name: string; path: string; force?: boolean; symbols?: number }> = [];
       const { preflightProjectGraphStore, projectNeedsGraphRebuild } = await import('./graph/projectGraphConnection.js');
       let projIdx = 0;
       for (const project of projects) {
@@ -714,7 +771,10 @@ class FantomMCPServer {
             const hadSymbols = ((project as any).functionCount ?? 0) > 0 || ((project as any).typeCount ?? 0) > 0;
             const force = projectNeedsGraphRebuild(project.id) || hadSymbols;
             if (force) this.log(`  Graph for ${project.name} is empty but the project was indexed before — forcing a rebuild after boot`);
-            pendingFirstParse.push({ id: project.id, name: project.name, path: project.path, force });
+            pendingFirstParse.push({
+              id: project.id, name: project.name, path: project.path, force,
+              symbols: ((project as any).functionCount ?? 0) + ((project as any).typeCount ?? 0),
+            });
             crashLog(`BOOT_PROJ_DEFER_PARSE id=${project.id} name=${project.name} force=${force} hadSymbols=${hadSymbols}`);
           }
         } catch (err) {
@@ -815,6 +875,10 @@ class FantomMCPServer {
           crashLog(`BOOT_DRAIN_ENTER ${drainIdx}/${pendingFirstParse.length} id=${p.id} name=${p.name}`);
           const t0 = Date.now();
           try {
+            if (p.force && (p.symbols ?? 0) > 0) {
+              const { hintProjectGraphSizeMiB } = await import('./graph/projectGraphConnection.js');
+              hintProjectGraphSizeMiB(p.id, (p.symbols ?? 0) / 1000);
+            }
             const r = await runIndex(db, getPrismaClient(), p.id, { trigger: 'manual', force: p.force === true });
             crashLog(`BOOT_DRAIN_DONE id=${p.id} force=${p.force === true} fns=${r.indexResult.functionsIndexed} types=${r.indexResult.typesIndexed} ms=${Date.now() - t0}`);
             this.log(`  ${p.force ? 'Rebuilt' : 'First-parse'} ${p.name}: ${r.indexResult.functionsIndexed} fns, ${r.indexResult.typesIndexed} types`);
@@ -1503,7 +1567,7 @@ class FantomMCPServer {
         };
       })(),
       initialized: this.initializationComplete,
-      version: '1.1.2',
+      version: '1.1.5',
       serverPath: path.resolve(dirname(fileURLToPath(import.meta.url)), 'index.js'),
       port: getServerPort(),
       stats: {
@@ -1662,6 +1726,7 @@ class FantomMCPServer {
 
     return {
       getWorkflowManager: () => this.workflowManager,
+      getWorkflowAcl: () => { void this.refreshProjectInstanceMap(); return this.workflowAcl; },
       getServerStatus: () => this.getServerStatus(),
       getCacheInfo: () => this.getCacheInfo(),
       clearCache: async (name?: string) => {
@@ -2284,6 +2349,8 @@ class FantomMCPServer {
               },
             },
           },
+          // Workflows (server-side guides; same ACL as workflow:// resources)
+          ...WORKFLOW_TOOL_DEFS,
           {
             name: 'listVersionGroups',
             description: 'List the product/version groups projects belong to (SkySpark 3.1.12, Haxall 4.0.6, Fantom 1.0.83, …) with project counts. Pass a group to the versionGroup filter of the search tools.',
@@ -2688,6 +2755,11 @@ class FantomMCPServer {
     const app = express();
     app.use(express.json());
 
+    // Optional static bearer token in front of /mcp and /admin
+    // (FANTOM_API_TOKEN; unset = off). TLS: reverse proxy (deploy/Caddyfile).
+    const { apiTokenGate } = await import('./auth/apiTokenGate.js');
+    app.use(apiTokenGate());
+
     // CORS middleware for development (dashboard on different port)
     app.use((req: Request, res: Response, next) => {
       const origin = req.headers.origin;
@@ -2765,7 +2837,7 @@ class FantomMCPServer {
         // ============================================
         // OAuth Authentication Enforcement
         // ============================================
-        if (this.isOAuthRequired()) {
+        if (this.isOAuthRequired() && !res.locals.apiTokenOk) {
           const authInfo = await this.validateMcpToken(authHeader);
 
           if (!authInfo) {
@@ -2796,8 +2868,8 @@ class FantomMCPServer {
 
           // Create a NEW Server instance for this session
           const sessionServer = new Server(
-            { name: 'mcp-fantom', version: '1.1.2' },
-            { capabilities: { tools: {}, resources: {} } }
+            { name: 'mcp-fantom', version: '1.1.5' },
+            { capabilities: { tools: {}, resources: {} }, instructions: SERVER_INSTRUCTIONS }
           );
 
           // Set up handlers on this session's server
@@ -2869,7 +2941,7 @@ class FantomMCPServer {
       this.log(`GET /mcp - session: ${sessionId || 'none'}, auth: ${authHeader ? 'present' : 'none'}`);
 
       // OAuth Authentication Enforcement
-      if (this.isOAuthRequired()) {
+      if (this.isOAuthRequired() && !res.locals.apiTokenOk) {
         const authInfo = await this.validateMcpToken(authHeader);
         if (!authInfo) {
           this.log('GET /mcp - OAuth required but no valid token');
@@ -2900,7 +2972,7 @@ class FantomMCPServer {
       this.log(`DELETE /mcp - session: ${sessionId || 'none'}, auth: ${authHeader ? 'present' : 'none'}`);
 
       // OAuth Authentication Enforcement
-      if (this.isOAuthRequired()) {
+      if (this.isOAuthRequired() && !res.locals.apiTokenOk) {
         const authInfo = await this.validateMcpToken(authHeader);
         if (!authInfo) {
           this.log('DELETE /mcp - OAuth required but no valid token');
@@ -3125,6 +3197,7 @@ class FantomMCPServer {
       void initAxonGrammar();
       // Axon: optional index run once sidecars registered (no-op unless axon.enabled && autoIndex).
       maybeAxonAutoIndexAtBoot();
+      try { const a = getAxonSettingsWithSources(); for (const w of axonPathWarnings(a.settings, a.sources)) this.log(`WARN ${w}`); } catch { /* settings unreadable */ }
 
       // Run critical initialization (fast), then start background tasks.
       // Do NOT rethrow from the catch: this property is assigned, not awaited,
@@ -4002,6 +4075,8 @@ class FantomMCPServer {
             },
           },
         },
+        // Workflows: server-side guides, same ACL as the workflow:// resources
+        ...WORKFLOW_TOOL_DEFS.map(({ category: _c, ...t }) => t),
         // Version groups: the product/version lines the search tools can be scoped to
         {
           name: 'listVersionGroups',
@@ -6168,6 +6243,29 @@ class FantomMCPServer {
           return result;
         }
 
+        case 'listWorkflows':
+        case 'getWorkflow': {
+          const user = this.workflowUserFor(extra);
+          await this.refreshProjectInstanceMap();
+          const deps = {
+            manager: this.workflowManager,
+            acl: this.workflowAcl,
+            projectInstance: (pid: string) => this.projectInstanceMap.get(pid) ?? null,
+          };
+          try {
+            const out = name === 'listWorkflows'
+              ? listWorkflowsForUser(deps, user, (args ?? {}) as any)
+              : getWorkflowForUser(deps, user, (args ?? {}) as any);
+            const failed = 'ok' in out && out.ok === false;
+            await trackTool(!failed, failed ? (out as any).error : undefined);
+            return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }], ...(failed ? { isError: true } : {}) };
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            await trackTool(false, msg);
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: msg }) }], isError: true };
+          }
+        }
+
         case 'listVersionGroups': {
           const { listVersionGroups } = await import('./projects/versionGroup.js');
           const groups = await listVersionGroups();
@@ -6539,9 +6637,38 @@ class FantomMCPServer {
   /**
    * Handle ListResources request - dynamically loads workflows from WorkflowManager
    */
-  private async handleListResources() {
-    // Dynamically load workflow resources from WorkflowManager
-    const workflowResources = this.workflowManager.getWorkflowList().map(workflow => ({
+  /**
+   * The MCP caller as a workflow user: the OAuth user of the HTTP session.
+   * No OAuth user (stdio, API token, auth off) = the server owner = admin.
+   */
+  private workflowUserFor(extra?: any): WorkflowUser {
+    const sid = extra?.sessionId as string | undefined;
+    const username = sid ? this.httpSessionMeta.get(sid)?.userId : null;
+    if (!username) return { username: 'local', role: 'admin' };
+    void this.refreshProjectInstanceMap();
+    const u = getUserStore().getUser(username);
+    return { username, role: u?.role === 'admin' ? 'admin' : 'user' };
+  }
+
+  private projectInstanceAt = 0;
+  private async refreshProjectInstanceMap(): Promise<void> {
+    if (Date.now() - this.projectInstanceAt < 30_000) return;
+    this.projectInstanceAt = Date.now();
+    try {
+      const projects = await getFantomDatabase().getAllProjects();
+      const m = new Map<string, string>();
+      for (const p of projects) if (p.instanceId) m.set(String(p.id), String(p.instanceId));
+      this.projectInstanceMap = m;
+    } catch { /* DB not ready: keep the old map */ }
+  }
+
+  private async handleListResources(user: WorkflowUser = { username: 'local', role: 'admin' }) {
+    // Workflow resources this user may view (project → instance → global order).
+    const order = { project: 0, instance: 1, personal: 2, global: 3 } as const;
+    const workflowResources = this.workflowManager.getWorkflowList()
+      .filter(w => this.workflowAcl.canView(user, w))
+      .sort((a, b) => order[a.scope] - order[b.scope] || a.metadata.title.localeCompare(b.metadata.title))
+      .map(workflow => ({
       uri: workflow.uri,
       name: workflow.metadata.title,
       description: workflow.metadata.description,
@@ -6585,7 +6712,7 @@ class FantomMCPServer {
   /**
    * Handle ReadResource request
    */
-  private async handleReadResource(request: any) {
+  private async handleReadResource(request: any, user: WorkflowUser = { username: 'local', role: 'admin' }) {
     const uri = request.params.uri;
 
     try {
@@ -6597,8 +6724,10 @@ class FantomMCPServer {
       let filePath: string;
 
       if (uri.startsWith('workflow://')) {
-        const workflowName = uri.replace('workflow://', '');
-        filePath = join(process.cwd(), 'workflows', `${workflowName}.md`);
+        // Content from the manager (same folder and same access as the list).
+        const wf = this.workflowManager.getWorkflowByUri(uri);
+        if (!wf || !this.workflowAcl.canView(user, wf)) throw new Error(`Workflow not found: ${uri}`);
+        return { contents: [{ uri, mimeType: 'text/markdown', text: wf.fullContent }] };
       } else if (uri.startsWith('docs://')) {
         const docName = uri.replace('docs://', '');
         // Convert kebab-case to SCREAMING_SNAKE_CASE for filename

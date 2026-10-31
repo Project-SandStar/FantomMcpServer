@@ -77,7 +77,7 @@ function describe(c) {
   const bits = [`id ${p.id}`, p.language];
   if (p.versionGroup && p.versionGroup.key !== 'other') bits.push(`version group "${p.versionGroup.label}"`);
   bits.push(`lazy indexing ${p.lazy ? 'on' : 'off'}`);
-  bits.push(`${p.functionCount} functions / ${p.typeCount} types`);
+  bits.push(sizeText(p));
   bits.push(`last indexed ${p.lastIndexed ? ago(p.lastIndexed) : 'never'}`);
   if (p.lastRun) bits.push(`last run "${p.lastRun.trigger}" ${ago(p.lastRun.startedAt)}${p.lastRun.error ? ' FAILED' : ''}`);
   if (p.focusFiles) bits.push(`${p.focusFiles} file${p.focusFiles === 1 ? '' : 's'} in focus`);
@@ -86,9 +86,23 @@ function describe(c) {
     : `projectId ${p.id}`;
   const out = [
     `Fantom MCP plugin: server up (v${c.version}). This directory is registered project "${p.name}" (${bits.join(', ')}).`,
-    `Use the Fantom MCP tools before grepping or guessing an API. Tools are deferred: run ToolSearch("fantom", 30) once, then: askCodebase (how does X work, where is Y; ${scope}) · searchFantomCode / semanticCodeSearch (find code; ${scope}) · getCallers + getCodeImpact (before changing a symbol) · whatChangedRecently / getSymbolHistory (why did it change) · searchLocalDocs (Fantom/Haxall/SkySpark docs) · searchVersionedApi (SkySpark 3.x to 4.0). Edits made with Edit/Write are reported by the plugin hook; call reportChanges only for files changed by shell commands.`,
+    `RULE: for any "how does X work / where is Y / who calls Z" question about this code, call a Fantom MCP tool BEFORE Grep, rg, grep or find. Grep is for exact strings after that. The index is live: edits are re-indexed in the background, so do not skip it because it "may be stale"; say so if a result looks wrong.`,
+    `Tools are deferred: run ToolSearch("fantom", 30) once, then: askCodebase (how does X work, where is Y; ${scope}) · searchFantomCode / semanticCodeSearch (find code; ${scope}) · getCallers + getCodeImpact (before changing a symbol) · whatChangedRecently / getSymbolHistory (why did it change) · getIndexHealth (projectId ${p.id}; what the index covers) · searchLocalDocs (Fantom/Haxall/SkySpark docs) · searchVersionedApi (SkySpark 3.x to 4.0) · listWorkflows, then getWorkflow (step-by-step guides).`,
+    `Workflows live on the server: listWorkflows, then getWorkflow. Never read local workflow files.`,
+    `When you start a subagent (Agent/Task) for code search in this project, put this in its prompt: "Fantom MCP project ${p.id}: load ToolSearch(\"fantom\", 30) and use askCodebase / searchFantomCode before grep." Edits made with Edit/Write are reported by the plugin hook; call reportChanges only for files changed by shell commands.`,
   ];
   if (p.lastRun && p.lastRun.error) out.push(`The last index run failed: ${String(p.lastRun.error).slice(0, 160)}. Results may be stale; refreshFantomProject or /fantom-mcp:doctor.`);
   else if (!p.lastIndexed) out.push('This project has never been indexed: call refreshFantomProject before relying on search results.');
   return out;
+}
+
+/**
+ * Index size. functionCount/typeCount on the project row can hold the counts
+ * of the last partial run only; the per-file symbol total is the true size.
+ */
+function sizeText(p) {
+  const rowTotal = (p.functionCount || 0) + (p.typeCount || 0);
+  const sym = p.symbolCount || 0;
+  if (sym > rowTotal) return `${sym.toLocaleString('en-US')} symbols in ${(p.fileCount || 0).toLocaleString('en-US')} files`;
+  return `${(p.functionCount || 0).toLocaleString('en-US')} functions / ${(p.typeCount || 0).toLocaleString('en-US')} types`;
 }

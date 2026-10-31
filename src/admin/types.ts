@@ -422,4 +422,5 @@ export interface AdminContext {
 
   // MCP workflow resources (workflows/*.md), edited from the dashboard
   getWorkflowManager?: () => import('../workflows/workflowManager.js').WorkflowManager;
+  getWorkflowAcl?: () => import('../workflows/workflowAccess.js').WorkflowAcl;
 }

@@ -2,6 +2,7 @@
 
 import { useState, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
+import { PathInput } from '@/components/ui/FolderPicker';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, FantomPod, FantomPodWithInstance, CreatePodInput, FantomInstance } from '@/lib/api';
 import { ProjectsSidebar, ProjectsSidebarEntry, ProjectsSidebarGroup } from '@/components/ProjectsSidebar';
@@ -693,12 +694,12 @@ export default function FantomPodsPage() {
               <label className="block text-sm font-medium text-gray-700 mb-1">
                 Path *
               </label>
-              <input
-                type="text"
+              <PathInput
                 value={formData.path}
-                onChange={(e) => setFormData({ ...formData, path: e.target.value })}
-                placeholder="e.g., ~/Code/myPod"
-                className="w-full rounded-md border border-gray-300 py-2 px-3 text-sm font-mono focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                onChange={(v) => setFormData({ ...formData, path: v })}
+                placeholder="e.g., /mirror/mac-user/myPod"
+                pickerTitle="Choose the pod / project folder"
+                inputClassName="flex-1 min-w-0 rounded-md border border-gray-300 py-2 px-3 text-sm font-mono focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
               />
             </div>
 

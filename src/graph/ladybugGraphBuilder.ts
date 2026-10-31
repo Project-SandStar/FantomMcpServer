@@ -22,10 +22,19 @@ import type {
 } from '../fantom-code/types.js';
 import type { NodeType, GraphBuildResult, UnresolvedRef } from './types.js';
 import { ladybugExecute } from './ladybugConnection.js';
+import { projectHasWal } from './projectGraphConnection.js';
 import { initLadybugSchema, clearProjectGraph } from './ladybugSchema.js';
 import { invalidateProjectNodeCount } from './projectNodeCounts.js';
 
 const logger = createLogger('ladybug-graph-builder');
+
+/**
+ * Let timers and HTTP requests run. A big build does long synchronous loops;
+ * without this /health and the dashboard wait until the build ends.
+ */
+export function yieldToEventLoop(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve));
+}
 
 /** Detect language from file extension */
 function langFromPath(fp: string): string {
@@ -89,9 +98,19 @@ export interface PendingEdge {
 export class LadybugGraphBuilder {
   private projectId: number;
   private nodeByQualifiedName = new Map<string, string>();
+  // Tail indexes over nodeByQualifiedName (see resolveReference): first-insert
+  // order of each qn, and the qns ending in ".<tail>" / "::<tail>".
+  private qnOrder = new Map<string, number>();
+  private dotTails = new Map<string, string[]>();
+  private podTails = new Map<string, string[]>();
   // Qualified names of nodes created by THIS run (preloaded names excluded),
   // so a top-level function is not skipped because another file has the qn.
   private createdQns = new Set<string>();
+  // Node ids created by THIS run. Top-level functions dedup on the id (file +
+  // name + line), not the qualified name: TS/JS/Vue qns are "<project>::fn",
+  // so every file's `parse` or `money` shared one qn and all but the first
+  // were dropped from the graph.
+  private createdIds = new Set<string>();
   private pendingEdges: PendingEdge[] = [];
   // References no node resolved (graph patch stores them in pending_refs).
   private unresolvedEdges: PendingEdge[] = [];
@@ -127,7 +146,7 @@ export class LadybugGraphBuilder {
     let n = 0;
     for (const [qn, id] of entries) {
       if (!qn || !id) continue;
-      this.nodeByQualifiedName.set(qn, id);
+      this.setName(qn, id);
       n++;
     }
     return n;
@@ -177,12 +196,17 @@ export class LadybugGraphBuilder {
 
   /** First three passes of a build: type nodes, members, top-level functions. */
   private async registerNodes(parsedFiles: ParsedFile[]): Promise<void> {
+    // `await` on a resolved promise does not let timers or sockets run, so
+    // yield for real every 200 files (see yieldToEventLoop).
+    let n = 0;
     for (const file of parsedFiles) {
+      if (++n % 200 === 0) await yieldToEventLoop();
       for (const typeDef of file.types) {
         await this.createTypeNode(typeDef);
       }
     }
     for (const file of parsedFiles) {
+      if (++n % 200 === 0) await yieldToEventLoop();
       for (const typeDef of file.types) {
         await this.createMemberNodes(typeDef);
       }
@@ -191,10 +215,12 @@ export class LadybugGraphBuilder {
     // TypeScript / JavaScript / Python codebases, and were previously dropped
     // from the graph because we only walked file.types.
     for (const file of parsedFiles) {
+      if (++n % 200 === 0) await yieldToEventLoop();
       if (!file.functions || file.functions.length === 0) continue;
       for (const func of file.functions) {
-        // Skip if a same-qualifiedName node was already created as a member.
-        if (this.createdQns.has(func.qualifiedName)) continue;
+        // Skip if this exact node was already created as a member.
+        const fid = func.id || generateFunctionId(func.filePath, func.qualifiedName, func.lineNumber);
+        if (this.createdIds.has(fid)) continue;
         await this.createFunctionNode(func, '');
       }
     }
@@ -314,7 +340,7 @@ export class LadybugGraphBuilder {
       bodySha: typeDef.bodySha,
     });
 
-    this.nodeByQualifiedName.set(typeDef.qualifiedName, id);
+    this.setName(typeDef.qualifiedName, id);
     this.createdQns.add(typeDef.qualifiedName);
 
     // Queue inheritance edges
@@ -394,8 +420,9 @@ export class LadybugGraphBuilder {
       bodySha: func.bodySha,
     });
 
-    this.nodeByQualifiedName.set(func.qualifiedName, id);
+    this.setName(func.qualifiedName, id);
     this.createdQns.add(func.qualifiedName);
+    this.createdIds.add(id);
 
     // Containment edge: type -> member. Skip for top-level/module-scoped
     // functions where there is no parent type (parentTypeId === '').
@@ -517,7 +544,9 @@ export class LadybugGraphBuilder {
    */
   private async createPendingEdges(): Promise<void> {
     const seen = new Set<string>();
+    let n = 0;
     for (const edge of this.pendingEdges) {
+      if (++n % 2000 === 0) await yieldToEventLoop();
       const targetId = this.resolveReference(edge.targetName, edge.context);
       if (!targetId) {
         this.stats.unresolvedCount++;
@@ -571,45 +600,68 @@ export class LadybugGraphBuilder {
    * Try to resolve a reference to a known node
    */
   private resolveReference(name: string, context?: { className?: string }): string | undefined {
-    // Exact match
-    if (this.nodeByQualifiedName.has(name)) {
-      return this.nodeByQualifiedName.get(name);
-    }
+    // Same rules and the same "first in insertion order" tie-break as the old
+    // full scans of nodeByQualifiedName, but answered from tail indexes. The
+    // scans made edge resolution O(edges × nodes): SoundSuite (25k nodes,
+    // 48k edges) blocked the event loop for minutes, so /health and the
+    // dashboard stopped answering during a boot rebuild (2026-10-30).
+    const exact = this.nodeByQualifiedName.get(name);
+    if (exact !== undefined) return exact;
 
     // Handle "this.method" → resolve via context class
     if (name.startsWith('this.') && context?.className) {
       const methodName = name.substring(5);
-      const suffix = `.${context.className}.${methodName}`;
-      for (const [qn, id] of this.nodeByQualifiedName) {
-        if (qn.endsWith(suffix) || qn === `${context.className}.${methodName}`) {
-          return id;
-        }
-      }
+      const tail = `${context.className}.${methodName}`;
+      const hit = this.firstOf([...(this.dotTails.get(tail) ?? []), ...(this.qnOrder.has(tail) ? [tail] : [])]);
+      if (hit) return hit;
     }
 
     // Try pod-qualified match: "Str" → "sys::Str"
-    for (const [qn, id] of this.nodeByQualifiedName) {
-      if (qn.endsWith(`::${name}`)) return id;
-    }
+    const pod = this.firstOf(this.podTails.get(name) ?? []);
+    if (pod) return pod;
 
     // Try within same class context
     if (!name.includes('.') && !name.includes('::') && context?.className) {
-      const suffix = `.${context.className}.${name}`;
-      for (const [qn, id] of this.nodeByQualifiedName) {
-        if (qn.endsWith(suffix)) return id;
-      }
+      const hit = this.firstOf(this.dotTails.get(`${context.className}.${name}`) ?? []);
+      if (hit) return hit;
     }
 
     // Unique simple name match
     if (!name.includes('.') && !name.includes('::')) {
-      const matches: string[] = [];
-      for (const [qn, id] of this.nodeByQualifiedName) {
-        if (qn.endsWith(`.${name}`)) matches.push(id);
-      }
-      if (matches.length === 1) return matches[0];
+      const matches = this.dotTails.get(name) ?? [];
+      if (matches.length === 1) return this.nodeByQualifiedName.get(matches[0]);
     }
 
     return undefined;
+  }
+
+  /** Record a qualified name and index its tails (after each "." and "::"). */
+  private setName(qn: string, id: string): void {
+    if (!this.qnOrder.has(qn)) {
+      this.qnOrder.set(qn, this.qnOrder.size);
+      for (let i = qn.indexOf('.'); i >= 0; i = qn.indexOf('.', i + 1)) {
+        const t = qn.substring(i + 1);
+        const arr = this.dotTails.get(t);
+        if (arr) arr.push(qn); else this.dotTails.set(t, [qn]);
+      }
+      for (let i = qn.indexOf('::'); i >= 0; i = qn.indexOf('::', i + 1)) {
+        const t = qn.substring(i + 2);
+        const arr = this.podTails.get(t);
+        if (arr) arr.push(qn); else this.podTails.set(t, [qn]);
+      }
+    }
+    this.nodeByQualifiedName.set(qn, id);
+  }
+
+  /** Id of the earliest-inserted qualified name among the candidates. */
+  private firstOf(qns: string[]): string | undefined {
+    let best: string | undefined;
+    let bestOrder = Infinity;
+    for (const qn of qns) {
+      const o = this.qnOrder.get(qn) ?? Infinity;
+      if (o < bestOrder) { bestOrder = o; best = qn; }
+    }
+    return best === undefined ? undefined : this.nodeByQualifiedName.get(best);
   }
 
   // ============================================
@@ -714,6 +766,7 @@ const BATCH_UNWIND_SIZE = 200;
 const CHECKPOINT_EVERY = 25;
 
 export async function checkpointQuietly(projectId: number): Promise<void> {
+  if (!projectHasWal(projectId)) return;
   try {
     await ladybugExecute(projectId, 'CHECKPOINT;');
   } catch (err) {
@@ -961,6 +1014,14 @@ export async function createEdgesFromBatch(
         retriedAfterCheckpoint = true;
         await checkpointQuietly(projectId);
         i -= BATCH_UNWIND_SIZE;
+        continue;
+      }
+      // Still full after a checkpoint: per-row writes would fail the same way,
+      // one slow query at a time. Skip the batch; the rest may still fit.
+      if (/buffer pool is full|unable to allocate memory/.test(msg)) {
+        logger.warn(`[LadybugDB] project ${projectId}: buffer pool still full after checkpoint — skipping ${batch.length} edges`);
+        retriedAfterCheckpoint = false;
+        await yieldToEventLoop();
         continue;
       }
       // Fall back to per-row so bad rows don't poison the chunk.

@@ -1,0 +1,87 @@
+# Fantom MCP + NetBird + HTTPS (Caddy). fileSystemSideCar Phase 8.
+#   FANTOM_API_TOKEN=... FANTOM_HOOK_TOKEN=... \
+#     docker compose -f deploy/docker-compose.yml up -d --build
+# The sidecar-receiver writes /mirror on the host (MIRROR_DIR) and POSTs to
+# http://fantom:3848/admin/indexing/report on the "fantom" network.
+services:
+  fantom:
+    build: ..
+    restart: unless-stopped
+    environment:
+      FANTOM_API_TOKEN: ${FANTOM_API_TOKEN:-}
+      FANTOM_HOOK_TOKEN: ${FANTOM_HOOK_TOKEN:?set FANTOM_HOOK_TOKEN}
+      FANTOM_MIRROR_ROOT: /mirror
+      FANTOM_MIRROR_PROJECTS: ${FANTOM_MIRROR_PROJECTS:-auto}
+      # Workflows (editable) live on the cache volume.
+      FANTOM_WORKFLOWS_DIR: /app/.cache/workflows
+      # Axon: synced SkySpark projects (read-only) and the Axon MCP server.
+      AXON_PROJECT_PATH: /axon/proj
+      AXON_MCP_URL: ${AXON_MCP_URL:-http://host.docker.internal:3847/mcp}
+    volumes:
+      - fantom-cache:/app/.cache
+      - fantom-models:/app/.cache/models
+      - ${MIRROR_DIR:-/srv/mirror}:/mirror:ro
+      # Axon proj/ folder (Windows host example: C:\sidecar-deploy\axon\data\mirror\proj).
+      - ${AXON_PROJ_DIR:-/srv/axon/proj}:/axon/proj:ro
+      # Shared with the netbird service: the admin page writes config.json here.
+      - netbird-ctl:/netbird-ctl
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "3848"
+    networks: [fantom]
+
+  # NetBird sidecar: joins the NetBird network as {hostname}.<your NetBird domain>.
+  # Paste the setup key on Settings > NetBird (/dashboard/config/#netbird). It shares the fantom network
+  # namespace, so the NetBird IP reaches port 3848 directly.
+  # The app, netbird and caddy share one network: restart them together
+  #   docker compose up -d --force-recreate fantom fantom-netbird fantom-caddy
+  # If only the app restarts, the sidecars see their network go away, exit,
+  # and Docker restarts them in the new one.
+  fantom-netbird:
+    image: netbirdio/netbird:latest
+    restart: unless-stopped
+    network_mode: "service:fantom"
+    cap_add: [NET_ADMIN, SYS_ADMIN, SYS_RESOURCE]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    entrypoint: ["/bin/bash", "/netbird-entrypoint.sh"]
+    environment:
+      NETBIRD_CTL_DIR: /netbird-ctl
+    volumes:
+      - ../docker/netbird-entrypoint.sh:/netbird-entrypoint.sh:ro
+      - netbird-ctl:/netbird-ctl
+      - netbird-state:/var/lib/netbird
+    depends_on: [fantom]
+
+  # HTTPS sidecar: https://{hostname}.{domain} (for example fantom.example.com) on
+  # the NetBird IP, certificate from Let's Encrypt via Cloudflare DNS.
+  # Turn it on and paste the Cloudflare token on Settings > NetBird (/dashboard/config/#netbird).
+  # Image: docker build -f docker/caddy.Dockerfile -t sidecar-caddy:latest docker
+  fantom-caddy:
+    image: sidecar-caddy:latest
+    build:
+      context: ../docker
+      dockerfile: caddy.Dockerfile
+    restart: unless-stopped
+    network_mode: "service:fantom"
+    entrypoint: ["/bin/sh", "/caddy-entrypoint.sh"]
+    environment:
+      NETBIRD_CTL_DIR: /netbird-ctl
+      CADDY_UPSTREAM: 127.0.0.1:3848
+    volumes:
+      - ../docker/caddy-entrypoint.sh:/caddy-entrypoint.sh:ro
+      - netbird-ctl:/netbird-ctl
+      - caddy-data:/data
+    depends_on: [fantom]
+
+volumes:
+  fantom-cache:
+  fantom-models:
+  netbird-ctl:
+  netbird-state:
+  caddy-data:
+
+networks:
+  fantom:
+    name: fantom

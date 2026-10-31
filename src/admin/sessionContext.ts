@@ -42,6 +42,13 @@ export interface SessionContextProject {
   indexMode: string;
   functionCount: number;
   typeCount: number;
+  /**
+   * Symbols and files from indexed_files (sum of per-file symbol counts).
+   * functionCount/typeCount can lag or be overwritten by a partial run; this
+   * total is the one the hook shows when it is larger. 0 when unknown.
+   */
+  symbolCount: number;
+  fileCount: number;
   lastIndexed: string | null;
   lastRun: SessionContextRun | null;
   /** Files of this project in the focus set (recently read/edited by AIs). */
@@ -117,6 +124,17 @@ export async function buildSessionContext(a: SessionContextArgs): Promise<Sessio
     if (a.focusCount) {
       try { focusFiles = await a.focusCount(hit.id); } catch { focusFiles = 0; }
     }
+    let symbolCount = 0;
+    let fileCount = 0;
+    try {
+      const agg = await (a.prisma as any).indexedFile.aggregate({
+        where: { projectId: hit.id },
+        _sum: { symbolCount: true },
+        _count: { _all: true },
+      });
+      symbolCount = Number(agg?._sum?.symbolCount ?? 0);
+      fileCount = Number(agg?._count?._all ?? 0);
+    } catch { /* older schema or test double: keep 0 */ }
     const vg = versionGroupForProject({ name: hit.name, path: hit.path, instance: hit.instance });
     project = {
       id: hit.id,
@@ -130,6 +148,8 @@ export async function buildSessionContext(a: SessionContextArgs): Promise<Sessio
       indexMode: hit.indexMode,
       functionCount: hit.functionCount,
       typeCount: hit.typeCount,
+      symbolCount,
+      fileCount,
       lastIndexed: iso(hit.lastIndexed),
       lastRun: run
         ? {

@@ -92,9 +92,16 @@ claude plugin update fantom-mcp@project-sandstar-mcp
 claude plugin update axon-mcp@project-sandstar-mcp
 ```
 
-Then start a new session, or run `/reload-plugins`. A local checkout install
-(`fantom-mcp@fantom-mcp`) needs no update: it reads `claudePlugin/dist` in
-place.
+Then start a new session, or run `/reload-plugins`.
+
+The plugin ID depends on where you installed it from. `claude plugin list`
+shows it. Use that exact ID: a wrong one fails with `Plugin "fantom-mcp" not
+found`.
+
+| Installed from | Plugin ID | Update |
+|---|---|---|
+| Project Sandstar MCP marketplace | `fantom-mcp@project-sandstar-mcp` | the commands above |
+| Local checkout (`npm run plugin:install`) | `fantom-mcp@fantom-mcp` | edits: `npm run plugin:build`, then `/reload-plugins`. After a version bump also `claude plugin update fantom-mcp@fantom-mcp` and restart |
 
 ### As a maintainer: ship a change
 

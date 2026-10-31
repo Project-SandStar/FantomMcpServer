@@ -4,6 +4,7 @@ import { useEffect, useMemo, useCallback, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api, BackupInfo, GraphNodeSearchResult } from '@/lib/api';
 import { SearchableComboBox, ComboBoxOption } from '@/components/ui/SearchableComboBox';
+import { FolderPickerModal } from '@/components/ui/FolderPicker';
 
 interface SchemaProperty {
   type: string;
@@ -228,6 +229,8 @@ export function ParameterForm({ schema, values, onChange, onSubmit, projectId }:
 
   // State to trigger re-render when path options change
   const [pathOptionsKey, setPathOptionsKey] = useState(0);
+  // Param key whose server folder picker is open (null = closed).
+  const [pickerKey, setPickerKey] = useState<string | null>(null);
 
   // Check if we have any type/function name parameters that need the graph nodes lookup
   const hasTypeOrFunctionParams = useMemo(() => {
@@ -499,17 +502,25 @@ export function ParameterForm({ schema, values, onChange, onSubmit, projectId }:
                 emptyOptionsMessage="No users available"
               />
             ) : isPathParameter(key, prop.type) ? (
-              /* Path parameter combo box with free text */
-              <SearchableComboBox
-                options={pathOptions}
-                value={(value as string) || null}
-                onChange={(newValue) => handlePathChange(key, newValue)}
-                placeholder="Enter or select a path..."
-                searchPlaceholder="Type a path or search..."
-                allowFreeText={true}
-                emptySearchMessage="Type a path or select from suggestions"
-                emptyOptionsMessage="Type a custom path"
-              />
+              /* Path parameter combo box with free text + server folder picker */
+              <div className="flex gap-2 items-start">
+                <div className="flex-1 min-w-0">
+                  <SearchableComboBox
+                    options={pathOptions}
+                    value={(value as string) || null}
+                    onChange={(newValue) => handlePathChange(key, newValue)}
+                    placeholder="Enter or select a path..."
+                    searchPlaceholder="Type a path or search..."
+                    allowFreeText={true}
+                    emptySearchMessage="Type a path or select from suggestions"
+                    emptyOptionsMessage="Type a custom path"
+                  />
+                </div>
+                <button type="button" onClick={() => setPickerKey(key)}
+                  className="px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-50 whitespace-nowrap">
+                  Browse…
+                </button>
+              </div>
             ) : isNodeIdParam(key) && prop.type === 'string' ? (
               /* Node ID (UUID) combo box with searchable dropdown */
               <SearchableComboBox
@@ -638,6 +649,10 @@ export function ParameterForm({ schema, values, onChange, onSubmit, projectId }:
           </div>
         );
       })}
+      <FolderPickerModal open={pickerKey !== null}
+        initialPath={pickerKey ? String(values[pickerKey] ?? '') : undefined}
+        onClose={() => setPickerKey(null)}
+        onSelect={(p) => { if (pickerKey) handlePathChange(pickerKey, p); setPickerKey(null); }} />
     </div>
   );
 }

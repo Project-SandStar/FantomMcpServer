@@ -757,15 +757,32 @@ export class LadybugQueryManager {
     documentation: string | null;
   } | null> {
     const projectFilter = projectId ? `, project_id: ${projectId}` : '';
-    const rows = await this.q<{
+    type Row = {
       id: string; name: string; qn: string; nt: string;
       fp: string; ls: number; sig: string; doc: string;
-    }>(
-      `MATCH (n:CodeNode {qualified_name: '${esc(qualifiedName)}'${projectFilter}})
-       RETURN n.id AS id, n.name AS name, n.qualified_name AS qn, n.node_type AS nt,
-              n.file_path AS fp, n.line_start AS ls, n.signature AS sig, n.documentation AS doc
-       LIMIT 1`
+    };
+    const ret = `RETURN n.id AS id, n.name AS name, n.qualified_name AS qn, n.node_type AS nt,
+              n.file_path AS fp, n.line_start AS ls, n.signature AS sig, n.documentation AS doc`;
+    const qn = esc(qualifiedName);
+    let rows = await this.q<Row>(
+      `MATCH (n:CodeNode {qualified_name: '${qn}'${projectFilter}}) ${ret} LIMIT 1`
     );
+    // Fallbacks for names without the project/pod prefix (TS/JS/Vue nodes are
+    // stored as "<project>::fn" or "<project>::Class.method"). Only a unique
+    // match counts, so an ambiguous short name never picks the wrong node.
+    if (rows.length === 0) {
+      rows = await this.q<Row>(
+        `MATCH (n:CodeNode${projectId ? ` {project_id: ${projectId}}` : ''})
+         WHERE n.qualified_name ENDS WITH '::${qn}' OR n.qualified_name ENDS WITH '.${qn}'
+         ${ret} LIMIT 2`
+      );
+      if (rows.length !== 1 && !qualifiedName.includes('.') && !qualifiedName.includes('::')) {
+        rows = await this.q<Row>(
+          `MATCH (n:CodeNode {name: '${qn}'${projectFilter}}) ${ret} LIMIT 2`
+        );
+      }
+      if (rows.length !== 1) return null;
+    }
     if (rows.length === 0) return null;
     const r = rows[0];
     return {

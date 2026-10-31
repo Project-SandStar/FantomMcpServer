@@ -44,6 +44,7 @@ ROOT="$(pwd)"
 # Internal engineering notes: real hostnames, addresses and incident detail.
 # Keep this list in sync with what a fresh audit finds (see AUDIT below).
 EXCLUDE_PATHS=(
+  "docs/plans"
   "docs/reports"
   "docs/tasks"
   "docs/sidecar-interop-findings-2026-09-13.md"

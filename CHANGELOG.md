@@ -3,6 +3,54 @@
 All notable changes to FantomMcpServer. Public releases are snapshots; see
 `scripts/release-public.sh`.
 
+## 1.1.5 — unreleased
+
+### Workflows come from the server
+- **New tools.** `listWorkflows({scope?, projectId?, query?})` lists the
+  workflows the caller may see (global, instance, project, personal).
+  `getWorkflow({name, section?, maxChars?})` returns one workflow, or one
+  section, plus its headings. Same access rules as `workflow://` resources.
+- **Plugin.** The `wf-*` skills no longer copy the workflow text. Each one
+  tells Claude to call `getWorkflow` on the server, so dashboard edits and
+  project workflows reach Claude. Hooks and the `fantom-mcp` skill say:
+  never read local workflow files.
+
+### No built-in server names
+- **Axon GitLab library.** The GitLab URL and repository have no default.
+  Set them on the Axon page, or with `AXON_GITLAB_URL` / `AXON_GITLAB_REPO`.
+- **NetBird.** The management URL default is the NetBird cloud
+  (`https://api.netbird.io:443`); `NETBIRD_MANAGEMENT_URL` changes it. The
+  HTTPS domain has no default; `NETBIRD_HTTPS_DOMAIN` sets one. HTTPS needs a
+  domain before you can turn it on. Saved settings are not changed.
+
+## 1.1.3 — 2026-10-27
+
+### Agents use Fantom MCP first
+- **Server instructions.** Every MCP client gets short routing text at
+  connect time: search the index before grep.
+- **Plugin.** The session-start message shows the real index size and
+  health. A new `search-hint` hook adds a one-line tip when grep, rg or
+  find runs in a registered project.
+
+### Call graph
+- **Short names.** `getCallers` and `getCodeImpact` accept a short name
+  (`balanceCheck`), not only the full qualified name.
+- **Same-name functions.** Two functions with the same name in different
+  files (e.g. `parse` in each statement parser) both stay in the graph.
+  Before, the second was dropped with all its call links.
+- **No false "degraded".** A CHECKPOINT with no WAL on disk is skipped,
+  and its "Error renaming file <id>.db.wal" no longer marks the project
+  degraded. It had blocked every edge write of a rebuild.
+
+### Index counts and search
+- **Whole-project counts.** An incremental run and `rebuild-graph` store
+  the project's full function and type counts, not only the parsed
+  files'. Files a run did not parse keep their per-file symbol counts.
+- **Name search after a graph rebuild.** `rebuild-graph` reloads the
+  in-memory index, so new and renamed symbols are searchable.
+- **Health check.** `missingFromSearch` compares functions with
+  functions; it counted every type as missing.
+
 ## 1.1.2 — 2026-10-19
 
 ### Claude Code plugin

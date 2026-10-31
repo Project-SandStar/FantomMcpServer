@@ -10,6 +10,9 @@ import { SidecarEmbeddingPicker } from '@/components/config/SidecarEmbeddingPick
 import { AdvancedSearchPanel } from '@/components/config/AdvancedSearchPanel';
 import { RunFromSidecarToggle } from '@/components/config/RunFromSidecarToggle';
 import { DebugLogPanel } from '@/components/config/DebugLogPanel';
+import { NetbirdPanel } from '@/components/config/NetbirdPanel';
+import { PathMappingsPanel } from '@/components/config/PathMappingsPanel';
+import { PathInput } from '@/components/ui/FolderPicker';
 
 function formatBytes(bytes: number): string {
   const units = ['B', 'KB', 'MB', 'GB'];
@@ -40,7 +43,8 @@ type SettingsGroup =
   | 'fantom-source'
   | 'code-index'
   | 'usage-db'
-  | 'debug';
+  | 'debug'
+  | 'netbird';
 
 const GROUPS: { id: SettingsGroup; label: string; icon: string }[] = [
   { id: 'connection', label: 'Connection', icon: '🔗' },
@@ -57,6 +61,7 @@ const GROUPS: { id: SettingsGroup; label: string; icon: string }[] = [
   { id: 'code-index', label: 'Code Index', icon: '🗂' },
   { id: 'usage-db', label: 'Usage Database', icon: '📊' },
   { id: 'debug', label: 'Debug', icon: '🐛' },
+  { id: 'netbird', label: 'NetBird', icon: '🌐' },
 ];
 
 // ─── Documentation Content ──────────────────────────────────────────────
@@ -325,6 +330,17 @@ const DOCS: Record<SettingsGroup, { title: string; content: React.ReactNode }> =
         <p>Live tail of the on-disk server log at <code className="bg-gray-100 px-1 rounded">logs/_crash.log</code> (per-segment files appear under the same <code className="bg-gray-100 px-1 rounded">logs/</code> directory when their tag is enabled).</p>
         <p>When debug is enabled, the viewer streams new lines as they appear and you can filter them with the search box.</p>
         <p>Use the Download button to grab the full log file as text — useful for sharing crash traces.</p>
+      </div>
+    ),
+  },
+  netbird: {
+    title: 'NetBird and HTTPS',
+    content: (
+      <div className="space-y-3 text-sm text-gray-600">
+        <p>Joins this server to the NetBird network as <code className="bg-gray-100 px-1 rounded">&lt;hostname&gt;</code>. Paste a setup key from the NetBird admin (Setup Keys), turn NetBird on and Save.</p>
+        <p><b>HTTPS</b> serves the server as <code className="bg-gray-100 px-1 rounded">https://&lt;hostname&gt;.&lt;domain&gt;</code> on the NetBird IP. Paste a Cloudflare API token (template &quot;Edit zone DNS&quot;, your domain&apos;s zone only). Without a token the Caddy container waits.</p>
+        <p><b>Advanced:</b> WireGuard port, 0 = NetBird picks a free port.</p>
+        <p>The page shows only the last 4 characters of the key and the token.</p>
       </div>
     ),
   },
@@ -1278,8 +1294,9 @@ export default function ConfigPage() {
             <div>
               <label className={labelClass}>Source Folder Path</label>
               <div className="flex gap-2">
-                <input type="text" value={fantomFolderInput} onChange={(e) => setFantomFolderInput(e.target.value)}
-                  placeholder="~/fantom" className={`flex-1 font-mono ${inputClass}`} />
+                <PathInput value={fantomFolderInput} onChange={setFantomFolderInput} className="flex-1"
+                  placeholder="/mirror/mac-alper/fantom" inputClassName={`flex-1 min-w-0 font-mono ${inputClass}`}
+                  pickerTitle="Choose the Fantom source folder" />
                 <button onClick={() => { if (fantomFolderInput.trim()) setFantomFolderMutation.mutate(fantomFolderInput.trim()); }}
                   disabled={setFantomFolderMutation.isPending || !fantomFolderInput.trim() || fantomFolderInput === fantomSourceFolder}
                   className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm">
@@ -1302,6 +1319,7 @@ export default function ConfigPage() {
             {fantomVersionsData?.message && !fantomVersionsData.versions?.length && (
               <p className="text-sm text-gray-500 italic">{fantomVersionsData.message}</p>
             )}
+            <PathMappingsPanel />
           </div>
         );
 
@@ -1462,6 +1480,9 @@ export default function ConfigPage() {
             onChange={(next) => setFormData({ ...formData, debug: next })}
           />
         );
+
+      case 'netbird':
+        return <NetbirdPanel />;
     }
   }
 

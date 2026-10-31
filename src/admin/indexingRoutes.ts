@@ -41,6 +41,8 @@ export interface IndexingRouteOptions {
   scheduler?: () => Pick<LazyIndexScheduler, 'enqueueRekey' | 'prismaClient'> | null;
   /** Prisma client for the context route (tests); default the shared client. */
   prisma?: () => PrismaClient;
+  /** Mirror root for receiver bodies (tests); default FANTOM_MIRROR_ROOT or /mirror. */
+  mirrorRoot?: () => string;
 }
 
 function isObj(v: unknown): v is Record<string, any> {
@@ -84,6 +86,15 @@ export function createReportToken(configPath = runtimeConfigPath()): { token: st
 
 function errMsg(err: unknown): string { return err instanceof Error ? err.message : String(err); }
 
+/** Env token for the hook (sidecar-receiver, containers); also accepted next to the config token. */
+export const HOOK_TOKEN_ENV = 'FANTOM_HOOK_TOKEN';
+
+function hookTokenOk(presented: unknown, configPath: string): boolean {
+  const envToken = process.env[HOOK_TOKEN_ENV]?.trim();
+  if (envToken && verifyReportToken(presented, hashReportToken(envToken))) return true;
+  return verifyReportToken(presented, readReportTokenHash(configPath));
+}
+
 /**
  * POST /indexing/report. Register BEFORE the Basic Auth middleware; the
  * handler answers every request itself.
@@ -92,13 +103,24 @@ export function registerIndexingHookRoute(router: Router, opts: IndexingRouteOpt
   const cfgPath = opts.configPath ?? runtimeConfigPath;
   router.post('/indexing/report', async (req: Request, res: Response) => {
     try {
-      if (!verifyReportToken(req.get(HOOK_TOKEN_HEADER), readReportTokenHash(cfgPath()))) {
+      if (!hookTokenOk(req.get(HOOK_TOKEN_HEADER), cfgPath())) {
         return res.status(401).json({ error: 'Invalid or missing report token' });
       }
       const b = isObj(req.body) ? req.body : {};
+      const { reportChanges } = await import('../indexing/focusTools.js');
+      // sidecar-receiver body (fileSystemSideCar docs/receiver.md):
+      // {"sidecar","root","paths":[rel,...]} relative to {mirror}/{sidecar}/{root}.
+      if (Array.isArray(b.paths) && (b.sidecar !== undefined || b.root !== undefined)) {
+        const { mirrorPaths, mirrorRoot } = await import('../indexing/mirror.js');
+        const m = mirrorPaths(opts.mirrorRoot?.() ?? mirrorRoot(), b.sidecar, b.root, b.paths);
+        if (m.files.length === 0) {
+          return res.status(202).json({ projectId: null, queued: 0, taskId: null, unknownFiles: m.rejected });
+        }
+        const result = await reportChanges({ files: m.files, client: 'sidecar-receiver', intent: `sidecar ${b.sidecar}/${b.root}` });
+        return res.status(202).json({ ...result, unknownFiles: [...m.rejected, ...result.unknownFiles] });
+      }
       const files = Array.isArray(b.files) ? b.files : typeof b.file === 'string' ? [b.file] : [];
       if (files.length === 0) return res.status(400).json({ error: 'files must be a non-empty array' });
-      const { reportChanges } = await import('../indexing/focusTools.js');
       const result = await reportChanges({
         files, cwd: b.cwd, sessionId: b.sessionId, client: b.client, intent: b.intent,
         projectId: b.projectId, projectPath: b.projectPath,
@@ -114,7 +136,7 @@ export function registerIndexingHookRoute(router: Router, opts: IndexingRouteOpt
   // Claude Code plugin. Same token as the report route; answers itself.
   router.get('/indexing/context', async (req: Request, res: Response) => {
     try {
-      if (!verifyReportToken(req.get(HOOK_TOKEN_HEADER), readReportTokenHash(cfgPath()))) {
+      if (!hookTokenOk(req.get(HOOK_TOKEN_HEADER), cfgPath())) {
         return res.status(401).json({ error: 'Invalid or missing report token' });
       }
       const cwd = typeof req.query.cwd === 'string' ? req.query.cwd.trim() : '';

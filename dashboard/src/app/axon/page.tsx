@@ -24,6 +24,7 @@ import {
   type AxonRecordSource,
   type AxonFunctionRow,
 } from '@/lib/api';
+import { PathInput } from '@/components/ui/FolderPicker';
 
 const T = {
   bg: 'bg-[#0b0f14]',
@@ -296,6 +297,51 @@ function SourceSection({ title, dir, totals, onIndexSource, ...list }: SectionPr
   );
 }
 
+// ── GitLab library card ─────────────────────────────────────────────────────
+
+function GitlabCard({ T, flash }: { T: Record<string, string>; flash: (k: 'ok' | 'err', t: string) => void }) {
+  const qc = useQueryClient();
+  const g = useQuery({ queryKey: ['axon-gitlab'], queryFn: api.getAxonGitlab, refetchInterval: 15000 });
+  const [f, setF] = useState<{ enabled: boolean; baseUrl: string; repo: string; ref: string; subPath: string; refreshMinutes: number } | null>(null);
+  const [token, setToken] = useState('');
+  useEffect(() => { if (g.data && !f) setF({ enabled: g.data.enabled, baseUrl: g.data.baseUrl, repo: g.data.repo, ref: g.data.ref, subPath: g.data.subPath, refreshMinutes: g.data.refreshMinutes }); }, [g.data, f]);
+  const refresh = () => { qc.invalidateQueries({ queryKey: ['axon-gitlab'] }); qc.invalidateQueries({ queryKey: ['axon-status'] }); };
+  const save = useMutation({ mutationFn: () => api.saveAxonGitlab({ ...f!, ...(token.trim() ? { token: token.trim() } : {}) }), onSuccess: () => { setToken(''); flash('ok', 'GitLab settings saved'); refresh(); }, onError: e => flash('err', e instanceof Error ? e.message : 'save failed') });
+  const clear = useMutation({ mutationFn: () => api.saveAxonGitlab({ token: null }), onSuccess: () => { flash('ok', 'token removed'); refresh(); } });
+  const test = useMutation({ mutationFn: api.testAxonGitlab, onSuccess: r => flash(r.ok ? 'ok' : 'err', r.ok ? `GitLab ok: ${r.name} (default branch ${r.defaultBranch})` : `GitLab: ${r.error}`) });
+  const pull = useMutation({ mutationFn: api.pullAxonGitlab, onSuccess: r => { flash(r.success ? 'ok' : 'err', r.success ? `fetched ${r.sha?.slice(0, 8)}${r.changed ? ' (new: library index queued)' : ' (no change)'}` : `fetch failed: ${r.error}`); refresh(); }, onError: e => { flash('err', e instanceof Error ? e.message : 'fetch failed'); refresh(); } });
+  const d = g.data;
+  if (!f || !d) return null;
+  const inp = `px-2 py-1 text-xs ${T.mono} ${T.input}`;
+  return (
+    <div className="border border-[#1f2a36] p-3 space-y-2">
+      <div className={`${T.mono} text-xs ${T.dim}`}>library source · GitLab (axon.gitlab)</div>
+      <label className={`${T.mono} text-xs flex items-center gap-2`}><input type="checkbox" checked={f.enabled} onChange={e => setF({ ...f, enabled: e.target.checked })} /> use the GitLab repository as the library</label>
+      <div className="grid grid-cols-2 gap-2">
+        <input className={inp} value={f.baseUrl} onChange={e => setF({ ...f, baseUrl: e.target.value })} placeholder="https://gitlab.example.com" />
+        <input className={inp} value={f.repo} onChange={e => setF({ ...f, repo: e.target.value })} placeholder="group/project" />
+        <input className={inp} value={f.ref} onChange={e => setF({ ...f, ref: e.target.value })} placeholder="branch (empty = default)" />
+        <input className={inp} value={f.subPath} onChange={e => setF({ ...f, subPath: e.target.value })} placeholder="sub-folder (empty = root)" />
+        <label className={`${T.mono} text-xs ${T.dim}`}>refresh every <input className={`${inp} w-16`} type="number" min={0} value={f.refreshMinutes} onChange={e => setF({ ...f, refreshMinutes: Number(e.target.value) })} /> min (0 = off)</label>
+        <input className={inp} type="password" autoComplete="off" value={token} onChange={e => setToken(e.target.value)}
+          placeholder={d.hasToken ? `token ••••${d.tokenLast4} (paste to replace)` : 'no token: paste a GitLab access token (read_repository)'} />
+      </div>
+      <div className={`${T.mono} text-xs ${T.dim}`}>
+        token: {d.hasToken ? <span className={T.accent}>••••{d.tokenLast4}{d.sources.token === 'env' ? ' (environment)' : ''}</span> : <span className={T.warn}>no token</span>}
+        {' · '}last fetch: {d.state.lastPullAt ? `${new Date(d.state.lastPullAt).toLocaleString()} (${d.state.lastResult})` : 'never'}
+        {d.state.lastSha && <> · sha {d.state.lastSha.slice(0, 8)}</>}
+      </div>
+      {d.state.lastError && <div className={`${T.mono} text-xs ${T.err}`}>! {d.state.lastError}</div>}
+      <div className="flex gap-2">
+        <button className={`px-3 py-1 text-xs ${T.mono} ${T.btnPrimary}`} disabled={save.isPending} onClick={() => save.mutate()}>{save.isPending ? 'saving…' : 'save GitLab'}</button>
+        <button className={`px-3 py-1 text-xs ${T.mono} ${T.btn}`} disabled={test.isPending || !d.hasToken} onClick={() => test.mutate()}>{test.isPending ? 'testing…' : 'test'}</button>
+        <button className={`px-3 py-1 text-xs ${T.mono} ${T.btn}`} disabled={pull.isPending || !d.hasToken} onClick={() => pull.mutate()}>{pull.isPending ? 'fetching…' : 'fetch now'}</button>
+        {d.hasToken && d.sources.token !== 'env' && <button className={`px-3 py-1 text-xs ${T.mono} ${T.btn}`} onClick={() => clear.mutate()}>remove token</button>}
+      </div>
+    </div>
+  );
+}
+
 // ── Page ────────────────────────────────────────────────────────────────────
 
 export default function AxonPage() {
@@ -315,6 +361,17 @@ export default function AxonPage() {
   useEffect(() => {
     if (status.data && !form) setForm(status.data.settings);
   }, [status.data, form]);
+  // Validate the current paths once on load, so the page shows what Fantom sees.
+  const [validatedOnLoad, setValidatedOnLoad] = useState(false);
+  useEffect(() => {
+    if (!status.data || validatedOnLoad) return;
+    setValidatedOnLoad(true);
+    const st = status.data.settings;
+    if (st.projectPath) api.axonValidate(st.projectPath).then(setValidation).catch(() => {});
+    if (st.libraryPath) api.axonValidateLibrary(st.libraryPath).then(setLibValidation).catch(() => {});
+  }, [status.data, validatedOnLoad]);
+  const src = status.data?.sources;
+  const srcNote = (k: 'projectPath' | 'libraryPath') => src?.[k] === 'env' ? 'set by environment' : src?.[k] === 'gitlab' ? 'from GitLab clone' : src?.[k] === 'saved' ? 'saved setting' : 'not set';
 
   const flash = (kind: 'ok' | 'err', text: string) => {
     setMsg({ kind, text });
@@ -456,16 +513,15 @@ export default function AxonPage() {
           {form ? (
             <div className="p-4 space-y-4">
               <div>
-                <label className={`${T.mono} text-xs ${T.dim}`}>projectPath <span className="opacity-60">(Axon MCP server checkout; proj/ is read from here)</span></label>
+                <label className={`${T.mono} text-xs ${T.dim}`}>Axon project folder <span className="opacity-60">(contains proj/, or is proj/) · {srcNote('projectPath')}</span></label>
                 <div className="flex gap-2 mt-1">
-                  <input className={`flex-1 px-3 py-2 text-sm ${T.mono} ${T.input}`} value={form.projectPath} onChange={e => setForm({ ...form, projectPath: e.target.value })} spellCheck={false} />
+                  <PathInput className="flex-1" inputClassName={`flex-1 min-w-0 px-3 py-2 text-sm ${T.mono} ${T.input}`} buttonClassName={`px-3 py-2 text-xs ${T.mono} ${T.btn}`} value={form.projectPath} readOnly={src?.projectPath === 'env'} onChange={v => setForm({ ...form, projectPath: v })} pickerTitle="Choose the Axon project folder (proj/ or its parent)" />
                   <button className={`px-3 py-2 text-xs ${T.mono} ${T.btn}`} onClick={() => validate.mutate(form.projectPath)} disabled={validate.isPending}>{validate.isPending ? 'validating…' : 'validate path'}</button>
                 </div>
                 {validation && (
                   <div className={`mt-2 p-3 ${T.mono} text-xs border ${validation.problems.length ? 'border-[#ffcc66]' : 'border-[#5ee1a2]'} bg-[#0b0f14] space-y-1`}>
                     <div>
-                      <span className={T.dim}>package.json</span> {validation.packageJson ? <span className={T.accent}>ok</span> : <span className={T.err}>missing</span>}
-                      <span className={`${T.dim} ml-3`}>dist/index.js</span> {validation.serverEntry ? <span className={T.accent}>ok</span> : <span className={T.err}>missing</span>}
+                      <span className={T.dim}>layout</span> <span className={T.accent}>{validation.layout === 'is-proj' ? 'folder is proj/' : validation.layout === 'contains-proj' ? 'contains proj/' : 'no proj/'}</span>
                       <span className={`${T.dim} ml-3`}>proj/</span> {validation.projExists ? <span className={T.accent}>{validation.projects.length} projects · {validation.totalFunctions} functions</span> : <span className={T.err}>missing</span>}
                     </div>
                     {validation.instances.length > 0 && <div><span className={T.dim}>instances:</span> {validation.instances.join(', ')}</div>}
@@ -474,10 +530,24 @@ export default function AxonPage() {
                 )}
               </div>
 
+              {src?.libraryPath === 'gitlab' ? (
               <div>
-                <label className={`${T.mono} text-xs ${T.dim}`}>libraryPath <span className="opacity-60">(offline Axon library: one folder per former project)</span></label>
+                <label className={`${T.mono} text-xs ${T.dim}`}>Axon library <span className="opacity-60">· from GitLab clone (local folder not used)</span></label>
+                <div className={`mt-1 p-3 ${T.mono} text-xs border border-[#5ee1a2] bg-[#0b0f14] space-y-1`}>
+                  <div><span className={T.dim}>clone</span> <span className={T.accent}>{s?.settings.libraryPath}</span></div>
+                  <div>
+                    <span className={T.dim}>last fetch</span>{' '}
+                    {s?.gitlab?.state.lastPullAt ? `${new Date(s.gitlab.state.lastPullAt).toLocaleString()} (${s.gitlab.state.lastResult})` : 'never'}
+                    {s?.gitlab?.state.lastSha && <> · sha {s.gitlab.state.lastSha.slice(0, 8)}</>}
+                  </div>
+                  {libValidation && <div><span className={T.dim}>detected</span> <span className={T.accent}>{libValidation.folders.length} folders · {libValidation.totalFunctions} functions</span></div>}
+                </div>
+              </div>
+              ) : (
+              <div>
+                <label className={`${T.mono} text-xs ${T.dim}`}>Axon library folder <span className="opacity-60">(one folder per former project) · {srcNote('libraryPath')}</span></label>
                 <div className="flex gap-2 mt-1">
-                  <input className={`flex-1 px-3 py-2 text-sm ${T.mono} ${T.input}`} value={form.libraryPath} onChange={e => setForm({ ...form, libraryPath: e.target.value })} spellCheck={false} />
+                  <PathInput className="flex-1" inputClassName={`flex-1 min-w-0 px-3 py-2 text-sm ${T.mono} ${T.input}`} buttonClassName={`px-3 py-2 text-xs ${T.mono} ${T.btn}`} value={form.libraryPath} readOnly={src?.libraryPath === 'env'} onChange={v => setForm({ ...form, libraryPath: v })} pickerTitle="Choose the Axon library folder" />
                   <button className={`px-3 py-2 text-xs ${T.mono} ${T.btn}`} onClick={() => validateLib.mutate(form.libraryPath)} disabled={validateLib.isPending}>{validateLib.isPending ? 'validating…' : 'validate path'}</button>
                 </div>
                 {libValidation && (
@@ -490,11 +560,15 @@ export default function AxonPage() {
                   </div>
                 )}
               </div>
+              )}
+
+              {(s?.pathWarnings ?? []).map((w, i) => <div key={i} className={`${T.mono} text-xs ${T.warn}`}>! {w}</div>)}
+              <GitlabCard T={T} flash={flash} />
 
               <Toggle value={form.autoIndex} onChange={v => setForm({ ...form, autoIndex: v })} label="autoIndex" hint="Run an index job at boot once sidecars advertise the code model" />
 
               <div className="flex items-center gap-3 pt-1">
-                <button className={`px-4 py-2 text-xs ${T.mono} ${T.btnPrimary}`} onClick={() => save.mutate({ projectPath: form.projectPath, libraryPath: form.libraryPath, autoIndex: form.autoIndex })} disabled={save.isPending}>{save.isPending ? 'saving…' : 'save'}</button>
+                <button className={`px-4 py-2 text-xs ${T.mono} ${T.btnPrimary}`} onClick={() => save.mutate({ ...(src?.projectPath !== 'env' ? { projectPath: form.projectPath } : {}), ...(src?.libraryPath === 'saved' || src?.libraryPath === 'empty' ? { libraryPath: form.libraryPath } : {}), autoIndex: form.autoIndex })} disabled={save.isPending}>{save.isPending ? 'saving…' : 'save'}</button>
                 <button className={`px-3 py-2 text-xs ${T.mono} ${T.btn}`} onClick={() => { if (s) setForm(s.settings); }}>reset</button>
               </div>
             </div>

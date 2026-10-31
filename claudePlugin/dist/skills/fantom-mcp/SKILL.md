@@ -33,6 +33,7 @@ ToolSearch("fantom", 30)
 | Move SkySpark 3.x code to 4.0 | `searchVersionedApi`, `migrateSkySpark4x` | Then the `/fantom-mcp:wf-skyspark-4x-migration` workflow. |
 | Pick the right product line | `listVersionGroups` | `versionGroup: "haxall 4.0.6"` or `"skyspark 3.1"`. |
 | Check or fix the index | `getIndexHealth`, `refreshFantomProject`, `reindexChangedFiles` | |
+| Follow a step-by-step guide (workflow) | `listWorkflows` then `getWorkflow` | `getWorkflow({name, section?})`. Workflows live on the server. |
 | Register this directory | `/fantom-mcp:add-project` | |
 
 Rules:
@@ -47,7 +48,11 @@ Rules:
 - A failing tool with a connection error means the server is down. Run
   `/fantom-mcp:doctor` and tell the user. Do not retry in a loop.
 
-Workflows (full guides, load on demand): `/fantom-mcp:wf-ai-coding-loop`,
+- Workflows live on the server: `listWorkflows`, then `getWorkflow`. Never
+  read local workflow files. If the server does not answer, say the workflow
+  is unavailable; do not guess its steps.
+
+Workflows (each skill calls `getWorkflow` on the server): `/fantom-mcp:wf-ai-coding-loop`,
 `wf-create-pod`, `wf-unit-testing`, `wf-skyspark-4x-migration`,
 `wf-xeto-spec-guide`, `wf-haxall-basics`, `wf-haxall-coding-standards`,
 `wf-haxall-methods-workflow`, `wf-connector-workflow`,

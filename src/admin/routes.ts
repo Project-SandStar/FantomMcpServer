@@ -7,6 +7,10 @@ import { registerAxonRoutes } from './axonRoutes.js';
 import { registerIndexRunRoutes } from './indexRunRoutes.js';
 import { registerIndexingHookRoute, registerIndexingRoutes } from './indexingRoutes.js';
 import { registerWorkflowRoutes } from './workflowRoutes.js';
+import { registerSidecarSyncRoutes } from './sidecarSyncRoutes.js';
+import { registerNetbirdRoutes } from './netbirdRoutes.js';
+import { registerPathMappingRoutes } from './pathMappingRoutes.js';
+import { registerFsBrowseRoutes } from './fsBrowseRoutes.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -325,7 +329,7 @@ function detectLanguagesInDirectory(dirPath: string): LanguageDetectionResult {
  * Detect the primary language of a project directory.
  * Returns language and parserType suitable for project creation.
  */
-function detectProjectLanguage(dirPath: string): { language: string; parserType: string } {
+export function detectProjectLanguage(dirPath: string): { language: string; parserType: string } {
   const result = detectLanguagesInDirectory(dirPath);
   const NON_SOURCE_LANGS = new Set(['json', 'yaml', 'markdown', 'text']);
 
@@ -388,6 +392,8 @@ async function syncProjectLanguage(
  */
 function basicAuthWithUserStore(userStore: UserStore) {
   return (req: Request, res: Response, next: NextFunction) => {
+    // Already authenticated by the FANTOM_API_TOKEN gate (src/auth/apiTokenGate.ts).
+    if (res.locals.apiTokenOk && req.user) return next();
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Basic ')) {
@@ -476,6 +482,14 @@ export function createAdminRouter(context: AdminContext): Router {
   // Apply Basic Auth using UserStore to all admin routes
   router.use(basicAuthWithUserStore(userStore));
   registerIndexingRoutes(router);
+  // Sidecar sync page: /admin/sidecar-sync/* (src/admin/sidecarSyncRoutes.ts)
+  registerSidecarSyncRoutes(router, { userStore });
+  // NetBird page: /admin/netbird/* (src/admin/netbirdRoutes.ts)
+  registerNetbirdRoutes(router);
+  // Path mappings (host prefix → container prefix): /admin/path-mappings
+  registerPathMappingRoutes(router);
+  // Server folder picker: /admin/fs/dirs (src/admin/fsBrowseRoutes.ts)
+  registerFsBrowseRoutes(router);
 
   // Pretty-print JSON for all admin routes
   router.use((_req: Request, res: Response, next: NextFunction) => {
@@ -2550,10 +2564,9 @@ export function createAdminRouter(context: AdminContext): Router {
       const sourceProjects = projects.filter(p => p.path.startsWith(instance.sourcePath!));
 
       // Also discover pods in source directory that might not be indexed yet
-      const srcEntries = fs.readdirSync(instance.sourcePath, { withFileTypes: true });
-      const podDirs = srcEntries
-        .filter(entry => entry.isDirectory())
-        .map(entry => entry.name);
+      // Flat (src/<pod>/fan) and nested Haxall (src/<category>/<pod>/fan).
+      const { discoverSourcePods } = await import('../fantom/sourcePods.js');
+      const candidates = discoverSourcePods(instance.sourcePath);
 
       const pods: Array<{
         name: string;
@@ -2565,14 +2578,9 @@ export function createAdminRouter(context: AdminContext): Router {
         lastIndexed?: string;
       }> = [];
 
-      for (const podName of podDirs) {
-        const podPath = path.join(instance.sourcePath, podName);
-        const fanDir = path.join(podPath, 'fan');
-
-        // Only include directories that have a fan/ subdirectory
-        if (!fs.existsSync(fanDir)) {
-          continue;
-        }
+      for (const cand of candidates) {
+        const podName = cand.name;
+        const podPath = cand.path;
 
         const project = sourceProjects.find(p => normalizePath(p.path) === normalizePath(podPath));
 
@@ -5561,6 +5569,11 @@ export function createAdminRouter(context: AdminContext): Router {
     // Prevent self-deletion
     if (currentUser && currentUser.username === usernameParam.toLowerCase()) {
       res.status(400).json({ error: 'Cannot delete your own account' });
+      return;
+    }
+
+    if (userStore.getUser(usernameParam)?.sidecarSync?.enabled) {
+      res.status(409).json({ error: 'Remove the sidecar sync login of this user first' });
       return;
     }
 
@@ -12706,7 +12719,7 @@ export function createAdminRouter(context: AdminContext): Router {
   registerIndexRunRoutes(router);
 
   // MCP workflow resources: /admin/workflows/* (src/admin/workflowRoutes.ts)
-  registerWorkflowRoutes(router, () => context.getWorkflowManager?.(), requireAdmin);
+  registerWorkflowRoutes(router, () => context.getWorkflowManager?.(), requireAdmin, () => context.getWorkflowAcl?.());
 
   return router;
 }

@@ -71,6 +71,19 @@ interface ApiOptions {
   body?: unknown;
 }
 
+export type ServerDirHint = 'skyspark-home' | 'haxall-home' | 'fantom-home' | 'docs' | 'pod' | 'axon-project' | 'axon-proj';
+export interface ServerDirEntry { name: string; path: string; isDir: true; hint?: ServerDirHint }
+export interface ServerDirListing {
+  path: string;
+  parent: string | null;
+  root: string;
+  roots: string[];
+  hint?: ServerDirHint;
+  entries: ServerDirEntry[];
+  fileCount: number;
+  truncated: boolean;
+}
+
 async function apiRequest<T>(endpoint: string, options: ApiOptions = {}): Promise<T> {
   const { method = 'GET', body } = options;
   const apiBase = getApiBase();
@@ -133,14 +146,55 @@ export interface IndexRunDeletePreview {
   refusal: string | null;
 }
 
+export type WorkflowScope = 'global' | 'instance' | 'project' | 'personal';
+
 export interface WorkflowListItem {
   id: string;
   uri: string;
   title: string;
   description: string;
+  scope: WorkflowScope;
+  scopeId: string;
+  slug: string;
+  builtin: boolean;
+  owner: string;
+  canEdit: boolean;
   mtimeMs: number;
   sizeBytes: number;
   lines: number;
+  lastEdit?: { user: string; at: string } | null;
+}
+
+export interface WorkflowListResponse {
+  count: number;
+  workflows: WorkflowListItem[];
+  dir: string;
+  dirExists: boolean;
+  user: { username: string; role: 'admin' | 'user' };
+  myProjects: Array<{ projectId: string; role: 'viewer' | 'editor' }> | null;
+}
+
+export interface WorkflowChange {
+  at: string;
+  user: string;
+  action: string;
+  id: string;
+  detail?: Record<string, unknown>;
+}
+
+export interface AxonGitlabView {
+  enabled: boolean;
+  baseUrl: string;
+  repo: string;
+  ref: string;
+  subPath: string;
+  refreshMinutes: number;
+  hasToken: boolean;
+  tokenLast4: string;
+  sources: Record<string, 'env' | 'saved' | 'default'>;
+  state: { lastSha: string; lastPullAt: string; lastError: string; lastResult: string };
+  cloneDir: string;
+  libraryPath: string;
 }
 
 export interface WorkflowDetail {
@@ -294,6 +348,9 @@ export interface HeavyJobHolder {
   since: string;
 }
 
+export interface PathMappingRow { from: string; to: string; toExists: boolean }
+export interface PathMappingsResponse { env: PathMappingRow[]; saved: PathMappingRow[] }
+
 export interface AxonSettings {
   projectPath: string;
   libraryPath: string;
@@ -366,6 +423,9 @@ export interface AxonJob {
 
 export interface AxonStatusResponse {
   settings: AxonSettings;
+  sources?: { projectPath: 'env' | 'saved' | 'empty' | 'gitlab'; libraryPath: 'env' | 'saved' | 'empty' | 'gitlab'; url: 'env' | 'saved' | 'empty' | 'gitlab' };
+  pathWarnings?: string[];
+  gitlab?: AxonGitlabView;
   mcp: AxonMcpStatus;
   embedding: {
     model: string; dimensions: number; embedTextVersion: number;
@@ -384,6 +444,7 @@ export interface AxonValidateResponse {
   packageJson: boolean;
   serverEntry: boolean;
   projDir: string;
+  layout?: 'contains-proj' | 'is-proj' | 'none';
   projExists: boolean;
   instances: string[];
   projects: Array<{ projectId: string; instance: string; project: string; functionCount: number; lastSync?: string }>;
@@ -1526,25 +1587,123 @@ export interface ExtractFunctionsResponse {
 }
 
 // ============================================
+// Sidecar sync (/admin/sidecar-sync/*)
+// ============================================
+
+export interface MirrorProject { name: string; path: string }
+export interface MirrorEffective extends MirrorProject {
+  sidecar: string | null; root: string | null; exists: boolean; fromAuto: boolean;
+}
+export interface MirrorView {
+  source: 'env' | 'settings'; auto: boolean; projects: MirrorProject[]; updatedAt: string | null;
+  mirrorRoot: string; effective: MirrorEffective[]; removed?: MirrorProject;
+}
+export interface SidecarRootStatus {
+  name: string; target: string; company: string | null; files: number; bytes: number;
+  last_path: string | null; last_change_ms: number | null;
+  hook: { ok: boolean; last_ms: number | null; error: string | null } | null;
+}
+export interface SidecarStatusEntry { id: string; connected: boolean; last_seen_ms: number | null; roots: SidecarRootStatus[] }
+export interface SidecarFeedEvent { ts_ms: number; sidecar: string; root: string; path?: string; op?: string; size?: number; message?: string }
+export interface SidecarSyncStatus {
+  configured: boolean; message: string | null;
+  settings: { receiverUrl: 'set' | 'not set'; receiverToken: 'set' | 'not set' };
+  status: { version: string | null; uptime_s: number | null; sidecars: SidecarStatusEntry[]; recent: SidecarFeedEvent[]; errors: SidecarFeedEvent[] } | null;
+  fetchedAt: string | null; stale?: boolean; error: string | null;
+}
+export interface MirrorReloadResult { created: string[]; missingFolders: string[]; notInList: string[]; total: number }
+export interface SidecarAccount {
+  id: string; username: string; roots: string[]; connected: boolean;
+  last_seen_ms: number | null; last_login_ms: number | null;
+  /** Roots the receiver lets this account write; empty = all. */
+  allowed_roots?: string[];
+}
+export interface SidecarAccountRow extends SidecarAccount {
+  user: string | null; dashboardLogin: boolean | null; syncEnabled: boolean; allowedRoots: string[];
+}
+export interface SidecarAccountsView { configured: boolean; accounts: SidecarAccountRow[]; rootNames?: string[]; error: string | null }
+
+// ============================================
+// NetBird (/admin/netbird)
+// ============================================
+
+export interface NetbirdStatus {
+  connected: boolean; fqdn: string | null; ip: string | null;
+  peersConnected: number; peersTotal: number; updatedAt: string | null;
+}
+export interface CaddyStatus {
+  running: boolean; certificate: { names: string[]; notAfter: string | null } | null;
+  error: string | null; updatedAt: string | null; stale: boolean;
+}
+export interface NetbirdHttpsView {
+  enabled: boolean; domain: string; email: string; hasToken: boolean; tokenHint: string | null;
+  address: string; status: CaddyStatus | null;
+}
+export interface NetbirdView {
+  configured: boolean; enabled: boolean; hostname: string; managementUrl: string;
+  hasKey: boolean; keyHint: string | null; wireguardPort: number; status: NetbirdStatus | null;
+  https: NetbirdHttpsView;
+}
+export interface NetbirdUpdate {
+  setupKey?: string; hostname?: string; managementUrl?: string; wireguardPort?: number; enabled?: boolean;
+  https?: { enabled?: boolean; domain?: string; cloudflareToken?: string; email?: string };
+}
+
+// ============================================
 // API Client
 // ============================================
 
 export const api = {
+  // NetBird
+  netbird: () => apiRequest<NetbirdView>('/netbird'),
+  netbirdSave: (u: NetbirdUpdate) => apiRequest<NetbirdView>('/netbird', { method: 'PUT', body: u }),
+  netbirdRemoveKey: () => apiRequest<NetbirdView>('/netbird/key', { method: 'DELETE' }),
+  netbirdRemoveToken: () => apiRequest<NetbirdView>('/netbird/https-token', { method: 'DELETE' }),
+  // Sidecar sync
+  sidecarMirror: () => apiRequest<MirrorView>('/sidecar-sync/mirror'),
+  sidecarMirrorAdd: (p: MirrorProject) => apiRequest<MirrorView>('/sidecar-sync/mirror', { method: 'POST', body: p }),
+  sidecarMirrorEdit: (name: string, p: Partial<MirrorProject>) =>
+    apiRequest<MirrorView>(`/sidecar-sync/mirror/${encodeURIComponent(name)}`, { method: 'PUT', body: p }),
+  sidecarMirrorRemove: (name: string) =>
+    apiRequest<MirrorView>(`/sidecar-sync/mirror/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  sidecarMirrorAuto: (auto: boolean) => apiRequest<MirrorView>('/sidecar-sync/mirror-auto', { method: 'PUT', body: { auto } }),
+  sidecarReload: () => apiRequest<MirrorReloadResult>('/sidecar-sync/reload', { method: 'POST' }),
+  sidecarStatus: () => apiRequest<SidecarSyncStatus>('/sidecar-sync/status'),
+  sidecarAccounts: () => apiRequest<SidecarAccountsView>('/sidecar-sync/accounts'),
+  sidecarAccountsLink: () =>
+    apiRequest<{ linked: string[]; created: string[]; alreadyLinked: string[] }>('/sidecar-sync/accounts/link', { method: 'POST' }),
   // Status
   getStatus: () => apiRequest<ServerStatus>('/status'),
 
-  // MCP workflow resources (workflows/*.md → workflow://<id>)
-  listWorkflows: () => apiRequest<{ count: number; workflows: WorkflowListItem[] }>('/workflows'),
-  getWorkflow: (id: string) => apiRequest<WorkflowDetail>(`/workflows/${encodeURIComponent(id)}`),
-  saveWorkflow: (id: string, content: string) =>
-    apiRequest<WorkflowDetail>(`/workflows/${encodeURIComponent(id)}`, { method: 'PUT', body: { content } }),
-  createWorkflow: (id: string, content: string) =>
-    apiRequest<WorkflowDetail>('/workflows', { method: 'POST', body: { id, content } }),
+  // MCP workflow resources (scoped markdown files → workflow://<id>)
+  listWorkflows: () => apiRequest<WorkflowListResponse>('/workflows'),
+  getWorkflow: (id: string) => apiRequest<WorkflowDetail>(`/workflows/item?id=${encodeURIComponent(id)}`),
+  saveWorkflow: (id: string, content: string, expectedMtimeMs?: number) =>
+    apiRequest<WorkflowDetail>(`/workflows/item?id=${encodeURIComponent(id)}`, { method: 'PUT', body: { content, expectedMtimeMs } }),
+  createWorkflow: (scope: WorkflowScope, scopeId: string, slug: string, content: string) =>
+    apiRequest<WorkflowDetail>('/workflows', { method: 'POST', body: { scope, scopeId, slug, content } }),
+  copyWorkflow: (id: string, scope: WorkflowScope, scopeId: string, slug?: string) =>
+    apiRequest<WorkflowDetail>('/workflows/copy', { method: 'POST', body: { id, scope, scopeId, slug } }),
   deleteWorkflow: (id: string) =>
-    apiRequest<{ success: boolean }>(`/workflows/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    apiRequest<{ success: boolean }>(`/workflows/item?id=${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  workflowHistory: (id?: string) =>
+    apiRequest<{ entries: WorkflowChange[] }>(`/workflows/history${id ? `?id=${encodeURIComponent(id)}` : ''}`),
+  workflowMembers: (projectId: string) =>
+    apiRequest<{ projectId: string; members: Array<{ username: string; role: 'viewer' | 'editor' }> }>(`/workflows/members/${encodeURIComponent(projectId)}`),
+  setWorkflowMember: (projectId: string, username: string, role: 'viewer' | 'editor') =>
+    apiRequest<{ projectId: string; members: Array<{ username: string; role: 'viewer' | 'editor' }> }>(`/workflows/members/${encodeURIComponent(projectId)}`, { method: 'PUT', body: { username, role } }),
+  removeWorkflowMember: (projectId: string, username: string) =>
+    apiRequest<{ projectId: string; members: Array<{ username: string; role: 'viewer' | 'editor' }> }>(`/workflows/members/${encodeURIComponent(projectId)}/${encodeURIComponent(username)}`, { method: 'DELETE' }),
   optimizeWorkflow: (id: string, content: string, instructions?: string) =>
     apiRequest<{ proposed: string; model: string; costUsd: number | null }>(
-      `/workflows/${encodeURIComponent(id)}/optimize`, { method: 'POST', body: { content, instructions } }),
+      '/workflows/optimize', { method: 'POST', body: { id, content, instructions } }),
+
+  // Axon library from GitLab (token never returned: hasToken + tokenLast4)
+  getAxonGitlab: () => apiRequest<AxonGitlabView>('/axon/gitlab'),
+  saveAxonGitlab: (body: Partial<Omit<AxonGitlabView, 'hasToken' | 'tokenLast4' | 'sources' | 'state' | 'cloneDir' | 'libraryPath'>> & { token?: string | null }) =>
+    apiRequest<AxonGitlabView>('/axon/gitlab', { method: 'PUT', body }),
+  testAxonGitlab: () => apiRequest<{ ok: boolean; name?: string; defaultBranch?: string; error?: string }>('/axon/gitlab/test', { method: 'POST' }),
+  pullAxonGitlab: () => apiRequest<{ success: boolean; sha?: string; changed?: boolean; error?: string; gitlab: AxonGitlabView }>('/axon/gitlab/pull', { method: 'POST' }),
 
   // Axon MCP server integration
   axonStatus: () => apiRequest<AxonStatusResponse>('/axon/status'),
@@ -2000,6 +2159,12 @@ export const api = {
   // ============================================
   getFantomSourceFolder: () =>
     apiRequest<{ path: string | null }>('/settings/fantom-source-folder'),
+  getPathMappings: () => apiRequest<PathMappingsResponse>('/path-mappings'),
+  /** Server folder picker (GET /admin/fs/dirs); no path = first root. */
+  listServerDirs: (path?: string) =>
+    apiRequest<ServerDirListing>(`/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`),
+  savePathMappings: (mappings: Array<{ from: string; to: string }>) =>
+    apiRequest<{ success: boolean; saved: PathMappingRow[] }>('/path-mappings', { method: 'PUT', body: { mappings } }),
   setFantomSourceFolder: (path: string) =>
     apiRequest<{ success: boolean; path: string }>('/settings/fantom-source-folder', {
       method: 'POST',
