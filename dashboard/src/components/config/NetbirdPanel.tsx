@@ -56,6 +56,7 @@ export function NetbirdPanel() {
   const [hostname, setHostname] = useState('fantom');
   const [managementUrl, setManagementUrl] = useState('https://api.netbird.io:443');
   const [wireguardPort, setWireguardPort] = useState('0');
+  const [externalIpMap, setExternalIpMap] = useState('');
   const [enabled, setEnabled] = useState(false);
   const [httpsOn, setHttpsOn] = useState(false);
   const [domain, setDomain] = useState('');
@@ -67,7 +68,7 @@ export function NetbirdPanel() {
 
   const fill = (v: NetbirdView) => {
     setHostname(v.hostname); setManagementUrl(v.managementUrl); setEnabled(v.enabled);
-    setWireguardPort(String(v.wireguardPort ?? 0));
+    setWireguardPort(String(v.wireguardPort ?? 0)); setExternalIpMap(v.externalIpMap ?? '');
     setHttpsOn(v.https.enabled); setDomain(v.https.domain); setEmail(v.https.email);
   };
 
@@ -89,7 +90,7 @@ export function NetbirdPanel() {
       const body: NetbirdUpdate = {
         ...(setupKey.trim() ? { setupKey: setupKey.trim() } : {}),
         hostname: hostname.trim(), managementUrl: managementUrl.trim(), enabled,
-        wireguardPort: port,
+        wireguardPort: port, externalIpMap: externalIpMap.trim(),
         https: {
           enabled: httpsOn, domain: domain.trim(), email: email.trim(),
           ...(cfToken.trim() ? { cloudflareToken: cfToken.trim() } : {}),
@@ -254,7 +255,15 @@ export function NetbirdPanel() {
               type="number" min={0} max={65535} value={wireguardPort} onChange={(e) => setWireguardPort(e.target.value)}
               disabled={!isAdmin} className={inputCls}
             />
-            <p className="text-xs text-gray-500 mt-1">0 = NetBird picks a free port. Change it only when two peers clash.</p>
+            <p className="text-xs text-gray-500 mt-1">0 = NetBird picks a free port. Set a fixed port to forward it on the firewall (UDP) for direct peer-to-peer links.</p>
+          </div>
+          <div className="mt-3">
+            <label className="block text-sm font-medium text-gray-700 mb-1">Advertised public IP (optional)</label>
+            <input
+              type="text" value={externalIpMap} onChange={(e) => setExternalIpMap(e.target.value)}
+              disabled={!isAdmin} className={inputCls} placeholder="203.0.113.10"
+            />
+            <p className="text-xs text-gray-500 mt-1">The public IP that forwards the WireGuard port (UDP) to this host. Peers then connect here directly instead of through the relay. Empty = not set. Passed as netbird up --external-ip-map.</p>
           </div>
         </details>
 

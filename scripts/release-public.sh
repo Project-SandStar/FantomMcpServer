@@ -49,6 +49,7 @@ EXCLUDE_PATHS=(
   "docs/tasks"
   "docs/sidecar-interop-findings-2026-09-13.md"
   "fan/tokens.json"
+  "scripts/docker/README.md"
 )
 
 # ── Patterns that must not appear in the published tree ────────────────────

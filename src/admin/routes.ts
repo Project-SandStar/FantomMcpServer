@@ -2960,7 +2960,8 @@ export function createAdminRouter(context: AdminContext): Router {
           action = 'exists';
         } else {
           project = await db.createProject({
-            name: pod.name,
+            // Unique across versions (`auth` exists in every Haxall).
+            name: await db.projectNameForPod(pod.name, pod.path, pod.defaultInstanceId),
             path: pod.path,
             podName: pod.name,
             instanceId: pod.defaultInstanceId || undefined,
@@ -11928,6 +11929,9 @@ export function createAdminRouter(context: AdminContext): Router {
       masterWsPort: readMasterWsPort(),
       masterServerUrl: getVirtualContainersConfig().masterServerUrl ?? null,
       slots: getSlotStatus(),
+      // Per-slot truth behind the global `keyPushed` flag: which sidecars hold
+      // no config for Fantom, and whether an automatic re-push has a key.
+      slotHealth: (await import('../sidecars/openRouterAutoPush.js')).describeSlotHealth(stored.keyPushed === true),
       // The permit unit is ONE CONCURRENT CLOUD REQUEST — that is what the
       // pool hands out and what `manualConcurrency` caps.
       budget: {
@@ -12631,7 +12635,8 @@ export function createAdminRouter(context: AdminContext): Router {
     return `${key.slice(0, 4)}****${key.slice(-4)}`;
   }
 
-  router.get('/settings/llm-providers', (_req: Request, res: Response): void => {
+  router.get('/settings/llm-providers', async (_req: Request, res: Response): Promise<void> => {
+    const { secretSource } = await import('../config/secretsStore.js');
     const settings = context.getSettings();
     const cfg = settings.llmProviders ?? {};
     res.json({
@@ -12641,18 +12646,21 @@ export function createAdminRouter(context: AdminContext): Router {
         model: cfg.groq?.model ?? null,
         apiKey: maskKey(process.env.GROQ_API_KEY),
         hasKey: !!process.env.GROQ_API_KEY,
+        keySource: secretSource('GROQ_API_KEY'),
       },
       anthropic: {
         enabled: cfg.anthropic?.enabled ?? false,
         model: cfg.anthropic?.model ?? null,
         apiKey: maskKey(process.env.ANTHROPIC_API_KEY),
         hasKey: !!process.env.ANTHROPIC_API_KEY,
+        keySource: secretSource('ANTHROPIC_API_KEY'),
       },
       gemini: {
         enabled: cfg.gemini?.enabled ?? false,
         model: cfg.gemini?.model ?? null,
         apiKey: maskKey(process.env.GEMINI_API_KEY),
         hasKey: !!process.env.GEMINI_API_KEY,
+        keySource: secretSource('GEMINI_API_KEY'),
       },
       // TypeSafe Jev routes work (RLM on/off per question); it never writes the
       // answer, so it is not a `defaultProvider` candidate.
@@ -12661,45 +12669,30 @@ export function createAdminRouter(context: AdminContext): Router {
         model: cfg.typesafe?.model ?? null,
         apiKey: maskKey(process.env.TYPESAFE_API_KEY),
         hasKey: !!process.env.TYPESAFE_API_KEY,
+        keySource: secretSource('TYPESAFE_API_KEY'),
       },
     });
   });
 
   router.post('/settings/llm-providers', async (req: Request, res: Response): Promise<void> => {
     const body = req.body ?? {};
-    const envPath = path.join(process.cwd(), '.env');
-    let envContent = '';
-    if (fs.existsSync(envPath)) envContent = fs.readFileSync(envPath, 'utf-8');
-
-    const setEnvVar = (name: string, value: string | null | undefined) => {
-      if (value === null || value === undefined || value === '') return;
-      const re = new RegExp(`^${name}=.*$`, 'm');
-      const line = `${name}=${value}`;
-      if (re.test(envContent)) envContent = envContent.replace(re, line);
-      else envContent = envContent + (envContent.endsWith('\n') || envContent === '' ? '' : '\n') + line + '\n';
-      process.env[name] = value;
-    };
-
-    if (body.groq?.apiKey) setEnvVar('GROQ_API_KEY', body.groq.apiKey);
-    if (body.anthropic?.apiKey) setEnvVar('ANTHROPIC_API_KEY', body.anthropic.apiKey);
-    if (body.gemini?.apiKey) setEnvVar('GEMINI_API_KEY', body.gemini.apiKey);
-    if (body.typesafe?.apiKey) setEnvVar('TYPESAFE_API_KEY', body.typesafe.apiKey);
-    // A key the process only has from the launching shell (~/.zshrc) is lost
-    // on the next launchd/PM2 start. Saving with a provider ENABLED and no key
-    // typed persists the env value into .env so the setting survives a
-    // restart from any launcher. Never overwrites a key already in .env.
-    for (const [name, on] of [
-      ['GROQ_API_KEY', !!body.groq?.enabled],
-      ['ANTHROPIC_API_KEY', !!body.anthropic?.enabled],
-      ['GEMINI_API_KEY', !!body.gemini?.enabled],
-      ['TYPESAFE_API_KEY', !!body.typesafe?.enabled],
-    ] as const) {
-      if (!on || !process.env[name]) continue;
-      if (new RegExp(`^${name}=.+$`, 'm').test(envContent)) continue;
-      setEnvVar(name, process.env[name]);
-      console.log(`[llm-providers] ${name} came from the process environment only — persisted to .env`);
+    // Keys go to the server's secrets store (<cache>/secrets, the persistent
+    // volume in Docker), not <root>/.env: in Docker that file is inside the
+    // container and every rebuild lost it, bringing back the env-file key.
+    const { storeSecret } = await import('../config/secretsStore.js');
+    try {
+      for (const [name, value] of [
+        ['GROQ_API_KEY', body.groq?.apiKey],
+        ['ANTHROPIC_API_KEY', body.anthropic?.apiKey],
+        ['GEMINI_API_KEY', body.gemini?.apiKey],
+        ['TYPESAFE_API_KEY', body.typesafe?.apiKey],
+      ] as const) {
+        if (typeof value === 'string' && value.trim()) storeSecret(name, value);
+      }
+    } catch (err) {
+      res.status(500).json({ error: `Could not store the API key on the server: ${(err as Error).message}` });
+      return;
     }
-    fs.writeFileSync(envPath, envContent);
 
     const llmProviders: any = {
       defaultProvider: body.defaultProvider ?? undefined,
@@ -12710,6 +12703,32 @@ export function createAdminRouter(context: AdminContext): Router {
     };
     await context.updateSettings({ llmProviders } as any);
     res.json({ success: true, restartRequired: false });
+  });
+
+  // One live round trip per provider with the SAVED key, so a dead key or a
+  // wrong model shows here and not as a footnote on the next ask. `targets`
+  // omitted = every provider plus the RLM sandbox model, probed in parallel.
+  // `models` overrides the model per target (the page sends the dropdown
+  // value so an unsaved selection is what gets tested).
+  router.post('/settings/llm-providers/test', async (req: Request, res: Response): Promise<void> => {
+    const { probeProvider, isProbeTarget, PROBE_TARGETS } = await import('./llmProviderProbe.js');
+    const body = req.body ?? {};
+    const requested: unknown[] = Array.isArray(body.targets) ? body.targets : [...PROBE_TARGETS];
+    const bad = requested.filter((t) => !isProbeTarget(t));
+    if (bad.length) {
+      res.status(400).json({ error: `unknown provider(s): ${bad.map(String).join(', ')} — expected ${PROBE_TARGETS.join(', ')}` });
+      return;
+    }
+    const models: Record<string, string> = body.models && typeof body.models === 'object' ? body.models : {};
+    const results = await Promise.all(
+      (requested as import('./llmProviderProbe.js').ProbeTarget[]).map((t) =>
+        probeProvider(t, { model: typeof models[t] === 'string' && models[t].trim() ? models[t].trim() : undefined }),
+      ),
+    );
+    for (const r of results) {
+      console.log(`[llm-providers] test ${r.target} ${r.ok ? 'ok' : 'FAIL'} ${r.ms}ms model=${r.model ?? '-'} route=${r.route}: ${r.message}`);
+    }
+    res.json({ results });
   });
 
   // Axon MCP server integration: /admin/axon/* (src/admin/axonRoutes.ts)

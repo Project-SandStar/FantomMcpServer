@@ -2,13 +2,18 @@
 
 import { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { api, LLMProviderName } from '@/lib/api';
+import { api, LLMProviderName, LLMProbeResult, LLMProbeTarget } from '@/lib/api';
 import { PROVIDER_MODELS, DEFAULT_PROVIDER_MODELS } from '@/lib/llmModels';
 
 const inputClass = "w-full rounded-md border border-gray-300 py-2 px-3 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500";
 const labelClass = "block text-xs font-medium text-gray-600 mb-1";
 
-type ProviderState = { enabled: boolean; model: string; apiKey: string; hasKey: boolean; masked: string | null };
+type ProviderState = { enabled: boolean; model: string; apiKey: string; hasKey: boolean; masked: string | null; keySource?: 'stored' | 'env' | null };
+
+/** Where the live key comes from: saved here (server secrets store) or the deployment env file. */
+function keySourceLabel(src?: 'stored' | 'env' | null): string {
+  return src === 'stored' ? 'saved on server' : src === 'env' ? 'from env file' : 'set';
+}
 
 const DEFAULT: ProviderState = { enabled: false, model: '', apiKey: '', hasKey: false, masked: null };
 
@@ -19,6 +24,22 @@ const PROVIDER_LABELS: Record<LLMProviderName, string> = {
 };
 
 const DEFAULT_MODELS = DEFAULT_PROVIDER_MODELS;
+
+const ALL_TARGETS: LLMProbeTarget[] = ['groq', 'anthropic', 'gemini', 'typesafe', 'rlm'];
+
+/** One line per probe: pass/fail, time, model, route, and the provider's own text. */
+function ProbeLine({ r }: { r: LLMProbeResult }) {
+  const cls = r.ok
+    ? 'text-green-700 bg-green-50 border-green-200'
+    : 'text-red-700 bg-red-50 border-red-200';
+  return (
+    <div className={`text-xs border rounded px-2 py-1 ${cls} break-words`}>
+      {r.ok ? '✓' : '×'} {r.ms} ms · {r.model ?? 'no model'}
+      {r.servedModel ? <> (served as <code>{r.servedModel}</code>)</> : null}
+      {' '}· {r.route} · {r.message}
+    </div>
+  );
+}
 
 export function LLMProvidersPanel() {
   const qc = useQueryClient();
@@ -38,10 +59,10 @@ export function LLMProvidersPanel() {
   useEffect(() => {
     if (!data) return;
     setDefaultProvider(data.defaultProvider ?? '');
-    setGroq({ enabled: data.groq.enabled, model: data.groq.model ?? '', apiKey: '', hasKey: data.groq.hasKey, masked: data.groq.apiKey });
-    setAnthropic({ enabled: data.anthropic.enabled, model: data.anthropic.model ?? '', apiKey: '', hasKey: data.anthropic.hasKey, masked: data.anthropic.apiKey });
-    setGemini({ enabled: data.gemini.enabled, model: data.gemini.model ?? '', apiKey: '', hasKey: data.gemini.hasKey, masked: data.gemini.apiKey });
-    setTypesafe({ enabled: data.typesafe?.enabled ?? false, model: data.typesafe?.model ?? '', apiKey: '', hasKey: data.typesafe?.hasKey ?? false, masked: data.typesafe?.apiKey ?? null });
+    setGroq({ enabled: data.groq.enabled, model: data.groq.model ?? '', apiKey: '', hasKey: data.groq.hasKey, masked: data.groq.apiKey, keySource: data.groq.keySource ?? null });
+    setAnthropic({ enabled: data.anthropic.enabled, model: data.anthropic.model ?? '', apiKey: '', hasKey: data.anthropic.hasKey, masked: data.anthropic.apiKey, keySource: data.anthropic.keySource ?? null });
+    setGemini({ enabled: data.gemini.enabled, model: data.gemini.model ?? '', apiKey: '', hasKey: data.gemini.hasKey, masked: data.gemini.apiKey, keySource: data.gemini.keySource ?? null });
+    setTypesafe({ enabled: data.typesafe?.enabled ?? false, model: data.typesafe?.model ?? '', apiKey: '', hasKey: data.typesafe?.hasKey ?? false, masked: data.typesafe?.apiKey ?? null, keySource: data.typesafe?.keySource ?? null });
   }, [data]);
 
   // Snapshot of what was last saved so we can show the operator the
@@ -70,6 +91,53 @@ export function LLMProvidersPanel() {
     },
   });
 
+  // Live probes. Results are kept per target so one card's result survives
+  // another card's test. The model sent is the dropdown value, so an unsaved
+  // selection is what gets tested; the KEY is always the saved one.
+  const [probeResults, setProbeResults] = useState<Partial<Record<LLMProbeTarget, LLMProbeResult>>>({});
+  const [probing, setProbing] = useState<Set<LLMProbeTarget>>(new Set());
+  const [probeError, setProbeError] = useState<string | null>(null);
+
+  const modelsForProbe = (): Partial<Record<LLMProbeTarget, string>> => ({
+    groq: groq.model || DEFAULT_MODELS.groq,
+    anthropic: anthropic.model || DEFAULT_MODELS.anthropic,
+    gemini: gemini.model || DEFAULT_MODELS.gemini,
+    ...(typesafe.model ? { typesafe: typesafe.model } : {}),
+  });
+
+  const runProbe = async (targets: LLMProbeTarget[]) => {
+    setProbeError(null);
+    setProbing((prev) => new Set([...prev, ...targets]));
+    try {
+      const { results } = await api.testLLMProviders({ targets, models: modelsForProbe() });
+      setProbeResults((prev) => {
+        const next = { ...prev };
+        for (const r of results) next[r.target] = r;
+        return next;
+      });
+    } catch (err) {
+      setProbeError((err as Error)?.message ?? 'test request failed');
+    } finally {
+      setProbing((prev) => {
+        const next = new Set(prev);
+        for (const t of targets) next.delete(t);
+        return next;
+      });
+    }
+  };
+
+  const testButton = (target: LLMProbeTarget) => (
+    <button
+      type="button"
+      onClick={() => runProbe([target])}
+      disabled={probing.has(target)}
+      className="px-2.5 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50 disabled:opacity-50"
+      title="One short request with the saved key"
+    >
+      {probing.has(target) ? 'Testing…' : 'Test'}
+    </button>
+  );
+
   if (isLoading) return <p className="text-sm text-gray-500">Loading…</p>;
 
   const providerCard = (
@@ -80,12 +148,16 @@ export function LLMProvidersPanel() {
     <div className="border border-gray-200 rounded-md p-4 space-y-3">
       <div className="flex items-center justify-between">
         <h4 className="text-sm font-semibold text-gray-900">{PROVIDER_LABELS[name]}</h4>
-        <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={state.enabled}
-            onChange={e => setState({ ...state, enabled: e.target.checked })} />
-          <span>Enabled</span>
-        </label>
+        <div className="flex items-center gap-3">
+          {testButton(name)}
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={state.enabled}
+              onChange={e => setState({ ...state, enabled: e.target.checked })} />
+            <span>Enabled</span>
+          </label>
+        </div>
       </div>
+      {probeResults[name] && <ProbeLine r={probeResults[name]!} />}
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className={labelClass}>Model</label>
@@ -101,7 +173,7 @@ export function LLMProvidersPanel() {
         </div>
         <div>
           <label className={labelClass}>
-            API Key {state.hasKey && <span className="text-green-600">· stored</span>}
+            API Key {state.hasKey && <span className="text-green-600">· {keySourceLabel(state.keySource)}</span>}
           </label>
           <input type="password" className={inputClass} value={state.apiKey}
             placeholder={state.masked ?? 'paste key to update'}
@@ -137,12 +209,16 @@ export function LLMProvidersPanel() {
               retrieval already answers the question. Advisory — below the confidence floor the default route runs.
             </p>
           </div>
-          <label className="flex items-center gap-2 text-sm shrink-0">
-            <input type="checkbox" checked={typesafe.enabled}
-              onChange={e => setTypesafe({ ...typesafe, enabled: e.target.checked })} />
-            <span>Enabled</span>
-          </label>
+          <div className="flex items-center gap-3 shrink-0">
+            {testButton('typesafe')}
+            <label className="flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={typesafe.enabled}
+                onChange={e => setTypesafe({ ...typesafe, enabled: e.target.checked })} />
+              <span>Enabled</span>
+            </label>
+          </div>
         </div>
+        {probeResults.typesafe && <ProbeLine r={probeResults.typesafe} />}
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className={labelClass}>Model</label>
@@ -152,7 +228,7 @@ export function LLMProvidersPanel() {
           </div>
           <div>
             <label className={labelClass}>
-              API Key {typesafe.hasKey && <span className="text-green-600">· stored</span>}
+              API Key {typesafe.hasKey && <span className="text-green-600">· {keySourceLabel(typesafe.keySource)}</span>}
             </label>
             <input type="password" className={inputClass} value={typesafe.apiKey}
               placeholder={typesafe.masked ?? 'paste key to update'}
@@ -166,7 +242,35 @@ export function LLMProvidersPanel() {
         </p>
       </div>
 
+      <div className="border border-amber-200 bg-amber-50/40 rounded-md p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h4 className="text-sm font-semibold text-gray-900">RLM sandbox model</h4>
+            <p className="text-xs text-gray-600 mt-0.5">
+              Tests the model the RLM loop resolves right now (local ss-rlm, a <code>direct:</code> provider with
+              its key above, or the sidecar&apos;s OpenRouter route). Set it on the OpenRouter page.
+              A fail here is why an ask shows <code>rlm 0.3s</code> and 0 questions.
+            </p>
+          </div>
+          <div className="shrink-0">{testButton('rlm')}</div>
+        </div>
+        {probeResults.rlm && <ProbeLine r={probeResults.rlm} />}
+      </div>
+
       <div className="flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          onClick={() => runProbe(ALL_TARGETS)}
+          disabled={probing.size > 0}
+          className="px-4 py-2 bg-white border border-gray-300 text-gray-800 rounded-md hover:bg-gray-50 disabled:opacity-50 text-sm font-medium"
+        >
+          {probing.size > 0 ? 'Testing…' : 'Test all'}
+        </button>
+        {probeError && (
+          <span className="text-sm text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1">
+            × Test failed: {probeError}
+          </span>
+        )}
         <button
           onClick={() => saveMut.mutate()}
           disabled={saveMut.isPending}

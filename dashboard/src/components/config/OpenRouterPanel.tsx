@@ -172,10 +172,38 @@ export function OpenRouterPanel() {
               placeholder={data.keyPushed ? `Configured (••••${data.keyLast4 ?? '????'})` : 'sk-or-v1-…'}
               className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm font-mono"
             />
+            {data.slotHealth && data.slotHealth.unset.length > 0 && (
+              <div className="mt-2 mb-1 px-3 py-2 text-xs rounded-md border border-amber-300 bg-amber-50 text-amber-900 space-y-1">
+                <div className="font-medium">
+                  {data.slotHealth.keyFlagStale
+                    ? `The key is NOT on ${data.slotHealth.unset.length} sidecar slot(s) for this server, although a key is marked as stored.`
+                    : `${data.slotHealth.unset.length} sidecar slot(s) for this server hold no OpenRouter config.`}
+                </div>
+                <ul className="list-disc ml-4">
+                  {data.slotHealth.unset.map(s => (
+                    <li key={s.sidecarId}>
+                      {s.name}
+                      {s.serverUrl ? <> — slot <code>{s.serverUrl}</code></> : null}
+                      {s.lastAutoPushAt ? ` · auto-pushed ${new Date(s.lastAutoPushAt).toLocaleTimeString()}` : ''}
+                    </li>
+                  ))}
+                </ul>
+                <div>
+                  {data.slotHealth.keySource
+                    ? `Fantom re-pushes the config with the ${data.slotHealth.keySource === 'env' ? 'FANTOM_OPENROUTER_API_KEY env' : 'saved'} key on each discovery poll (every 60 s, 5 min apart per sidecar).`
+                    : 'Fantom has no key to re-push, and a push without a key is ignored by an empty slot. Paste the key above and save (it is kept on the server), or set FANTOM_OPENROUTER_API_KEY in the server env.'}
+                </div>
+              </div>
+            )}
+            {data.slotHealth && data.slotHealth.unknown.length > 0 && (
+              <p className="text-xs text-gray-500 mt-1">
+                Slot state unknown (status probe failed): {data.slotHealth.unknown.map(s => s.name).join(', ')}.
+              </p>
+            )}
             <p className="text-xs text-gray-500 mt-1">
               {data.keyPushed
                 ? `A key is stored (ends in ${data.keyLast4 ?? '????'}). Leave blank to keep it — this field is never pre-filled with the real value.`
-                : 'The key is sent to the sidecars and held by them. Fantom never stores, logs or returns it.'}
+                : 'The key is sent to the sidecars and saved on this server in its own owner-only file, so Fantom can re-key a sidecar after a restart. It is never logged or returned.'}
             </p>
           </div>
 
@@ -207,7 +235,7 @@ export function OpenRouterPanel() {
               type="button"
               onClick={() => repush.mutate()}
               disabled={repush.isPending || !data.keyPushed}
-              title="A sidecar holds this config in memory only — re-push after one restarts."
+              title="Re-push sends the key only if Fantom holds one (last pasted key or FANTOM_OPENROUTER_API_KEY). An empty slot ignores a push without a key."
               className="text-sm text-blue-600 hover:underline disabled:text-gray-400 disabled:no-underline"
             >
               Re-push to sidecars

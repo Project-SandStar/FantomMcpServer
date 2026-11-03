@@ -74,7 +74,7 @@ describe('axon gitlab', () => {
       expect(r3.changed).toBe(true);
       expect(changed.length).toBe(2);
       expect(fs.existsSync(path.join(r3.libraryPath, 'custA', 'g.axon'))).toBe(true);
-    });
+    }, 30_000); // three real git clones/fetches; under a full-suite run 5s is not enough
 
     it('fails clearly without a token and never stores one', async () => {
       await expect(pullGitlabLibrary({ settings: { ...DEFAULT_GITLAB, enabled: true, baseUrl: 'https://gitlab.example.com', repo: 'a/lib' }, root: path.join(tmp, 'c2') })).rejects.toThrow(/No token/);

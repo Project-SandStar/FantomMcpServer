@@ -74,3 +74,4 @@ dashboard/config/*.json
 
 # Dev-mode marker (src/config/devMode.ts): enables local-only dashboard conveniences
 config/dev-mode
+.worktrees/

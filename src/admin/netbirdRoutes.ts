@@ -3,7 +3,7 @@
  * (or FANTOM_API_TOKEN bearer); register AFTER the auth middleware.
  *
  *   GET    /netbird        settings + last status from the NetBird container
- *   PUT    /netbird        {setupKey?, hostname?, managementUrl?, wireguardPort?, enabled?,
+ *   PUT    /netbird        {setupKey?, hostname?, managementUrl?, wireguardPort?, externalIpMap?, enabled?,
  *                            https?: {enabled?, domain?, cloudflareToken?, email?}}  (admin)
  *   DELETE /netbird/key    remove the key and set enabled=false               (admin)
  *   DELETE /netbird/https-token  remove the Cloudflare token                  (admin)
@@ -46,6 +46,8 @@ export interface NetbirdConfig {
   hostname: string;
   managementUrl: string;
   wireguardPort: number;
+  /** netbird up --external-ip-map, e.g. "203.0.113.10". Empty = not set. */
+  externalIpMap: string;
   enabled: boolean;
   https: HttpsConfig;
   updatedAt: string;
@@ -86,6 +88,7 @@ export interface NetbirdView {
   hasKey: boolean;
   keyHint: string | null;
   wireguardPort: number;
+  externalIpMap: string;
   status: NetbirdStatus | null;
   https: HttpsView;
 }
@@ -129,6 +132,14 @@ export function validDomain(d: unknown): d is string {
 
 export function validWireguardPort(p: unknown): p is number {
   return typeof p === 'number' && Number.isInteger(p) && p >= 0 && p <= 65535;
+}
+
+const IPV4 = '(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}';
+const IP_MAP_ENTRY_RE = new RegExp(`^${IPV4}(/(${IPV4}|[A-Za-z0-9_.-]{1,15}))?$`);
+
+/** "" or a comma list of IP, IP/localIP or IP/interface (netbird up --external-ip-map). */
+export function validExternalIpMap(m: unknown): m is string {
+  return typeof m === 'string' && m.length <= 500 && (m === '' || m.split(',').every((e) => IP_MAP_ENTRY_RE.test(e)));
 }
 
 /** Map caddy-status.json (written by docker/caddy-entrypoint.sh) to the page view. */
@@ -195,6 +206,7 @@ export function registerNetbirdRoutes(router: Router, opts: NetbirdRouteOptions 
       hostname: validHostname(r.hostname) ? r.hostname : DEFAULT_HOSTNAME,
       managementUrl: validManagementUrl(r.managementUrl) ? r.managementUrl : defaultUrl,
       wireguardPort: validWireguardPort(r.wireguardPort) ? r.wireguardPort : 0,
+      externalIpMap: validExternalIpMap(r.externalIpMap) ? r.externalIpMap : '',
       enabled: r.enabled === true,
       https: {
         enabled: h.enabled === true,
@@ -242,6 +254,7 @@ export function registerNetbirdRoutes(router: Router, opts: NetbirdRouteOptions 
       hasKey: !!cfg.setupKey,
       keyHint: keyHint(cfg.setupKey),
       wireguardPort: cfg.wireguardPort,
+      externalIpMap: cfg.externalIpMap,
       status: configured ? readStatus(dir) : null,
       https: {
         enabled: cfg.https.enabled,
@@ -292,6 +305,11 @@ export function registerNetbirdRoutes(router: Router, opts: NetbirdRouteOptions 
       if (b.wireguardPort !== undefined) {
         if (!validWireguardPort(b.wireguardPort)) throw new NetbirdError('WireGuard port must be a whole number from 0 to 65535 (0 = NetBird picks)');
         cfg.wireguardPort = b.wireguardPort;
+      }
+      if (b.externalIpMap !== undefined) {
+        const m = typeof b.externalIpMap === 'string' ? b.externalIpMap.replace(/\s+/g, '') : b.externalIpMap;
+        if (!validExternalIpMap(m)) throw new NetbirdError('Advertised public IP must be empty or an IPv4 address like 203.0.113.10 (or IP/local-IP, comma separated)');
+        cfg.externalIpMap = m;
       }
       if (b.enabled !== undefined) {
         if (typeof b.enabled !== 'boolean') throw new NetbirdError('enabled must be true or false');

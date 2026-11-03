@@ -101,20 +101,47 @@ async function apiRequest<T>(endpoint: string, options: ApiOptions = {}): Promis
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  if (!response.ok) {
-    if (response.status === 401) {
-      throw new Error('Authentication required');
-    }
-    // Keep the server's own `error` text (e.g. a 409's reason) when it sent one.
-    let detail = '';
-    try {
-      const j = await response.json();
-      if (j && typeof j.error === 'string') detail = ` — ${j.error}`;
-    } catch { /* not JSON */ }
-    throw new Error(`API error: ${response.statusText}${detail}`);
+  if (!response.ok && response.status === 401) {
+    throw new Error('Authentication required');
   }
+  return readJsonResponse<T>(response, 'API error');
+}
 
-  return response.json();
+/**
+ * Read a fetch Response as JSON without the bare `response.json()` crash.
+ *
+ * A proxy that loses the upstream (Caddy 502 after a reset, a 504) sends an
+ * EMPTY body, and `response.json()` then throws "Unexpected end of JSON input"
+ * — the only thing the user saw on 2026-11-03. This reads the body as text,
+ * parses JSON only when there is some, and names the HTTP status otherwise.
+ * On a non-OK status it throws with the server's own `error` text if present.
+ */
+export async function readJsonResponse<T>(response: Response, fallbackMessage = 'Request failed'): Promise<T> {
+  const status = `${response.status}${response.statusText ? ` ${response.statusText}` : ''}`;
+  let text = '';
+  try {
+    text = await response.text();
+  } catch (err) {
+    throw new Error(`Server returned ${status}, and the connection closed before the body arrived (${(err as Error).message}).`);
+  }
+  let parsed: unknown = undefined;
+  if (text.trim()) {
+    try { parsed = JSON.parse(text); } catch { /* not JSON */ }
+  }
+  if (!response.ok) {
+    const j = parsed as { error?: unknown; message?: unknown } | undefined;
+    const serverMsg = typeof j?.error === 'string' ? j.error : typeof j?.message === 'string' ? j.message : '';
+    if (serverMsg) throw new Error(`${fallbackMessage}: ${serverMsg} (HTTP ${status})`);
+    if (!text.trim()) throw new Error(`Server returned ${status} with no body. The server or the proxy in front of it may have dropped the request; try again.`);
+    throw new Error(`Server returned ${status}: ${text.slice(0, 200)}`);
+  }
+  if (!text.trim()) {
+    throw new Error(`Server returned ${status} with an empty body where JSON was expected.`);
+  }
+  if (parsed === undefined) {
+    throw new Error(`Server returned ${status} with a body that is not JSON: ${text.slice(0, 200)}`);
+  }
+  return parsed as T;
 }
 
 // ============================================
@@ -600,6 +627,17 @@ export interface VirtualContainer {
  * its key and allow-list per master, so capacity configured for another
  * master is deliberately unusable here.
  */
+export interface OpenRouterSlotHealth {
+  /** Sidecars whose slot for Fantom holds no OpenRouter config. */
+  unset: Array<{ sidecarId: string; name: string; serverUrl?: string; lastAutoPushAt: number | null }>;
+  /** Connected sidecars whose slot could not be read. */
+  unknown: Array<{ sidecarId: string; name: string }>;
+  /** Key an automatic re-push would use; null = none, so no auto-push. */
+  keySource: 'stored' | 'env' | null;
+  /** `keyPushed` is true but some slots are unset. */
+  keyFlagStale: boolean;
+}
+
 export interface MasterSlotStatus {
   sidecarId: string;
   serverUrl?: string;
@@ -785,6 +823,8 @@ export interface OpenRouterConfigResponse {
   keyPushed: boolean;
   /** Last 4 chars of the stored key, for the masked placeholder. Never the key. */
   keyLast4: string | null;
+  /** Per-slot truth behind `keyPushed`; null before the first discovery poll. */
+  slotHealth?: OpenRouterSlotHealth | null;
   /** Cloud routing is opt-in; while false everything stays local. */
   enabled: boolean;
   catalogue: OpenRouterCatalogueEntry[];
@@ -1015,11 +1055,25 @@ export interface SidecarHealth {
 
 export interface LLMProvidersResponse {
   defaultProvider: LLMProviderName | null;
-  groq: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean };
-  anthropic: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean };
-  gemini: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean };
+  groq: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean; keySource?: 'stored' | 'env' | null };
+  anthropic: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean; keySource?: 'stored' | 'env' | null };
+  gemini: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean; keySource?: 'stored' | 'env' | null };
   /** TypeSafe Jev — routing judgments (RLM on/off), not a text generator. */
-  typesafe?: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean };
+  typesafe?: { enabled: boolean; model: string | null; apiKey: string | null; hasKey: boolean; keySource?: 'stored' | 'env' | null };
+}
+
+/** Targets of the LLM Providers "Test" button; `rlm` probes the RLM sandbox model as the loop resolves it. */
+export type LLMProbeTarget = LLMProviderName | 'typesafe' | 'rlm';
+
+export interface LLMProbeResult {
+  target: LLMProbeTarget;
+  ok: boolean;
+  ms: number;
+  model: string | null;
+  servedModel?: string | null;
+  route: string;
+  message: string;
+  status?: number;
 }
 
 export interface RecentSearch {
@@ -1641,11 +1695,11 @@ export interface NetbirdHttpsView {
 }
 export interface NetbirdView {
   configured: boolean; enabled: boolean; hostname: string; managementUrl: string;
-  hasKey: boolean; keyHint: string | null; wireguardPort: number; status: NetbirdStatus | null;
+  hasKey: boolean; keyHint: string | null; wireguardPort: number; externalIpMap?: string; status: NetbirdStatus | null;
   https: NetbirdHttpsView;
 }
 export interface NetbirdUpdate {
-  setupKey?: string; hostname?: string; managementUrl?: string; wireguardPort?: number; enabled?: boolean;
+  setupKey?: string; hostname?: string; managementUrl?: string; wireguardPort?: number; externalIpMap?: string; enabled?: boolean;
   https?: { enabled?: boolean; domain?: string; cloudflareToken?: string; email?: string };
 }
 
@@ -1925,6 +1979,9 @@ export const api = {
     gemini?: { enabled?: boolean; model?: string; apiKey?: string };
     typesafe?: { enabled?: boolean; model?: string; apiKey?: string };
   }) => apiRequest<{ success: boolean; restartRequired: boolean }>('/settings/llm-providers', { method: 'POST', body }),
+  /** Live round trip with the SAVED key. `targets` omitted = all. `models` = per-target model override. */
+  testLLMProviders: (body: { targets?: LLMProbeTarget[]; models?: Partial<Record<LLMProbeTarget, string>> } = {}) =>
+    apiRequest<{ results: LLMProbeResult[] }>('/settings/llm-providers/test', { method: 'POST', body }),
 
   // Usage
   getUsage: (days = 7) => apiRequest<UsageStats>(`/usage?days=${days}`),
@@ -2688,7 +2745,8 @@ export interface SemanticSearchResponse {
 export interface AskEvent {
   seq: number;
   t: number;
-  kind: 'stage' | 'plan' | 'round' | 'ask' | 'answer' | 'thought' | 'done' | 'error';
+  /** 'warning': a provider problem (detail = warning kind, items[0] = provider). */
+  kind: 'stage' | 'plan' | 'round' | 'ask' | 'answer' | 'thought' | 'done' | 'error' | 'warning';
   text: string;
   id?: string;
   detail?: string;
@@ -2727,6 +2785,15 @@ export interface AskAnswerResponse {
   historyIncluded: boolean;
   complexity?: 'simple' | 'complex' | null;
   rlm?: { used: boolean; model?: string | null; rounds?: number; toolCalls?: number; citations?: number };
+  /** Provider problems, e.g. Gemini out of credits while OpenRouter answered. */
+  warnings?: ProviderWarning[];
+}
+
+export interface ProviderWarning {
+  kind: 'provider-quota-exhausted' | 'provider-rate-limited' | 'provider-auth-failed' | 'provider-failed';
+  provider: string;
+  message: string;
+  status?: number;
 }
 
 export interface ProjectVectorPoint {

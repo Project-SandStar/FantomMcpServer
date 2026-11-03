@@ -246,7 +246,7 @@ export interface RlmGatherResult {
   subQuestions: string[];
 }
 
-interface RlmEndpoint {
+export interface RlmEndpoint {
   base: string;
   /** Full chat-completions URL when it is not `<base>/v1/chat/completions`
    *  (Gemini's OpenAI-compatible route is `<base>/chat/completions`). Set
@@ -285,7 +285,7 @@ export const SANDBOX_PORT = 8101;
  * ss-rlm — the whole point of choosing "OpenRouter only" is that the GPUs are
  * not in this path, so quietly putting them back would be the failure.
  */
-async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoint | null> {
+export async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoint | null> {
   let mode: 'local-only' | 'local-first' | 'cloud-only' = 'local-only';
   let sandboxModel: string | undefined;
   try {
@@ -368,12 +368,14 @@ async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoint | nul
   // URL must byte-match the `serverUrl` we pushed — a trailing slash or a
   // different host spelling is a 404 that reads as "no config pushed" — so it
   // comes from the same source the push is keyed by, never a rebuilt string.
-  let masterUrl: string | undefined;
-  try {
-    const { getSlotStatus, getVirtualContainersConfig } = await import('../sidecars/virtualContainers.js');
-    masterUrl = getVirtualContainersConfig().masterServerUrl
-      ?? getSlotStatus().find(sl => sl.serverUrl)?.serverUrl;
-  } catch { /* handled below */ }
+  //
+  // Per HOST, not the first slot in the list: each sidecar files this master
+  // under the address it saw our tunnel come from, and a LAN host and a
+  // NetBird host see different ones (gpu-01 held our NetBird address, BASWS35
+  // our LAN address, 2026-11-03). Sending BASWS35's spelling to gpu-01 was a
+  // 404 on every round, so the loop never ran.
+  const { canonicalMasterUrl } = await import('../sidecars/openRouterChat.js');
+  const masterUrl = await canonicalMasterUrl(host.id);
   if (!masterUrl) {
     console.warn('[RLM] cannot identify this master to the sandbox (no serverUrl known) — skipping RLM.');
     return null;
@@ -959,7 +961,7 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
  *   Measured: with reasoning_effort none the same plan is 182 tokens,
  *   finish=stop, 1.8 s.
  */
-function noReasoning(ep: RlmEndpoint): Record<string, unknown> {
+export function noReasoning(ep: RlmEndpoint): Record<string, unknown> {
   if (ep.direct === 'gemini') return { reasoning_effort: 'none' };
   if (ep.direct === 'anthropic') return {};   // no reasoning field in this dialect; off by default
   return { reasoning: { enabled: false } };

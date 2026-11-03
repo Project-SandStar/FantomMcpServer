@@ -376,8 +376,20 @@ export class SemanticSearchService {
     vectorResults = joinedVector;
     const nodeIds = vectorResults.map(r => r.nodeId);
     let nodes: Awaited<ReturnType<typeof this.fetchNodesByIds>>;
+    // Projects whose graph store failed the node fetch. Their hits fall back
+    // to the vector row's own columns instead of being dropped.
+    const graphFailed = new Set<number | undefined>();
+    const fetchOrDegrade = async (ids: string[], pid?: number) => {
+      try {
+        return await this.fetchNodesByIds(ids, pid);
+      } catch (err) {
+        graphFailed.add(pid);
+        logger.warn(`[search] graph node fetch failed for project ${pid ?? 'shared'}; using vector rows only: ${(err as Error).message}`);
+        return [];
+      }
+    };
     if (projectId !== undefined) {
-      nodes = await this.fetchNodesByIds(nodeIds, projectId);
+      nodes = await fetchOrDegrade(nodeIds, projectId);
     } else {
       const byProject = new Map<number, string[]>();
       const noPid: string[] = [];
@@ -392,10 +404,10 @@ export class SemanticSearchService {
       }
       nodes = [];
       for (const [pid, ids] of byProject) {
-        nodes.push(...await this.fetchNodesByIds(ids, pid).catch(() => []));
+        nodes.push(...await fetchOrDegrade(ids, pid));
       }
       if (noPid.length > 0) {
-        nodes.push(...await this.fetchNodesByIds(noPid).catch(() => []));
+        nodes.push(...await fetchOrDegrade(noPid));
       }
     }
 
@@ -446,7 +458,11 @@ export class SemanticSearchService {
       let node = nodeMap.get(vr.nodeId);
       // v3 file:/project: rows have no CodeNode — build the hit from the row's
       // denormalised columns (qualified_name / file_path) instead of dropping it.
-      const synthetic = !node && (vr.nodeType === 'file' || vr.nodeType === 'project') && !!vr.qualifiedName;
+      // Same when the hit's graph store failed: keep the vector hit.
+      const synthetic = !node && !!vr.qualifiedName && (
+        vr.nodeType === 'file' || vr.nodeType === 'project'
+        || graphFailed.has(projectId ?? vr.projectId)
+      );
       if (!node) {
         if (!synthetic) { dropped.push({ id: vr.nodeId, type: vr.nodeType, qn: vr.qualifiedName }); continue; }
         const qn = vr.qualifiedName as string;
@@ -1278,6 +1294,21 @@ export class SemanticSearchService {
     limit: number,
     projectId?: number,
   ): Promise<Array<{ id: string; name: string; relationship: string }>> {
+    // Related nodes are context only: a graph failure (full buffer pool, a
+    // degraded store) must not fail the search that asked for them.
+    try {
+      return await this.getRelatedNodesUnsafe(nodeId, limit, projectId);
+    } catch (err) {
+      logger.warn(`[search] related nodes skipped for ${nodeId} (project ${projectId ?? 'shared'}): ${(err as Error).message}`);
+      return [];
+    }
+  }
+
+  private async getRelatedNodesUnsafe(
+    nodeId: string,
+    limit: number,
+    projectId?: number,
+  ): Promise<Array<{ id: string; name: string; relationship: string }>> {
     const related: Array<{ id: string; name: string; relationship: string }> = [];
 
     // Get top callers
@@ -1324,7 +1355,9 @@ export class SemanticSearchService {
       const node = nodeMap.get(vr.nodeId);
       if (!node) continue;
 
-      const metrics = await this.graph(options.projectId).getMetrics(node.id);
+      // Graph counts only adjust the score; a failed graph query scores 0.
+      const metrics = await this.graph(options.projectId).getMetrics(node.id)
+        .catch(() => ({ callerCount: 0, calleeCount: 0 }));
       const graphScore = this.calculateGraphScore(metrics.callerCount);
       const combinedScore = (1 - graphWeight) * vr.score + graphWeight * graphScore;
 

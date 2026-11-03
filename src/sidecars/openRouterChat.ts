@@ -55,11 +55,18 @@ export class OpenRouterChatUnavailable extends Error {
  * trailing slash or `localhost` where the push said an IP resolves to a
  * different map key and returns 404, which reads as "you pushed no config".
  */
-export async function canonicalMasterUrl(): Promise<string | undefined> {
+export async function canonicalMasterUrl(sidecarId?: string): Promise<string | undefined> {
   try {
     const { getVirtualContainersConfig, getSlotStatus } = await import('./virtualContainers.js');
-    return getVirtualContainersConfig().masterServerUrl
-      ?? getSlotStatus().find(s => s.serverUrl)?.serverUrl;
+    const slots = getSlotStatus();
+    // Per host when a host is named: a LAN host and a NetBird host file the
+    // same master under different addresses (gpu-01 held our NetBird address,
+    // BASWS35 our LAN address, 2026-11-03). The first slot is only a fallback
+    // for a host whose slot we have not seen yet.
+    const own = sidecarId ? slots.find(s => s.sidecarId === sidecarId && s.serverUrl)?.serverUrl : undefined;
+    return own
+      ?? getVirtualContainersConfig().masterServerUrl
+      ?? slots.find(s => s.serverUrl)?.serverUrl;
   } catch {
     return undefined;
   }
@@ -131,8 +138,9 @@ export async function openRouterChat(
     role?: string;
   } = {},
 ): Promise<OpenRouterChatResult> {
-  const masterUrl = await canonicalMasterUrl();
-  if (!masterUrl) {
+  // Fleet-wide fallback only; each host gets its own spelling in the loop below.
+  const anyMasterUrl = await canonicalMasterUrl();
+  if (!anyMasterUrl) {
     throw new OpenRouterChatUnavailable(
       'this master has no canonical URL known to the fleet, so the sidecar cannot tell whose key to '
       + 'spend — check that a config push has reached at least one sidecar.',
@@ -218,6 +226,7 @@ export async function openRouterChat(
       continue;
     }
     const url = `${host.protocol}://${host.host}:${SIDECAR_API_PORT}/api/v1/chat/completions`;
+    const masterUrl = (await canonicalMasterUrl(host.id)) ?? anyMasterUrl;
     const ac = new AbortController();
     // The attempt gets the whole remaining window. See HARD_FAILURE_RETRY.
     const attemptMs = remaining;

@@ -5,6 +5,50 @@ per-session file) and reads this one only on demand; other agents (Codex, Cursor
 file directly. Keep the two consistent: rules live in `CLAUDE.md`, reference lives here. Both
 files ship in the public release tree — never put internal hostnames or addresses in them.
 
+## Use context-mode for reading and searching
+
+This repository is large. Raw `grep`, `cat`, `find` and long log tails flood
+the context window and slow every agent down.
+
+Use the **context-mode** tools for any search or read that may return more
+than a few dozen lines. Only the result you print enters your context.
+
+| Task | Use | Not |
+|---|---|---|
+| Search code or text across files | context-mode `ctx_batch_execute` or `ctx_execute` with a small script that prints only the matches you need | `grep -r`, or `rg`/`find` with long output |
+| Read part of a large file to analyse it | context-mode `ctx_execute_file` (path + code that prints only what you need) | `cat` of the whole file |
+| Read a file you are about to edit | the Read tool, with `offset`/`limit` for the part you need | context-mode (Edit needs the exact bytes in context) |
+| Logs, test and build output | context-mode: filter by time and pattern, print counts, failures and the last few matches | long `tail`, full test output |
+| Fetch a web page or API | context-mode `ctx_fetch_and_index`, then `ctx_search` | `curl` into the context |
+| Text you need again later | context-mode `ctx_index`, then `ctx_search` | reading it twice |
+
+Short, targeted shell commands are fine: `git status`, `git log --oneline -5`,
+`ls` of one folder.
+
+### Tool order for search and shell output
+
+1. **context-mode first** (the gateway). Use its tools for every search and
+   every read that may return more than a few dozen lines, as in the table
+   above.
+2. **If context-mode is not available** in a session, or for a quick
+   one-off command:
+   - Search with **ripgrep** (`rg`), never `grep`. Examples:
+     `rg -n "pattern" src/`, `rg -l "name" --type rust`, `rg -c "error" app.log`.
+     ripgrep skips `.gitignore`d folders by default; still add
+     `-g '!target' -g '!node_modules'` where needed.
+   - Run shell commands through **rtk** for token savings:
+     `rtk git status`, `rtk git log`, `rtk cargo test`, `rtk ls`, `rtk find`.
+     If a Claude Code hook already rewrites commands to rtk, plain commands
+     are fine. Use `rtk proxy <cmd>` only to see raw output when debugging.
+   - Keep output small: `head`, `tail -n 20`, `rg -c`, `wc -l`. Never print
+     whole logs, generated files or build folders.
+
+Never search these folders: node_modules/, build/, dist/, dashboard/.next/, dashboard/node_modules/, claudePlugin/dist/, config/ backups, cache folders.
+
+Several agents may work in this repo at once: work in your own git worktree
+under `.worktrees/<name>` (ignored by git), commit only your own files, and
+never print secrets (tokens, passwords, keys, `.env` values).
+
 ## What it is
 
 A Model Context Protocol server that gives AI assistants a working knowledge of a Fantom /
@@ -220,6 +264,10 @@ The full list (~190 routes) is in `src/admin/routes.ts`.
 | `ADMIN_USER` / `ADMIN_PASS` | `admin` | admin API credentials |
 | `CACHE_ENABLED` | `true` | docs cache |
 | `FANTOM_GRAPH_MAX_OPEN` | — | cap on concurrently open graph databases |
+| `FANTOM_GRAPH_QUERY_THREADS` | `min(CPUs, 4)` | threads per graph query; each thread pins its own buffer-pool pages |
+| `FANTOM_GRAPH_DB_BUFFER_MIB` | — | fixed per-project buffer pool (skips sizing) |
+| `FANTOM_GRAPH_DB_BUFFER_MIN_MIB` / `_MAX_MIB` | `32` / `256` | per-project pool floor / hard cap; pool = 5 × store file size |
+| `FANTOM_GRAPH_POOL_MEM_FRACTION` | `0.0625` | share of the memory limit for all open pools; per-store cap = limit × fraction / `FANTOM_GRAPH_MAX_OPEN` |
 
 ## Testing
 

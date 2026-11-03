@@ -160,4 +160,44 @@ describe('apiTokenGate', () => {
     expect((await fetch(base + '/health')).status).toBe(200);
     expect((await fetch(base + '/admin/indexing/report', { method: 'POST' })).status).toBe(200);
   });
+
+  it('takes a live OAuth access token on /mcp only, checked in the gate', async () => {
+    token = 's3cret';
+    const app = express();
+    app.use(apiTokenGate({ token: () => token, verifyOAuthToken: async (t) => t === 'good-oauth' }));
+    const ok = (req: Request, res: Response) => { res.json({ user: req.user?.username ?? null, api: !!res.locals.apiTokenOk }); };
+    app.post('/mcp', ok);
+    app.get('/admin/x', ok);
+    const s2 = app.listen(0);
+    const b2 = `http://127.0.0.1:${(s2.address() as AddressInfo).port}`;
+    try {
+      const bearer = (t: string) => ({ Authorization: `Bearer ${t}` });
+      expect(await (await fetch(b2 + '/mcp', { method: 'POST', headers: bearer('s3cret') })).json()).toEqual({ user: null, api: true });
+      expect(await (await fetch(b2 + '/mcp', { method: 'POST', headers: bearer('good-oauth') })).json()).toEqual({ user: null, api: false });
+      const bad = await fetch(b2 + '/mcp', { method: 'POST', headers: bearer('expired-or-bad') });
+      expect(bad.status).toBe(401);
+      expect(bad.headers.get('www-authenticate')).toContain('Bearer');
+      expect((await fetch(b2 + '/mcp', { method: 'POST' })).status).toBe(401);
+      expect((await fetch(b2 + '/mcp', { method: 'POST', headers: { 'X-Fantom-Api-Token': 'good-oauth' } })).status).toBe(401);
+      expect((await fetch(b2 + '/admin/x', { headers: bearer('good-oauth') })).status).toBe(401);
+    } finally {
+      await new Promise(r => s2.close(r));
+    }
+    // Without a verifier wired, an OAuth token is refused (no fall-through).
+    expect((await fetch(base + '/mcp', { method: 'POST', headers: { Authorization: 'Bearer good-oauth' } })).status).toBe(401);
+  });
+
+  it('refuses when the OAuth check throws', async () => {
+    token = 's3cret';
+    const app = express();
+    app.use(apiTokenGate({ token: () => token, verifyOAuthToken: async () => { throw new Error('db down'); } }));
+    app.post('/mcp', (_req: Request, res: Response) => { res.json({ ok: true }); });
+    const s2 = app.listen(0);
+    try {
+      const r = await fetch(`http://127.0.0.1:${(s2.address() as AddressInfo).port}/mcp`, { method: 'POST', headers: { Authorization: 'Bearer x' } });
+      expect(r.status).toBe(401);
+    } finally {
+      await new Promise(r => s2.close(r));
+    }
+  });
 });

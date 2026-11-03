@@ -9,7 +9,7 @@ import type { Server } from 'http';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { registerNetbirdRoutes, parseNetbirdStatus, parseCaddyStatus, validHostname, validManagementUrl, validDomain, validWireguardPort } from '../admin/netbirdRoutes.js';
+import { registerNetbirdRoutes, parseNetbirdStatus, parseCaddyStatus, validHostname, validManagementUrl, validDomain, validWireguardPort, validExternalIpMap } from '../admin/netbirdRoutes.js';
 
 const KEY = 'A1B2C3D4-SECRET-KEY-WXYZ';
 const TOKEN = 'cfTokenSecretValue_0123456789-abcd';
@@ -50,6 +50,12 @@ describe('netbird helpers', () => {
     expect(validWireguardPort(65536)).toBe(false);
     expect(validWireguardPort(-1)).toBe(false);
     expect(validWireguardPort('1')).toBe(false);
+    expect(validExternalIpMap('')).toBe(true);
+    expect(validExternalIpMap('203.0.113.10')).toBe(true);
+    expect(validExternalIpMap('203.0.113.10/10.0.0.1,198.51.100.2/eth1')).toBe(true);
+    expect(validExternalIpMap('999.1.1.1')).toBe(false);
+    expect(validExternalIpMap('1.2.3.4;rm')).toBe(false);
+    expect(validExternalIpMap(5)).toBe(false);
   });
 
   it('parses caddy-status.json; old file means not running', () => {
@@ -105,7 +111,7 @@ describe('/admin/netbird', () => {
     const v = await (await call('GET', '')).json();
     expect(v).toEqual({
       configured: true, enabled: false, hostname: 'fantom', managementUrl: 'https://api.netbird.io:443',
-      hasKey: false, keyHint: null, wireguardPort: 0, status: null,
+      hasKey: false, keyHint: null, wireguardPort: 0, externalIpMap: '', status: null,
       https: {
         enabled: false, domain: '', email: '', hasToken: false, tokenHint: null,
         address: '', status: null,
@@ -150,6 +156,16 @@ describe('/admin/netbird', () => {
     await call('PUT', '', { https: { enabled: false } });
     expect(JSON.parse(fs.readFileSync(file, 'utf8')).https.cloudflareToken).toBe(TOKEN);
     expect(await (await call('GET', '')).text()).not.toContain(TOKEN);
+  });
+
+  it('saves the advertised public IP right after wireguardPort (sed reads it)', async () => {
+    const res = await call('PUT', '', { wireguardPort: 52002, externalIpMap: ' 203.0.113.10 ' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ wireguardPort: 52002, externalIpMap: '203.0.113.10' });
+    const raw = fs.readFileSync(path.join(ctl, 'config.json'), 'utf8');
+    expect(raw).toMatch(/^  "wireguardPort": 52002,\n  "externalIpMap": "203.0.113.10",$/m);
+    expect((await call('PUT', '', { externalIpMap: 'not an ip' })).status).toBe(400);
+    expect(await (await call('PUT', '', { externalIpMap: '' })).json()).toMatchObject({ externalIpMap: '' });
   });
 
   it('DELETE /https-token removes only the token', async () => {

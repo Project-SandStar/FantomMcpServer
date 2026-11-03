@@ -30,6 +30,9 @@ export default {
     ],
   },
   testMatch: ['**/__tests__/**/*.ts', '**/?(*.)+(spec|test).ts'],
+  // Suites that spawn git, a hook script or an HTTP server exceed Jest's 5s
+  // default when the whole suite runs in parallel (release dry run, 2026-11-03).
+  testTimeout: 30_000,
   // Agent worktrees live under .claude/worktrees/<id>/ and carry a full copy
   // of the tree; without these, jest runs every suite twice (once per copy)
   // and the duplicates collide on module identity.

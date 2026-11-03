@@ -14,6 +14,10 @@
 
 import type { RerankMode } from './hybridSearch.js';
 import { emitAskEvent } from './askEvents.js';
+import {
+  ProviderHttpError, classifyError, warningFor, finalizeWarnings, markProviderExhausted, providerExhaustedState, providerLabel,
+  type ProviderWarning,
+} from './providerErrors.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getSemanticSearchService } from './semanticSearchService.js';
@@ -722,6 +726,8 @@ export interface AnswerCodeQuestionResult {
   /** Jev routing judgment when the gate ran (caller gave no `rlm` flag and
    *  TypeSafe is enabled). `applied` = it turned the RLM loop off. */
   jev?: { route: 'direct' | 'rlm'; confidence: number; identifier: boolean; applied: boolean; model: string; ms: number };
+  /** Provider problems the caller should see, e.g. Gemini out of credits while OpenRouter answered. */
+  warnings?: ProviderWarning[];
 }
 
 /**
@@ -822,7 +828,7 @@ async function callGroqChat(model: string, system: string, user: string, maxToke
       ],
     }),
   });
-  if (!res.ok) throw new Error(`Groq HTTP ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new ProviderHttpError('groq', res.status, await res.text());
   const json: any = await res.json();
   return json.choices?.[0]?.message?.content ?? '';
 }
@@ -844,7 +850,7 @@ export async function callAnthropicChat(model: string, system: string, user: str
       messages: [{ role: 'user', content: user }],
     }),
   });
-  if (!res.ok) throw new Error(`Anthropic HTTP ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new ProviderHttpError('anthropic', res.status, await res.text());
   const json: any = await res.json();
   if (Array.isArray(json.content)) {
     return json.content.map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join('');
@@ -865,7 +871,7 @@ export async function callGeminiChat(model: string, system: string, user: string
       generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens },
     }),
   });
-  if (!res.ok) throw new Error(`Gemini HTTP ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new ProviderHttpError('gemini', res.status, await res.text());
   const json: any = await res.json();
   return json.candidates?.[0]?.content?.parts?.map((p: any) => p?.text ?? '').join('') ?? '';
 }
@@ -1454,11 +1460,20 @@ export async function answerCodeQuestion(
   // sidecar's OpenRouter route with the `direct:` id, which is a 400 there,
   // and every direct ask degraded to citations-only (2026-09-30).
   const directSynthesis = async (): Promise<string | null> => {
+    let directProvider: string | null = null;
     try {
       const { getOpenRouterSettings } = await import('../sidecars/openRouterConfig.js');
       const { parseDirectRlmModel } = await import('../sidecars/openRouterModels.js');
       const direct = parseDirectRlmModel(getOpenRouterSettings().rlmSandboxModel ?? '');
       if (!direct) return null;
+      directProvider = direct.provider;
+      // Out of credits a few minutes ago: skip the call that would fail again,
+      // but still tell the caller why the answer came from somewhere else.
+      if (providerExhaustedState(direct.provider)) {
+        console.warn(`[answerCodeQuestion] ${providerLabel(direct.provider)} is marked out of credits — skipping direct synthesis, using '${provider}'`);
+        addWarning(warningFor(direct.provider, 'quota-exhausted', providerExhaustedState(direct.provider)?.status));
+        return null;
+      }
       const tokens = Math.max(maxTokens, 4096);
       const text = direct.provider === 'gemini'
         ? await callGeminiChat(direct.model, SYSTEM_PROMPT, synthUserPrompt, tokens)
@@ -1468,12 +1483,33 @@ export async function answerCodeQuestion(
       console.log(`[answerCodeQuestion] synthesis via ${direct.provider}'s own API (${direct.model}) at ${Math.round((Date.now() - startedAt) / 1000)}s of ${Math.round(budgetMs / 1000)}s`);
       return text;
     } catch (err) {
-      console.warn(`[answerCodeQuestion] direct synthesis failed: ${(err as Error).message.split('\n')[0].slice(0, 200)} — falling back to '${provider}'`);
+      const c = classifyError(err);
+      console.warn(`[answerCodeQuestion] direct synthesis failed (${c.kind}): ${(err as Error).message.replace(/\s+/g, ' ').slice(0, 300)} — falling back to '${provider}'`);
+      if (directProvider) noteProviderFailure(directProvider, err);
       return null;
     }
   };
 
+  /** Warnings for the caller, filled as providers fail; the fallback name is added once known. */
+  const warnings: ProviderWarning[] = [];
+  const addWarning = (w: ProviderWarning) => {
+    if (warnings.some(x => x.provider === w.provider && x.kind === w.kind)) return;
+    warnings.push(w);
+  };
+  /** Classify a failed provider call; remember an exhausted account. */
+  const noteProviderFailure = (p: string, err: unknown) => {
+    const c = classifyError(err);
+    if (c.kind === 'quota-exhausted') markProviderExhausted(p, c.status);
+    if (c.kind !== 'other') addWarning(warningFor(p, c.kind, c.status));
+  };
+
   try {
+    // A cloud provider marked out of credits is skipped at once: the call
+    // would fail again and cost the caller a round trip each time.
+    if ((provider === 'groq' || provider === 'anthropic' || provider === 'gemini') && providerExhaustedState(provider)) {
+      addWarning(warningFor(provider, 'quota-exhausted', providerExhaustedState(provider)?.status));
+      throw new Error(`${providerLabel(provider)} is marked out of credits (skipped)`);
+    }
     const viaDirect = provider === 'openrouter' ? await directSynthesis() : null;
     if (viaDirect !== null) {
       answer = viaDirect;
@@ -1496,6 +1532,7 @@ export async function answerCodeQuestion(
   } catch (err) {
     // Cloud provider failed (missing key, network, etc.) — fall back to sidecar.
     console.warn(`[answerCodeQuestion] provider '${provider}' failed: ${(err as Error).message}; trying the remaining paths`);
+    if (!/marked out of credits/.test((err as Error).message)) noteProviderFailure(provider, err);
     try {
       // OpenRouter first, then the local sidecar. The old order went straight
       // to the sidecar, which under "OpenRouter only" advertises neither 'llm'
@@ -1520,7 +1557,10 @@ export async function answerCodeQuestion(
         // cannot work from a 500.
         usedProvider = 'none';
         usedModel = 'unavailable';
-        const why = (err as Error).message.split('\n')[0].slice(0, 200);
+        // A known cause (out of credits, bad key) beats the raw text of the
+        // last fallback that failed.
+        const known = warnings.find(w => w.kind === 'provider-quota-exhausted') ?? warnings[0];
+        const why = known ? known.message : (err as Error).message.split('\n')[0].slice(0, 200);
         answer =
           'Synthesis was unavailable, so this is the retrieved evidence without a written answer.\n\n'
           + `The sources below are the ranked matches for the question${results.length ? '' : ' (none found)'}. `
@@ -1540,6 +1580,13 @@ export async function answerCodeQuestion(
   }));
   for (const h of promoted) {
     citations.push({ nodeId: h.nodeId, qualifiedName: h.qualifiedName, filePath: h.filePath, lineStart: h.lineStart, project: h.project, via: 'rlm' });
+  }
+
+  // Name what answered instead, now that it is known, and put each warning on
+  // the live feed so the dashboard can show it while the ask is still open.
+  const finalWarnings = finalizeWarnings(warnings, usedProvider, usedModel);
+  for (const w of finalWarnings) {
+    if (opts.askId) emitAskEvent(opts.askId, { kind: 'warning', text: w.message, detail: w.kind, items: [w.provider] });
   }
 
   marks.synthesisDone = Date.now();
@@ -1566,6 +1613,7 @@ export async function answerCodeQuestion(
       overBudget: Math.max(0, (marks.synthesisDone - startedAt) - budgetMs),
     },
     complexity,
+    ...(finalWarnings.length ? { warnings: finalWarnings } : {}),
     rlm: { used: rlmUsed, model: rlmModel, rounds: rlmRounds, toolCalls: rlmToolCalls, citations: promoted.length },
     ...(jevDecision ? {
       jev: {

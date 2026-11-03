@@ -3,7 +3,32 @@
 All notable changes to FantomMcpServer. Public releases are snapshots; see
 `scripts/release-public.sh`.
 
-## 1.1.5 — unreleased
+## 1.1.6 — 2026-11-03
+
+### RLM runs again on mixed LAN and NetBird fleets
+- **Master URL per sidecar host.** Each sidecar files this master under the
+  address it saw the tunnel come from. A LAN host and a NetBird host hold
+  different spellings, so sending one URL to every host was a 404 on the
+  other host and the RLM loop never ran. The loop and the OpenRouter chat
+  client now send each host its own recorded address.
+
+### Ask path
+- **Reverify after reconnect.** The ask path re-checks the provider after a
+  sidecar reconnect and reads JSON responses safely. A provider quota error
+  shows a popup in the dashboard.
+- **Live key test per provider.** The LLM providers page tests each key
+  against its own provider.
+
+### Graph store
+- **Memory budget.** Query threads are capped and buffer pools are sized by
+  the memory budget. A LadybugDB WAL assertion is treated as on-disk
+  corruption, so the store rebuilds instead of crashing in a loop.
+
+### Deploy
+- **Docker scripts.** `scripts/docker` is in git. Each stack's `<stack>-net`
+  owns the network, so the app container can restart alone.
+
+## 1.1.5 — 2026-10-31
 
 ### Workflows come from the server
 - **New tools.** `listWorkflows({scope?, projectId?, query?})` lists the

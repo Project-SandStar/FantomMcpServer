@@ -22,7 +22,7 @@ jest.unstable_mockModule('../sidecars/virtualInferenceClient.js', () => ({
 const {
   verifyVectorCompatibility, cosine, PROBE_TEXTS, ensureVerified,
   __resetVectorCompatibilityForTest, isClearedToEmbed, verdictKey, getRefusal,
-  recordRefusal, clearTransientRefusals, getProbeBackoff,
+  recordRefusal, clearTransientRefusals, getProbeBackoff, noteSidecarRegistered, isNoTunnelFailure,
   localReference, cloudReference, selectCloudReference, getVerification,
 } = await import('../embedding/providers/vectorCompatibility.js');
 
@@ -395,7 +395,8 @@ describe('under "OpenRouter only" the gate stops asking about local', () => {
 
 describe('probe-failed refusals back off before they are cleared', () => {
   const key = 'probe-backoff-test';
-  const refuse = () => recordRefusal({ key, providerName: 'flaky-OR-CodeEmbedding', kind: 'probe-failed', reason: 'no WS tunnel' } as any);
+  // A live host that times out: the flapping case the backoff exists for.
+  const refuse = () => recordRefusal({ key, providerName: 'flaky-OR-CodeEmbedding', kind: 'probe-failed', reason: 'OpenRouter probe failed: sendCommandToSidecar: timeout after 15000ms (action=virtual-embed)' } as any);
 
   beforeEach(() => {
     __resetVectorCompatibilityForTest();
@@ -431,5 +432,72 @@ describe('probe-failed refusals back off before they are cleared', () => {
     jest.setSystemTime(Date.now() + 3_600_000);
     expect(clearTransientRefusals()).toBe(0);
     expect(getRefusal('real')).toBeTruthy();
+  });
+
+  it('a register does NOT reset the backoff of a live-host timeout', () => {
+    noteSidecarRegistered();
+    for (let i = 0; i < 5; i++) refuse();
+    expect(noteSidecarRegistered()).toBe(0);
+    expect(getProbeBackoff(key).failures).toBe(5);
+    expect(clearTransientRefusals()).toBe(0);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// "No WS tunnel" after a boot: the sidecars are not connected yet. On
+// 2026-11-03 every provider reached ×10 in 3 min and stayed refused for 15 min
+// after the fleet came back, so code search failed until a manual verify.
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('no-tunnel probe failures and sidecar registers', () => {
+  const key = 'no-tunnel-test';
+  const NO_TUNNEL = 'the cloud peer reference embedder X failed, so compatibility could not be established: '
+    + 'virtual-embed: no WS tunnel to the sidecar (command returned null)';
+  const refuse = () => recordRefusal({ key, providerName: 'BASWS35-OR-CodeEmbedding', kind: 'probe-failed', reason: NO_TUNNEL } as any);
+
+  beforeEach(() => {
+    __resetVectorCompatibilityForTest();
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-11-03T12:38:00Z'));
+  });
+  afterEach(() => { jest.useRealTimers(); __resetVectorCompatibilityForTest(); });
+
+  it('recognises the no-tunnel reason', () => {
+    expect(isNoTunnelFailure(NO_TUNNEL)).toBe(true);
+    expect(isNoTunnelFailure('sendCommandToSidecar: timeout after 15000ms')).toBe(false);
+  });
+
+  it('does not count no-tunnel failures before any sidecar has registered', () => {
+    for (let i = 0; i < 10; i++) refuse();
+    expect(getProbeBackoff(key).failures).toBe(0);
+    expect(getRefusal(key)).toBeTruthy();
+    // The first register clears it at once — no 887 s wait.
+    noteSidecarRegistered();
+    expect(clearTransientRefusals()).toBe(1);
+    expect(getRefusal(key)).toBeFalsy();
+  });
+
+  it('a register resets a grown no-tunnel backoff so the reverify re-probes', () => {
+    noteSidecarRegistered(); // fleet seen once
+    jest.setSystemTime(Date.now() + 6 * 60_000);
+    for (let i = 0; i < 10; i++) refuse(); // tunnel dropped later, backoff grows
+    expect(getProbeBackoff(key).failures).toBe(10);
+    expect(clearTransientRefusals()).toBe(0);
+    expect(noteSidecarRegistered()).toBe(1);
+    expect(clearTransientRefusals()).toBe(1);
+  });
+
+  it('a flapping host gets at most one no-tunnel reset per 5 minutes', () => {
+    noteSidecarRegistered();
+    jest.setSystemTime(Date.now() + 6 * 60_000);
+    refuse(); refuse(); refuse();
+    expect(noteSidecarRegistered()).toBe(1);
+    expect(clearTransientRefusals()).toBe(1);
+    refuse(); refuse(); refuse(); // fails again right after the reset
+    jest.setSystemTime(Date.now() + 60_000);
+    expect(noteSidecarRegistered()).toBe(0); // within 5 min: no second reset
+    expect(clearTransientRefusals()).toBe(0);
+    jest.setSystemTime(Date.now() + 5 * 60_000);
+    expect(noteSidecarRegistered()).toBe(1);
   });
 });

@@ -91,3 +91,16 @@ describe('preflightAllProjectGraphStores', () => {
     clearProjectGraphRebuildFlag(9006);
   });
 });
+
+describe('isUnrecoverableDbError', () => {
+  test('WAL record assertion is corruption (project 13, 2026-11-01)', () => {
+    const msg = 'Assertion failed in file "/__w/ladybug/ladybug/src/storage/wal/wal_record.cpp" on line 76: UNREACHABLE_CODE';
+    expect(mod.isUnrecoverableDbError(msg)).toBe(true);
+  });
+  test('lock contention is not corruption', () => {
+    expect(mod.isUnrecoverableDbError('Could not set lock on file : /app/.cache/graph/13.db')).toBe(false);
+  });
+  test('an assertion outside storage/wal is not matched', () => {
+    expect(mod.isUnrecoverableDbError('Assertion failed in file "/__w/ladybug/ladybug/src/binder/bind.cpp" on line 9')).toBe(false);
+  });
+});

@@ -456,6 +456,21 @@ export async function refreshAllVirtualContainers(): Promise<VirtualContainer[]>
   if (!cfg.enabled) return [];
   const sidecars = listSidecars({ enabled: true });
   await Promise.all(sidecars.map(s => refreshVirtualContainers(s.id).catch(() => null)));
+  // Re-key any slot a sidecar restart or a new master URL left "unset". Pushes
+  // only to those sidecars, with a per-sidecar cooldown, and re-reads them a
+  // moment later so the provider list fills without waiting a whole poll.
+  // Dynamic import: openRouterConfig imports this module.
+  try {
+    const { autoPushUnsetSlots } = await import('./openRouterAutoPush.js');
+    const pushed = autoPushUnsetSlots().filter(o => o.pushed);
+    if (pushed.length > 0) {
+      setTimeout(() => {
+        for (const o of pushed) void refreshVirtualContainers(o.sidecarId).catch(() => null);
+      }, 1500).unref?.();
+    }
+  } catch (err) {
+    console.warn(`[virtual-containers] auto-push failed: ${(err as Error).message}`);
+  }
   const rows = listVirtualContainers();
   if (rows.length === 0) {
     const unset = getSlotStatus().filter(s => s.openrouter !== 'configured').length;

@@ -12,13 +12,14 @@
  *
  * ── Key hygiene ────────────────────────────────────────────────────────────
  *
- * The key is WRITE-ONLY here. It arrives on the admin request, goes straight
- * out over the WS frame, and is never written to config, never logged, never
- * returned by any endpoint, and never held past the call. What Fantom
- * persists is only what it is safe to persist: which roles have a model
- * mapped, which upstream provider is pinned, the routing modes, and the fact
- * that a push happened. The sidecar holds the key, exactly as before; Fantom
- * is now the thing that hands it over, not a second place it lives.
+ * The key is never written to config, never logged and never returned by any
+ * endpoint. It arrives on the admin request and goes out over the WS frame;
+ * Fantom also stores it on the server (`secretsStore.ts`, or reads
+ * FANTOM_OPENROUTER_API_KEY from the env) so it can re-key a slot that a sidecar restart or a new
+ * master URL left empty — see `availablePushKey` and `openRouterAutoPush.ts`.
+ * What Fantom persists is only what it is safe to persist: which roles have a
+ * model mapped, which upstream provider is pinned, the routing modes, and the
+ * fact that a push happened.
  *
  * Re-pushing without a key is supported and is the normal case for changing a
  * mode or a model: the sidecar merges a partial push onto the entry it
@@ -36,9 +37,12 @@
  */
 
 import * as path from 'path';
+import { storeSecret, secretSource, type SecretSource } from '../config/secretsStore.js';
 import type { VirtualRole, VirtualRoutingMode } from './virtualContainers.js';
 import { VIRTUAL_ROLES, DEFAULT_OR_RERANK_MODEL } from './virtualContainers.js';
-import { DEFAULT_CODE_ASSISTANT_MODEL, isRlmFallbackMode, type RlmFallbackMode } from './openRouterModels.js';
+import {
+  DEFAULT_CODE_ASSISTANT_MODEL, DEFAULT_RLM_SANDBOX_MODEL, isRlmFallbackMode, parseDirectRlmModel, type RlmFallbackMode,
+} from './openRouterModels.js';
 import {
   modesFromPolicies, sanitizePolicies, policyFromMode,
   type PolicyByRole,
@@ -282,17 +286,61 @@ export interface PushResult {
   reason?: string;
 }
 
+// ── Key source for automatic pushes ──────────────────────────────────────
+//
+// The sidecar keeps its config, key included, in memory and per master URL.
+// A sidecar restart, or Fantom moving to a new URL (the Docker deployment),
+// leaves Fantom's slot "unset", and a push WITHOUT a key does not fix that:
+// the sidecar drops it ("pushed with no apiKey (and none on file)"). So an
+// automatic re-push has to carry the key, which means Fantom must have one.
+// The key lives in the shared secrets store (`src/config/secretsStore.ts`):
+// a key pasted on the dashboard is saved to `<cache>/secrets/` (the persistent
+// volume in Docker) and applied to process.env; at boot a stored key wins
+// over `FANTOM_OPENROUTER_API_KEY` from the env file. Never written to the
+// config file, never logged, never returned.
+export type PushKeySource = SecretSource;
+
+export function availablePushKey(): { key: string; source: Exclude<PushKeySource, null> } | null {
+  const key = process.env.FANTOM_OPENROUTER_API_KEY?.trim();
+  const source = secretSource('FANTOM_OPENROUTER_API_KEY');
+  return key && source ? { key, source } : null;
+}
+
 /**
  * Push the config to every enabled sidecar with an open WS tunnel.
  *
- * `apiKey` is optional and used once, in memory: it is placed on the outgoing
- * frame and then dropped. Omit it to update models or modes without
+ * `apiKey` is optional. When given it goes on the outgoing frame and is stored
+ * on the server (secrets store, never the config file) so
+ * automatic re-pushes can re-key a slot that a sidecar restart emptied — see
+ * `openRouterAutoPush.ts`. Omit it to update models or modes without
  * re-sending the key — the sidecar merges partial pushes.
  */
 export function pushOpenRouterConfig(
   settings: OpenRouterSettings,
   apiKey?: string,
 ): { results: PushResult[]; pushedCount: number } {
+  if (apiKey) {
+    try {
+      storeSecret('FANTOM_OPENROUTER_API_KEY', apiKey);
+    } catch (err) {
+      // Still push it; only the server-side copy failed.
+      process.env.FANTOM_OPENROUTER_API_KEY = apiKey;
+      console.warn(`[openrouter] could not store the API key on the server: ${(err as Error).message}`);
+    }
+  }
+  const { payload, resolved } = buildOpenRouterPushPayload(settings, apiKey);
+  settings = resolved;
+  return deliverAndRecord(settings, payload, apiKey);
+}
+
+/**
+ * The `config` frame payload for a push. Pure: no I/O, no stored state. Shared
+ * by the operator push and the per-sidecar automatic re-push.
+ */
+export function buildOpenRouterPushPayload(
+  settings: OpenRouterSettings,
+  apiKey?: string,
+): { payload: Record<string, unknown>; resolved: OpenRouterSettings } {
   // Derive the wire modes HERE rather than trusting what the caller put in
   // `modeByRole`. The policy is the stored truth and the mode is a projection
   // of it; every other reader already recomputes it, and this was the last
@@ -323,7 +371,14 @@ export function pushOpenRouterConfig(
   // shows up in the sidecar's `rolesWithModel` as if it were configured.
   delete allowedModels['rlm'];
   if (settings.rlmSandboxModel) {
-    allowedModels['rlm-sandbox'] = { model: settings.rlmSandboxModel };
+    // A `direct:<provider>:<model>` id runs on that provider's own API and is
+    // not an OpenRouter model. Pushing it made the OpenRouter fallback 400
+    // ("direct:gemini:gemini-3.8-flash is not a valid model ID", 2026-11-03),
+    // so when Gemini ran out of credits there was no fallback at all. The
+    // sidecar gets a real OpenRouter model for that fallback instead.
+    allowedModels['rlm-sandbox'] = {
+      model: parseDirectRlmModel(settings.rlmSandboxModel) ? DEFAULT_RLM_SANDBOX_MODEL : settings.rlmSandboxModel,
+    };
   }
 
   // Mode under BOTH keys. Fantom decides the endpoint itself
@@ -343,7 +398,14 @@ export function pushOpenRouterConfig(
       domain: 'code',
     },
   };
-  settings = resolved;
+  return { payload, resolved };
+}
+
+function deliverAndRecord(
+  settings: OpenRouterSettings,
+  payload: Record<string, unknown>,
+  apiKey?: string,
+): { results: PushResult[]; pushedCount: number } {
 
   const results: PushResult[] = [];
   for (const sc of listSidecars({ enabled: true })) {
@@ -389,5 +451,9 @@ export function pushOpenRouterConfig(
 export function rePushStoredConfig(): { results: PushResult[]; pushedCount: number } | null {
   const s = getOpenRouterSettings();
   if (Object.keys(s.allowedModels).length === 0) return null;
-  return pushOpenRouterConfig(s);
+  // Carry the key when Fantom has one: a keyless push is dropped by a slot the
+  // sidecar restart emptied, which is exactly the case this button is for.
+  const key = availablePushKey()?.key;
+  const { payload, resolved } = buildOpenRouterPushPayload(s, key);
+  return deliverAndRecord(resolved, payload, key);
 }

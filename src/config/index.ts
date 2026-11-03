@@ -5,6 +5,7 @@ import { resolve, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 import type { FantomConfig } from '../types/index.js';
 import { getInstallRoot } from '../utils/installRoot.js';
+import { applyStoredSecretsToEnv } from './secretsStore.js';
 
 // Load .env relative to this file's location, not process.cwd().
 // When the MCP server is spawned via stdio from a foreign cwd
@@ -14,6 +15,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // build/config/index.js -> repo root is two levels up
 dotenvConfig({ path: path.resolve(__dirname, '../../.env') });
+// API keys saved on the dashboard (<cache>/secrets, the persistent volume in
+// Docker) win over .env and the deployment env file. See secretsStore.ts.
+applyStoredSecretsToEnv();
 
 /**
  * Default configuration values

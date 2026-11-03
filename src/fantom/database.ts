@@ -690,6 +690,26 @@ export class FantomDatabase {
   // ===========================================
 
   /**
+   * A free project name for a pod. `FantomProject.name` is unique, and the
+   * same pod name exists in every Haxall/SkySpark version (`auth` in 4.0.4
+   * AND 4.0.6). Using the bare pod name made the second version's create
+   * throw, so only pods unique to that version got a project — 57 of 62
+   * Haxall 4.0.6 pods were silently never indexed. Bare name when free, else
+   * `<instance name>:<pod>` (the form the instance source indexer uses), else
+   * that plus a short path hash.
+   */
+  async projectNameForPod(podName: string, podPath: string, instanceId?: number | null): Promise<string> {
+    const prisma = getPrismaClient();
+    const taken = async (n: string) => (await prisma.fantomProject.findUnique({ where: { name: n } })) !== null;
+    if (!(await taken(podName))) return podName;
+    const inst = instanceId != null ? await prisma.instance.findUnique({ where: { id: instanceId } }) : null;
+    const qualified = inst ? `${inst.name}:${podName}` : podName;
+    if (qualified !== podName && !(await taken(qualified))) return qualified;
+    const { createHash } = await import('crypto');
+    return `${qualified}#${createHash('md5').update(podPath).digest('hex').slice(0, 6)}`;
+  }
+
+  /**
    * Create a new Fantom project for code indexing.
    *
    * Refuses to register the same path twice. Schema currently only has

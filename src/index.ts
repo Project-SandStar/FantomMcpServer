@@ -340,7 +340,7 @@ class FantomMCPServer {
     this.server = new Server(
       {
         name: 'mcp-fantom',
-        version: '1.1.5',
+        version: '1.1.6',
       },
       {
         capabilities: {
@@ -1408,9 +1408,10 @@ class FantomMCPServer {
           // Detect language
           const detected = detectPrimaryLanguage(pod.path);
 
-          // Create a new project for this pod
+          // Create a new project for this pod. The name must be unique across
+          // versions (`auth` exists in every Haxall), see projectNameForPod.
           const project = await db.createProject({
-            name: pod.name,
+            name: await db.projectNameForPod(pod.name, pod.path, pod.defaultInstanceId),
             path: pod.path,
             podName: pod.name,
             instanceId: pod.defaultInstanceId || undefined,
@@ -1567,7 +1568,7 @@ class FantomMCPServer {
         };
       })(),
       initialized: this.initializationComplete,
-      version: '1.1.5',
+      version: '1.1.6',
       serverPath: path.resolve(dirname(fileURLToPath(import.meta.url)), 'index.js'),
       port: getServerPort(),
       stats: {
@@ -2758,7 +2759,15 @@ class FantomMCPServer {
     // Optional static bearer token in front of /mcp and /admin
     // (FANTOM_API_TOKEN; unset = off). TLS: reverse proxy (deploy/Caddyfile).
     const { apiTokenGate } = await import('./auth/apiTokenGate.js');
-    app.use(apiTokenGate());
+    // On /mcp it also accepts a live OAuth access token (provider is set up
+    // further down, so read it per request; no provider = refused).
+    app.use(apiTokenGate({
+      verifyOAuthToken: async (t) => {
+        const provider = this.oauthProvider;
+        if (!provider) return false;
+        try { await provider.verifyAccessToken(t); return true; } catch { return false; }
+      },
+    }));
 
     // CORS middleware for development (dashboard on different port)
     app.use((req: Request, res: Response, next) => {
@@ -2868,7 +2877,7 @@ class FantomMCPServer {
 
           // Create a NEW Server instance for this session
           const sessionServer = new Server(
-            { name: 'mcp-fantom', version: '1.1.5' },
+            { name: 'mcp-fantom', version: '1.1.6' },
             { capabilities: { tools: {}, resources: {} }, instructions: SERVER_INSTRUCTIONS }
           );
 
@@ -3166,6 +3175,9 @@ class FantomMCPServer {
         }
         resolve();
       });
+      // Idle sockets outlive the proxy's (see httpServerTimeouts.ts): avoids
+      // Caddy 502s with an empty body from a keep-alive race.
+      void import('./utils/httpServerTimeouts.js').then(m => m.applyHttpServerTimeouts(httpServer));
       // Attach sidecar WS server (Fantom-native protocol) and Sound Suite
       // master-side handler (so multi-master sidecars can register us).
       void import('./sidecars/wsServer.js').then(m => m.attachSidecarWsServer(httpServer));

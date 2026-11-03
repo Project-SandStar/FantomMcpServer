@@ -183,12 +183,51 @@ const verified = new Map<string, VectorVerification>();
  * Consecutive probe failures double the wait before the next attempt,
  * 30s → 15 min cap; a pass resets it.
  */
-const probeFailures = new Map<string, { count: number; lastAt: number }>();
+const probeFailures = new Map<string, { count: number; lastAt: number; noTunnel: boolean; lastResetAt?: number }>();
 const PROBE_BACKOFF_BASE_MS = 30_000;
 const PROBE_BACKOFF_MAX_MS = 15 * 60_000;
+
+/**
+ * "No WS tunnel" is a fact about the fleet, not about the provider: the probe
+ * never left this server. After a boot every sidecar is disconnected for a few
+ * minutes, and counting those failures pushed every provider to the 15 min cap
+ * before any of them had a chance (2026-11-03: ×10 in 3 min, then "next probe
+ * in 887s" when the fleet came back).
+ */
+export function isNoTunnelFailure(reason: string): boolean {
+  return /no WS tunnel/i.test(reason);
+}
+
+/** Set by the first sidecar register since boot. Before it, no-tunnel failures do not count. */
+let anySidecarRegistered = false;
+
+/** A register may reset a no-tunnel backoff at most this often per provider. */
+const NO_TUNNEL_RESET_MIN_INTERVAL_MS = 5 * 60_000;
+
+/**
+ * A sidecar (re)registered: new evidence that tunnels are up. Reset the
+ * backoff of refusals whose last failure was "no WS tunnel", so the next
+ * clearTransientRefusals() drops them and the debounced reverify re-probes.
+ *
+ * Failures from a LIVE host (a timeout, a bad reply) keep their backoff: that
+ * is the flapping-host case the backoff exists for. A no-tunnel reset is also
+ * rate-limited per provider, so a host that re-registers every few seconds
+ * still cannot cause more than one extra probe per 5 minutes.
+ */
+export function noteSidecarRegistered(now = Date.now()): number {
+  anySidecarRegistered = true;
+  let n = 0;
+  for (const [key, f] of probeFailures) {
+    if (!f.noTunnel) continue;
+    if (f.lastResetAt !== undefined && now - f.lastResetAt < NO_TUNNEL_RESET_MIN_INTERVAL_MS) continue;
+    probeFailures.set(key, { count: 0, lastAt: 0, noTunnel: true, lastResetAt: now });
+    n++;
+  }
+  return n;
+}
 function probeBackoffRemainingMs(key: string, now = Date.now()): number {
   const f = probeFailures.get(key);
-  if (!f) return 0;
+  if (!f || f.count <= 0) return 0;
   const wait = Math.min(PROBE_BACKOFF_MAX_MS, PROBE_BACKOFF_BASE_MS * 2 ** Math.min(10, f.count - 1));
   return Math.max(0, f.lastAt + wait - now);
 }
@@ -204,7 +243,11 @@ export function recordRefusal(r: Omit<VectorRefusal, 'at'>): VectorRefusal {
   verified.delete(rec.key);
   if (rec.kind === 'probe-failed') {
     const f = probeFailures.get(rec.key);
-    probeFailures.set(rec.key, { count: (f?.count ?? 0) + 1, lastAt: Date.now() });
+    const noTunnel = isNoTunnelFailure(rec.reason);
+    // Before the first register since boot, "no tunnel" is the expected state
+    // of every provider: record it, but do not grow the backoff.
+    const count = noTunnel && !anySidecarRegistered ? 0 : (f?.count ?? 0) + 1;
+    probeFailures.set(rec.key, { count, lastAt: Date.now(), noTunnel, lastResetAt: f?.lastResetAt });
   } else {
     probeFailures.delete(rec.key);
   }
@@ -633,4 +676,5 @@ export function __resetVectorCompatibilityForTest(): void {
   refusals.clear();
   verified.clear();
   probeFailures.clear();
+  anySidecarRegistered = false;
 }

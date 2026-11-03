@@ -30,7 +30,7 @@
 
 import { listVirtualContainers } from '../../sidecars/virtualContainers.js';
 import {
-  clearTransientRefusals, verifyVectorCompatibility, cloudReference, selectCloudReferences,
+  clearTransientRefusals, noteSidecarRegistered, verifyVectorCompatibility, cloudReference, selectCloudReferences,
 } from './vectorCompatibility.js';
 import { embeddingRoutingPolicy, tableDimsFor } from './embeddingProvider.js';
 
@@ -44,6 +44,13 @@ let pendingReasons: string[] = [];
 
 /** Called from the WS register handler. Cheap; the work is deferred. */
 export function onSidecarReconnected(sidecarName: string): void {
+  // A register is new evidence that tunnels are up: reset the backoff of
+  // providers whose last probe failed only because no tunnel existed, so the
+  // clear below drops them instead of "keeping … refused, next probe in 887s".
+  const reset = noteSidecarRegistered();
+  if (reset > 0) {
+    console.log(`[cloud-reverify] ${sidecarName} registered — reset the no-tunnel probe backoff of ${reset} provider(s).`);
+  }
   const cleared = clearTransientRefusals();
   if (cleared > 0) {
     console.log(

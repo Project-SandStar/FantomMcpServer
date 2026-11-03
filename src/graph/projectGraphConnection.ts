@@ -29,8 +29,17 @@ import * as path from 'path';
 import { Database, Connection } from '@ladybugdb/core';
 import { createLogger } from '../utils/index.js';
 import { getCachePath } from '../utils/installRoot.js';
+import {
+  isBufferPoolError,
+  resolveProjectBufferPoolMiB,
+  resolveGraphQueryThreads,
+  runWithPoolFullRetry,
+} from './graphPoolSizing.js';
 
 const logger = createLogger('project-graph-conn');
+
+/** Pool size (MiB) each project store was last opened with; logged and in pool stats. */
+const lastPoolMiB = new Map<number, number>();
 
 interface Entry {
   projectId: number;
@@ -143,7 +152,7 @@ function purgeProjectDbFiles(projectId: number): void {
  * Distinguish on-disk corruption we can recover from by delete+rebuild from a
  * transient lock held by another live process (which must NOT trigger a purge).
  */
-function isUnrecoverableDbError(msg: string): boolean {
+export function isUnrecoverableDbError(msg: string): boolean {
   // Never purge on a live-process lock — that's contention, not corruption.
   if (/\block\b|another .*process|already (open|in use)|held by pid/i.test(msg)) return false;
   // Match ONLY true on-disk corruption signatures seen on OPEN. Deliberately
@@ -156,7 +165,12 @@ function isUnrecoverableDbError(msg: string): boolean {
   // "not a valid Lbug database file" (2026-09-20, project 367): a file with no
   // LBUG magic, e.g. left over from an older storage format. It was not
   // matched here, so every open threw and the project stayed broken for days.
-  return /\.shadow|\.wal\.checkpoint|reading past the end of the file|unexpected end of file|wal.*(replay|recover|corrupt)|corrupt|checksum|truncated|malformed|database is (invalid|damaged)|not a valid .*database file|invalid .*database file|bad magic|unsupported (storage|file|database) version/i.test(msg);
+  // "Assertion failed in file …/storage/wal/wal_record.cpp … UNREACHABLE_CODE"
+  // (2026-11-01, project 13 on basws42): a WAL record the replayer cannot
+  // decode. It was not matched, so the store never healed, the project was
+  // force-reindexed on every boot and the RSS guard restarted the server
+  // every ~14 minutes.
+  return /assertion failed in file "?[^"]*storage\/wal\/|\.shadow|\.wal\.checkpoint|reading past the end of the file|unexpected end of file|wal.*(replay|recover|corrupt)|corrupt|checksum|truncated|malformed|database is (invalid|damaged)|not a valid .*database file|invalid .*database file|bad magic|unsupported (storage|file|database) version/i.test(msg);
 }
 
 // ── On-disk pre-flight ──────────────────────────────────────────────────────
@@ -503,14 +517,16 @@ async function openProjectConnection(
     // via projectQuery's free-idle-and-retry. Override via FANTOM_GRAPH_DB_BUFFER_MIB.
     // 24 MiB is too small for the big stores: SoundSuite (21.7k nodes, 20 MB
     // file) wrote 0 of 48.6k edges at 24 and all of them at 96 (2026-10-17).
-    // Size the pool from the store file instead — 5 × its MiB, 24..128 — so
-    // the ~330 stores under 5 MB keep 24 and only the dozen large ones grow.
-    const bufMiBEnv = Number(process.env.FANTOM_GRAPH_DB_BUFFER_MIB);
+    // Size the pool from the store file (5 × its MiB) with a floor and a cap
+    // from the memory budget — see graphPoolSizing.ts. The query thread cap
+    // below matters more: on a 112-CPU host each worker pinned its own pages
+    // and a 24 MiB pool overflowed on a 7 MB store (2026-11-03).
     let fileMiB = 0;
     try { fileMiB = fs.statSync(dbPath).size / 1024 / 1024; } catch { /* new store */ }
     fileMiB = Math.max(fileMiB, resetSizeHintMiB.get(projectId) ?? 0);
-    const sizedMiB = Math.min(128, Math.max(24, Math.ceil(fileMiB * 5)));
-    const PROJECT_DB_BUFFER_SIZE = (Number.isFinite(bufMiBEnv) && bufMiBEnv > 0 ? bufMiBEnv : sizedMiB) * 1024 * 1024;
+    const poolMiB = resolveProjectBufferPoolMiB(fileMiB, getMaxOpen());
+    lastPoolMiB.set(projectId, poolMiB);
+    const PROJECT_DB_BUFFER_SIZE = poolMiB * 1024 * 1024;
     // autoCheckpoint OFF. We CHECKPOINT ourselves on every close (below) and
     // at shutdown; the engine's own checkpoint fires INSIDE a running query
     // (`TransactionManager::checkpoint ← Transaction::getNextTuplesInternal`)
@@ -528,7 +544,7 @@ async function openProjectConnection(
       false,                 // autoCheckpoint
     );
     await db.init();
-    const conn = new Connection(db);
+    const conn = new Connection(db, resolveGraphQueryThreads());
     await conn.init();
     return { database: db, connection: conn };
   };
@@ -585,7 +601,7 @@ async function openProjectConnection(
   const mem = process.memoryUsage();
   const rssMb = Math.round(mem.rss / 1024 / 1024);
   const heapMb = Math.round(mem.heapUsed / 1024 / 1024);
-  logger.info(`LadybugDB connection opened for project ${projectId} at ${dbPath} | open=${entries.size} rss=${rssMb}MB heap=${heapMb}MB`);
+  logger.info(`LadybugDB connection opened for project ${projectId} at ${dbPath} | open=${entries.size} pool=${lastPoolMiB.get(projectId) ?? '?'}MiB threads=${resolveGraphQueryThreads()} rss=${rssMb}MB heap=${heapMb}MB`);
   // Mirror to crash log so silent SIGKILLs (Jetsam OOM under mmap pressure)
   // leave us a breadcrumb identifying the last opened connection. Routed
   // through logSink so the master debug toggle gates this write.
@@ -594,17 +610,6 @@ async function openProjectConnection(
     crashWrite('LADYBUG_OPEN', `project=${projectId} open=${entries.size} rss=${rssMb}MB heap=${heapMb}MB path=${dbPath}`);
   } catch { /* swallow */ }
   return connection;
-}
-
-/** A Kuzu buffer-manager OOM ("buffer pool is full and no memory could be
- *  freed"). NOTE: this is NOT recoverable by freeing other connections' pools
- *  or GC — each Database's pool is independent and construction-fixed. The real
- *  cause is concurrent queries pinning frames on one connection; `runSerialized`
- *  prevents that. We keep this predicate only to log the residual single-query
- *  case distinctly. */
-function isBufferPoolError(err: unknown): boolean {
-  const m = err instanceof Error ? err.message : String(err);
-  return /buffer pool is full|Buffer manager exception|Unable to allocate memory/i.test(m);
 }
 
 /**
@@ -666,7 +671,7 @@ async function runSerialized<R>(
         logger.error(
           `[projectGraph] buffer-pool OOM on project ${projectId} even under ` +
             `serialization — a single query's working set exceeds the ` +
-            `project pool (24..128 MiB by store size; FANTOM_GRAPH_DB_BUFFER_MIB overrides).`,
+            `project pool (${lastPoolMiB.get(projectId) ?? '?'} MiB; see graphPoolSizing.ts for the env overrides).`,
         );
       } else if (isIoError(err)) {
         markProjectDegraded(projectId, err);
@@ -693,23 +698,35 @@ export async function projectQuery<T = Record<string, unknown>>(
   cypher: string,
 ): Promise<T[]> {
   return runSerialized(projectId, async (entry) => {
-    const result = await entry.connection.query(cypher);
-    const qr = Array.isArray(result) ? result[0] : result;
-    try {
-      const rows = await qr.getAll();
-      return rows as T[];
-    } finally {
-      // CRITICAL: a QueryResult pins buffer-manager pages until closed. Leaving
-      // it open leaks those pins; across the ~dozens of graph queries in one
-      // `ask`/enrichment pass they accumulate until the 24 MiB per-project pool
-      // is exhausted → "Buffer manager exception: buffer pool is full and no
-      // memory could be freed" — even fully serialized (the pins are the leak,
-      // not concurrency). Empirically: 37 unclosed queries OOM a 24 MiB pool;
-      // closing each lets 200+ run. Close ALL results when query() returns an
-      // array (multi-statement) too, not just the first.
-      closeResults(result);
-    }
+    // A full pool on a read gets one retry on a single thread (fewest pinned
+    // pages) before it surfaces to the caller.
+    return runWithPoolFullRetry(
+      entry.connection,
+      resolveGraphQueryThreads(),
+      () => queryAll<T>(entry, cypher),
+      () => logger.warn(`[projectGraph] project ${projectId}: buffer pool full; retrying the query on 1 thread`),
+    );
   });
+}
+
+/** One read query: all rows, every QueryResult closed. */
+async function queryAll<T>(entry: Entry, cypher: string): Promise<T[]> {
+  const result = await entry.connection.query(cypher);
+  const qr = Array.isArray(result) ? result[0] : result;
+  try {
+    const rows = await qr.getAll();
+    return rows as T[];
+  } finally {
+    // CRITICAL: a QueryResult pins buffer-manager pages until closed. Leaving
+    // it open leaks those pins; across the ~dozens of graph queries in one
+    // `ask`/enrichment pass they accumulate until the per-project pool is
+    // exhausted → "Buffer manager exception: buffer pool is full and no
+    // memory could be freed" — even fully serialized (the pins are the leak,
+    // not concurrency). Empirically: 37 unclosed queries OOM a 24 MiB pool;
+    // closing each lets 200+ run. Close ALL results when query() returns an
+    // array (multi-statement) too, not just the first.
+    closeResults(result);
+  }
 }
 
 /** Close every QueryResult a query() call produced (array = multi-statement),

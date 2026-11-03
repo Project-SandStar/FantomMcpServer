@@ -2,7 +2,8 @@
 
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
-import { api, type AskEvent } from '@/lib/api';
+import { api, readJsonResponse, type AskEvent, type ProviderWarning } from '@/lib/api';
+import { ProviderAlertModal } from '@/components/ui/ProviderAlertModal';
 import dynamic from 'next/dynamic';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -124,11 +125,7 @@ async function performSemanticSearch(
     body: JSON.stringify({ query, projectId, versionGroup, limit, rerank: rerank ? 'on' : 'off' })
   });
 
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Search failed');
-  }
-  return response.json();
+  return readJsonResponse(response, 'Search failed');
 }
 
 async function fetchProjectVectors(projectId: number): Promise<{ nodes: VectorPoint[] }> {
@@ -141,11 +138,7 @@ async function fetchProjectVectors(projectId: number): Promise<{ nodes: VectorPo
     headers: { 'Authorization': authHeader }
   });
 
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Failed to fetch vectors');
-  }
-  return response.json();
+  return readJsonResponse(response, 'Failed to fetch vectors');
 }
 
 async function fetchVectorStats(): Promise<VectorStats> {
@@ -158,11 +151,7 @@ async function fetchVectorStats(): Promise<VectorStats> {
     headers: { 'Authorization': authHeader }
   });
 
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Failed to fetch stats');
-  }
-  return response.json();
+  return readJsonResponse(response, 'Failed to fetch stats');
 }
 
 interface GenerateVectorsResult {
@@ -189,11 +178,7 @@ async function generateVectors(projectId: number): Promise<GenerateVectorsResult
     body: JSON.stringify({ batchSize: 25 })
   });
 
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Failed to generate vectors');
-  }
-  return response.json();
+  return readJsonResponse(response, 'Failed to generate vectors');
 }
 
 // ============================================
@@ -425,8 +410,19 @@ export default function VectorViewerPage() {
     onMutate: (vars) => {
       askStartedAt.current = performance.now(); setAskElapsedMs(0);
       setAskFeedId(vars.askId); setAskEvents([]); setThinkingOpen(true);
+      setProviderAlert([]); providerAlertShownFor.current = null;
+    },
+    onSuccess: (data, vars) => {
+      if (data.warnings?.length && providerAlertShownFor.current !== vars.askId) {
+        providerAlertShownFor.current = vars.askId;
+        setProviderAlert(data.warnings);
+      }
     },
   });
+  // Popup for a provider problem (e.g. Gemini out of credits). Shown once per
+  // ask: from the live feed if a warning arrives early, else from the result.
+  const [providerAlert, setProviderAlert] = useState<ProviderWarning[]>([]);
+  const providerAlertShownFor = useRef<string | null>(null);
   // Live "thinking" feed: what the RLM is asking and what came back, polled
   // once a second while the ask runs, plus one final read after it settles.
   const [askFeedId, setAskFeedId] = useState<string | null>(null);
@@ -466,6 +462,16 @@ export default function VectorViewerPage() {
     }).catch(() => {}); }, 300);
     return () => clearTimeout(t);
   }, [askMutation.isPending, askFeedId]);
+  // A provider warning on the live feed opens the popup while the ask runs.
+  useEffect(() => {
+    if (!askFeedId || providerAlertShownFor.current === askFeedId) return;
+    const ws = askEvents
+      .filter(e => e.kind === 'warning' && e.detail?.startsWith('provider-'))
+      .map(e => ({ kind: e.detail as ProviderWarning['kind'], provider: e.items?.[0] ?? 'provider', message: e.text }));
+    if (ws.length === 0) return;
+    providerAlertShownFor.current = askFeedId;
+    setProviderAlert(ws);
+  }, [askEvents, askFeedId]);
   // Tick while an ask is in flight so the wait is a number, not a spinner.
   useEffect(() => {
     if (!askMutation.isPending) return;
@@ -637,6 +643,7 @@ export default function VectorViewerPage() {
 
   return (
     <div className="flex flex-col lg:flex-row gap-4">
+      <ProviderAlertModal warnings={providerAlert} onClose={() => setProviderAlert([])} />
       <ProjectsSidebar
         entries={sidebarEntries}
         groups={sidebarGroups}
@@ -1047,6 +1054,7 @@ export default function VectorViewerPage() {
                         </li>
                       );
                       if (e.kind === 'thought') return <li key={e.seq} className="text-gray-600 italic"><span className="text-gray-400 not-italic">{t}</span> {e.text}</li>;
+                      if (e.kind === 'warning') return <li key={e.seq} className="text-amber-700"><span className="text-gray-400">{t}</span> ⚠ {e.text}</li>;
                       if (e.kind === 'error') return <li key={e.seq} className="text-red-700"><span className="text-gray-400">{t}</span> {e.text}</li>;
                       return <li key={e.seq} className="text-gray-500"><span className="text-gray-400">{t}</span> {e.kind === 'stage' ? '' : `${e.kind} · `}{e.text}</li>;
                     })}

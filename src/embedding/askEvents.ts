@@ -15,7 +15,8 @@ export interface AskEvent {
   seq: number;
   /** ms since the ask started */
   t: number;
-  kind: 'stage' | 'plan' | 'round' | 'ask' | 'answer' | 'thought' | 'done' | 'error';
+  /** 'warning': a provider problem the user should see (detail = warning kind, items[0] = provider). */
+  kind: 'stage' | 'plan' | 'round' | 'ask' | 'answer' | 'thought' | 'done' | 'error' | 'warning';
   text: string;
   /** Pairs an 'answer' with its 'ask'. */
   id?: string;

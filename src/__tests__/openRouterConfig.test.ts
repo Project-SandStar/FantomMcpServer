@@ -192,3 +192,16 @@ describe('chat models stay out of the single-rate spend table', () => {
     expect(estimateSpendUsd('qwen/qwen3-embedding-4b', 1_000_000)).toBeCloseTo(0.02);
   });
 });
+
+describe('push payload: a direct:<provider> RLM model never reaches the sidecar', () => {
+  it('pushes a real OpenRouter model as the rlm-sandbox fallback', async () => {
+    const { buildOpenRouterPushPayload } = await import('../sidecars/openRouterConfig.js');
+    const { DEFAULT_RLM_SANDBOX_MODEL } = await import('../sidecars/openRouterModels.js');
+    const s = { ...defaultOpenRouterSettings(), rlmSandboxModel: 'direct:gemini:gemini-3.8-flash' };
+    const { payload } = buildOpenRouterPushPayload(s);
+    const am = (payload.openrouter as any).allowedModels;
+    expect(am['rlm-sandbox']).toEqual({ model: DEFAULT_RLM_SANDBOX_MODEL });
+    const plain = buildOpenRouterPushPayload({ ...defaultOpenRouterSettings(), rlmSandboxModel: 'qwen/qwen3-coder' });
+    expect((plain.payload.openrouter as any).allowedModels['rlm-sandbox']).toEqual({ model: 'qwen/qwen3-coder' });
+  });
+});

@@ -43,7 +43,14 @@ Without a token, the `fantom-caddy` container waits and serves nothing.
 ## Advanced
 
 **WireGuard port**: default `0` (NetBird picks a free port). Set a fixed port
-only when two peers on one host clash.
+to forward it on the firewall, or when two peers on one host clash.
+
+**Advertised public IP** (optional): the public IP that forwards the WireGuard
+port (UDP) to this host, e.g. `203.0.113.10`. Passed as
+`netbird up --external-ip-map` (env `NB_EXTERNAL_IP_MAP` when empty). Peers then
+connect here directly (P2P) instead of through the relay. Publish the port as
+UDP on the `fantom` service (the NetBird container shares its network) and
+forward the same UDP port on the firewall.
 
 ## How it works
 
@@ -51,7 +58,7 @@ The `fantom-netbird` and `fantom-caddy` containers share the folder `/netbird-ct
 container. The dashboard writes `config.json` there. The script
 `docker/netbird-entrypoint.sh` reads it, runs `netbird up`, and writes
 `status.json` every 10 seconds. `docker/caddy-entrypoint.sh` reads the
-`https` part, runs Caddy and writes `caddy-status.json`. Both use the Fantom
-container network, so the NetBird IP reaches port 3848 and 443 directly.
-If the Fantom container restarts, both sidecars exit and Docker restarts them
-in the new network.
+`https` part, runs Caddy and writes `caddy-status.json`. Fantom, `fantom-netbird` and
+`fantom-caddy` all use the network of a small `fantom-net` container, so the
+NetBird IP reaches port 3848 and 443 directly. Fantom can restart or be
+recreated alone; NetBird and HTTPS keep working.

@@ -3,10 +3,42 @@
 #     docker compose -f deploy/docker-compose.yml up -d --build
 # The sidecar-receiver writes /mirror on the host (MIRROR_DIR) and POSTs to
 # http://fantom:3848/admin/indexing/report on the "fantom" network.
+#
+# fantom-net owns the network namespace, the ports and the DNS name "fantom".
+# fantom, fantom-netbird and fantom-caddy join it (network_mode: container:fantom-net),
+# so the app can restart or be recreated alone and netbird + caddy keep working:
+#   docker compose up -d --no-deps --force-recreate fantom
+# If fantom-net itself is recreated, recreate the three that join it too:
+#   docker compose up -d --no-deps --force-recreate fantom-net fantom fantom-netbird fantom-caddy
+# container: and not service:, because docker compose v2.2.3 fails
+# `up --no-deps <svc>` with "no such service" when the network is service:<other>.
+# On basws42 the task SidecarStackWatchdog repairs a stack that lost its network.
 services:
+  fantom-net:
+    image: alpine:3.20
+    container_name: fantom-net
+    init: true
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+    mem_limit: 32m
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "3848"
+    ports:
+      # NetBird WireGuard (UDP). fantom-netbird shares this network, so its port is
+      # published here. Set the same port under Settings > NetBird > Advanced and
+      # forward it on the firewall for direct peer-to-peer links.
+      - "${FANTOM_NETBIRD_WG_PORT:-52002}:${FANTOM_NETBIRD_WG_PORT:-52002}/udp"
+    networks:
+      fantom:
+        aliases: [fantom]
+
   fantom:
     build: ..
     restart: unless-stopped
+    network_mode: "container:fantom-net"
+    depends_on: [fantom-net]
     environment:
       FANTOM_API_TOKEN: ${FANTOM_API_TOKEN:-}
       FANTOM_HOOK_TOKEN: ${FANTOM_HOOK_TOKEN:?set FANTOM_HOOK_TOKEN}
@@ -25,23 +57,14 @@ services:
       - ${AXON_PROJ_DIR:-/srv/axon/proj}:/axon/proj:ro
       # Shared with the netbird service: the admin page writes config.json here.
       - netbird-ctl:/netbird-ctl
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    expose:
-      - "3848"
-    networks: [fantom]
 
   # NetBird sidecar: joins the NetBird network as {hostname}.<your NetBird domain>.
   # Paste the setup key on Settings > NetBird (/dashboard/config/#netbird). It shares the fantom network
-  # namespace, so the NetBird IP reaches port 3848 directly.
-  # The app, netbird and caddy share one network: restart them together
-  #   docker compose up -d --force-recreate fantom fantom-netbird fantom-caddy
-  # If only the app restarts, the sidecars see their network go away, exit,
-  # and Docker restarts them in the new one.
+  # namespace (fantom-net), so the NetBird IP reaches port 3848 directly.
   fantom-netbird:
     image: netbirdio/netbird:latest
     restart: unless-stopped
-    network_mode: "service:fantom"
+    network_mode: "container:fantom-net"
     cap_add: [NET_ADMIN, SYS_ADMIN, SYS_RESOURCE]
     devices:
       - /dev/net/tun:/dev/net/tun
@@ -52,7 +75,7 @@ services:
       - ../docker/netbird-entrypoint.sh:/netbird-entrypoint.sh:ro
       - netbird-ctl:/netbird-ctl
       - netbird-state:/var/lib/netbird
-    depends_on: [fantom]
+    depends_on: [fantom-net]
 
   # HTTPS sidecar: https://{hostname}.{domain} (for example fantom.example.com) on
   # the NetBird IP, certificate from Let's Encrypt via Cloudflare DNS.
@@ -64,7 +87,7 @@ services:
       context: ../docker
       dockerfile: caddy.Dockerfile
     restart: unless-stopped
-    network_mode: "service:fantom"
+    network_mode: "container:fantom-net"
     entrypoint: ["/bin/sh", "/caddy-entrypoint.sh"]
     environment:
       NETBIRD_CTL_DIR: /netbird-ctl
@@ -73,7 +96,7 @@ services:
       - ../docker/caddy-entrypoint.sh:/caddy-entrypoint.sh:ro
       - netbird-ctl:/netbird-ctl
       - caddy-data:/data
-    depends_on: [fantom]
+    depends_on: [fantom-net]
 
 volumes:
   fantom-cache:
