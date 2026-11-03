@@ -18,7 +18,7 @@ import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   api, VirtualRole, OpenRouterRoleActivity, CloudBudgetStats, OpenRouterCatalogueEntry,
-  RoutingPolicy, PolicyDrift, PolicyNote,
+  RoutingPolicy, PolicyDrift, PolicyNote, OpenRouterProbeResult,
 } from '@/lib/api';
 
 const ACTIVITY_POLL_MS = 4000;
@@ -130,6 +130,20 @@ export function OpenRouterPanel() {
     mutationFn: api.rePushOpenRouterConfig,
     onSuccess: (r) => setNote(`Re-pushed to ${r.pushedCount} sidecar(s).`),
   });
+
+  // Live round trips. Each result replaces only its own role, so "Test all"
+  // and a single "Test" share one map and never wipe each other's rows.
+  const [probes, setProbes] = useState<Partial<Record<VirtualRole, OpenRouterProbeResult>>>({});
+  const test = useMutation({
+    mutationFn: (roles?: VirtualRole[]) => api.testOpenRouter(roles ? { roles } : {}),
+    onSuccess: (r) => setProbes(prev => ({ ...prev, ...Object.fromEntries(r.results.map(x => [x.role, x])) })),
+    onError: (e: Error) => setNote(`Test failed: ${e.message}`),
+  });
+  const testing = (role: VirtualRole): boolean =>
+    test.isPending && (test.variables === undefined || test.variables.includes(role));
+  /** The pushed model for a role: the only one a test can exercise. */
+  const storedModel = (role: VirtualRole): string | undefined =>
+    role === 'rlm' ? data?.rlm?.model : data?.settings.allowedModels[role]?.model;
 
   if (isLoading || !data) return <div className="text-sm text-gray-500">Loading…</div>;
 
@@ -502,19 +516,54 @@ export function OpenRouterPanel() {
 
       {/* ── 5. MODEL SELECTION ───────────────────────────────────────── */}
       <section>
-        <h3 className="text-lg font-semibold text-gray-900 mb-3">Model Selection</h3>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-lg font-semibold text-gray-900">Model Selection</h3>
+          <button
+            type="button"
+            onClick={() => test.mutate(undefined)}
+            disabled={test.isPending}
+            title="One live request per role, down the path the role really uses, with the key and model the sidecars hold."
+            className="px-3 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50"
+          >
+            {test.isPending && test.variables === undefined ? 'Testing all…' : 'Test all'}
+          </button>
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          {data.catalogue.map((c: OpenRouterCatalogueEntry) => (
-            <Picker
-              key={c.role}
-              label={c.label}
-              value={models[c.role] ?? ''}
-              onChange={(v) => setModels({ ...models, [c.role]: v })}
-              options={c.options}
-              hint={c.hint}
-              notServedYet={c.servable === false}
-            />
-          ))}
+          {data.catalogue.map((c: OpenRouterCatalogueEntry) => {
+            const stored = storedModel(c.role);
+            const unsaved = !!models[c.role] && models[c.role] !== stored;
+            return (
+              <div key={c.role}>
+                <Picker
+                  label={c.label}
+                  value={models[c.role] ?? ''}
+                  onChange={(v) => setModels({ ...models, [c.role]: v })}
+                  options={c.options}
+                  hint={c.hint}
+                  notServedYet={c.servable === false}
+                />
+                <div className="flex items-center gap-2 mt-1">
+                  <button
+                    type="button"
+                    onClick={() => test.mutate([c.role])}
+                    disabled={test.isPending}
+                    className="px-2 py-1 text-xs border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    {testing(c.role) ? 'Testing…' : 'Test'}
+                  </button>
+                  {/* A test can only exercise what is pushed. Say so next to
+                      the button, or a pass on the old model reads as a pass
+                      on the new one. */}
+                  {unsaved && (
+                    <span className="text-xs text-amber-700">
+                      tests the saved model{stored ? <> <code>{stored}</code></> : null}, not this unsaved choice
+                    </span>
+                  )}
+                </div>
+                {probes[c.role] && <ProbeLine r={probes[c.role]!} />}
+              </div>
+            );
+          })}
         </div>
         <p className="text-xs text-gray-500 mt-3">
           A cloud embedding provider still has to pass the vector-compatibility check — same texts, local vs
@@ -574,6 +623,19 @@ function policyHint(policy: RoutingPolicy, note?: PolicyNote): string {
 
 function money(v: number | null | undefined): string {
   return v === null || v === undefined ? '—' : `$${v.toFixed(2)}`;
+}
+
+function ProbeLine({ r }: { r: OpenRouterProbeResult }) {
+  const cls = r.ok
+    ? 'text-green-700 bg-green-50 border-green-200'
+    : 'text-red-700 bg-red-50 border-red-200';
+  return (
+    <div className={`text-xs border rounded px-2 py-1 mt-1 ${cls} break-words`}>
+      {r.ok ? '✓' : '×'} {r.ms} ms · {r.model ?? 'no model'}
+      {r.servedModel ? <> (served as <code>{r.servedModel}</code>)</> : null}
+      {' '}· {r.route} · {r.message}
+    </div>
+  );
 }
 
 function Stat({ label, value }: { label: string; value: string }) {

@@ -12296,6 +12296,27 @@ export function createAdminRouter(context: AdminContext): Router {
     res.json({ ok: out.pushedCount > 0, ...out });
   });
 
+  /**
+   * Live round trip per role, down the path the role really uses, with the
+   * key the sidecars hold. Body: `{ roles?: VirtualRole[] }`; omitted = all.
+   * Tests what is saved and pushed, never an unsaved dropdown choice.
+   */
+  router.post('/openrouter/test', async (req: Request, res: Response): Promise<void> => {
+    const { probeOpenRouterRoles, isOpenRouterProbeRole, OPENROUTER_PROBE_ROLES } = await import('./openRouterProbe.js');
+    const body = req.body ?? {};
+    const requested: unknown[] = Array.isArray(body.roles) ? body.roles : [...OPENROUTER_PROBE_ROLES];
+    const bad = requested.filter((r) => !isOpenRouterProbeRole(r));
+    if (bad.length) {
+      res.status(400).json({ error: `unknown role(s): ${bad.map(String).join(', ')} — expected ${OPENROUTER_PROBE_ROLES.join(', ')}` });
+      return;
+    }
+    const results = await probeOpenRouterRoles(requested as import('../sidecars/virtualContainers.js').VirtualRole[]);
+    for (const r of results) {
+      console.log(`[openrouter] test ${r.role} ${r.ok ? 'ok' : 'FAIL'} ${r.ms}ms model=${r.model ?? '-'} route=${r.route}: ${r.message}`);
+    }
+    res.json({ results });
+  });
+
   /** Force a virtual-container rediscovery poll (normally every 60s). */
   router.post('/sidecars/virtual/refresh', async (_req: Request, res: Response): Promise<void> => {
     const { refreshAllVirtualContainers, getSlotStatus } = await import('../sidecars/virtualContainers.js');

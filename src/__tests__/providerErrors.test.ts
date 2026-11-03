@@ -60,7 +60,7 @@ describe('classifyProviderError', () => {
     expect(classifyProviderError(429, '{"error":{"message":"Rate limit reached for model `llama-3.3-70b-versatile` on tokens per minute (TPM): Limit 6000. Please try again in 2.5s.","type":"tokens","code":"rate_limit_exceeded"}}')).toBe('rate-limited');
   });
   it('401 = auth; 500 = other', () => {
-    expect(classifyProviderError(401, '{"error":"invalid api key"}')).toBe('auth');
+    expect(classifyProviderError(401, '{"error":"invalid api key"}')).toBe('auth-invalid');
     expect(classifyProviderError(500, 'oops')).toBe('other');
   });
 });
@@ -86,7 +86,7 @@ describe('warningFor', () => {
       kind: 'provider-quota-exhausted',
       provider: 'gemini',
       status: 429,
-      message: 'Gemini has no credits left. Add credits or pick another provider in Config → LLM providers. This answer used OpenRouter.',
+      message: 'Gemini has no credits left. Add credits or pick another provider in Config → LLM providers. This answer came from OpenRouter.',
     });
     expect(kindOfWarning(w)).toBe('quota-exhausted');
   });
@@ -114,7 +114,7 @@ describe('finalizeWarnings (what the ask result carries)', () => {
     const out = finalizeWarnings([warningFor('gemini', 'quota-exhausted', 429)], 'openrouter', 'deepseek/deepseek-v4-flash');
     expect(out).toEqual([{
       kind: 'provider-quota-exhausted', provider: 'gemini', status: 429,
-      message: 'Gemini has no credits left. Add credits or pick another provider in Config → LLM providers. This answer used OpenRouter (deepseek/deepseek-v4-flash).',
+      message: 'Gemini has no credits left. Add credits or pick another provider in Config → LLM providers. This answer came from OpenRouter (deepseek/deepseek-v4-flash).',
     }]);
   });
   it('no fallback worked: the warning says no answer was written', () => {

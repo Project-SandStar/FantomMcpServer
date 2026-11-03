@@ -713,6 +713,17 @@ export interface OpenRouterSettings {
   lastPushedTo?: string[];
 }
 
+/** One role's live test from the OpenRouter page (POST /openrouter/test). */
+export interface OpenRouterProbeResult {
+  role: VirtualRole;
+  ok: boolean;
+  ms: number;
+  model: string | null;
+  servedModel?: string | null;
+  route: string;
+  message: string;
+  status?: number;
+}
 export interface OpenRouterIssue { role?: VirtualRole; message: string }
 export interface OpenRouterPushResult { sidecarId: string; name: string; pushed: boolean; reason?: string }
 
@@ -1829,6 +1840,9 @@ export const api = {
     }>(
       '/openrouter', { method: 'POST', body },
     ),
+  /** Live round trip per role with the pushed key and model. `roles` omitted = all. */
+  testOpenRouter: (body: { roles?: VirtualRole[] } = {}) =>
+    apiRequest<{ results: OpenRouterProbeResult[] }>('/openrouter/test', { method: 'POST', body }),
   getOpenRouterActivity: () => apiRequest<OpenRouterActivityResponse>('/openrouter/activity'),
   getOpenRouterCredits: () =>
     apiRequest<{ ok: boolean; reason?: string; credits: CloudBudgetStats['credits']; spendToday: number; budget: CloudBudgetStats }>(
@@ -2790,10 +2804,11 @@ export interface AskAnswerResponse {
 }
 
 export interface ProviderWarning {
-  kind: 'provider-quota-exhausted' | 'provider-rate-limited' | 'provider-auth-failed' | 'provider-failed';
+  kind: 'provider-quota-exhausted' | 'provider-rate-limited' | 'provider-auth-invalid' | 'provider-failed';
   provider: string;
   message: string;
   status?: number;
+  reason?: string;
 }
 
 export interface ProjectVectorPoint {

@@ -3,6 +3,22 @@
 All notable changes to FantomMcpServer. Public releases are snapshots; see
 `scripts/release-public.sh`.
 
+## 1.1.7 — 2026-11-03
+
+### OpenRouter page
+- **Test per role.** The OpenRouter config page has a Test button per role
+  and a Test all button. Each test goes down the same path the role uses for
+  a real request and shows the provider's own error text.
+
+### Provider errors
+- **Failure kinds.** A provider is marked by the kind of failure, not only
+  as out of credits. When an earlier provider already failed, a later plain
+  failure is named too, with a short reason.
+
+### Tests
+- **Timeouts.** The suite-wide timeout is 30s. Suites that spawn git, a
+  hook script or an HTTP server exceeded 5s in a full parallel run.
+
 ## 1.1.6 — 2026-11-03
 
 ### RLM runs again on mixed LAN and NetBird fleets

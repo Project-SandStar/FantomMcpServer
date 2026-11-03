@@ -7,7 +7,7 @@ import type { ProviderWarning } from '@/lib/api';
 const TITLES: Record<ProviderWarning['kind'], string> = {
   'provider-quota-exhausted': 'out of credits',
   'provider-rate-limited': 'is rate-limiting requests',
-  'provider-auth-failed': 'refused the API key',
+  'provider-auth-invalid': 'rejected the API key',
   'provider-failed': 'failed',
 };
 
@@ -33,7 +33,7 @@ export function ProviderAlertModal({ warnings, onClose }: { warnings: ProviderWa
   if (warnings.length === 0) return null;
   const first = warnings[0];
   const name = LABELS[first.provider] ?? first.provider;
-  const severe = first.kind === 'provider-quota-exhausted' || first.kind === 'provider-auth-failed';
+  const severe = first.kind === 'provider-quota-exhausted' || first.kind === 'provider-auth-invalid';
 
   return (
     <div

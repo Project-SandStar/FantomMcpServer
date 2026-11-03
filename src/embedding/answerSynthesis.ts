@@ -16,6 +16,7 @@ import type { RerankMode } from './hybridSearch.js';
 import { emitAskEvent } from './askEvents.js';
 import {
   ProviderHttpError, classifyError, warningFor, finalizeWarnings, markProviderExhausted, providerExhaustedState, providerLabel,
+  isHardKind, shortFailureReason,
   type ProviderWarning,
 } from './providerErrors.js';
 import * as fs from 'fs';
@@ -1469,9 +1470,10 @@ export async function answerCodeQuestion(
       directProvider = direct.provider;
       // Out of credits a few minutes ago: skip the call that would fail again,
       // but still tell the caller why the answer came from somewhere else.
-      if (providerExhaustedState(direct.provider)) {
-        console.warn(`[answerCodeQuestion] ${providerLabel(direct.provider)} is marked out of credits — skipping direct synthesis, using '${provider}'`);
-        addWarning(warningFor(direct.provider, 'quota-exhausted', providerExhaustedState(direct.provider)?.status));
+      const marked = providerExhaustedState(direct.provider);
+      if (marked) {
+        console.warn(`[answerCodeQuestion] ${providerLabel(direct.provider)} is marked ${marked.kind} — skipping direct synthesis, using '${provider}'`);
+        addWarning(warningFor(direct.provider, marked.kind, marked.status));
         return null;
       }
       const tokens = Math.max(maxTokens, 4096);
@@ -1499,16 +1501,20 @@ export async function answerCodeQuestion(
   /** Classify a failed provider call; remember an exhausted account. */
   const noteProviderFailure = (p: string, err: unknown) => {
     const c = classifyError(err);
-    if (c.kind === 'quota-exhausted') markProviderExhausted(p, c.status);
+    if (isHardKind(c.kind)) markProviderExhausted(p, c.status, Date.now(), c.kind);
     if (c.kind !== 'other') addWarning(warningFor(p, c.kind, c.status));
+    // A plain failure is still worth naming when an earlier provider already
+    // failed: "Gemini has no credits; OpenRouter failed (bad model ID)".
+    else if (warnings.length > 0) addWarning(warningFor(p, 'other', c.status, undefined, shortFailureReason(err)));
   };
 
   try {
     // A cloud provider marked out of credits is skipped at once: the call
     // would fail again and cost the caller a round trip each time.
-    if ((provider === 'groq' || provider === 'anthropic' || provider === 'gemini') && providerExhaustedState(provider)) {
-      addWarning(warningFor(provider, 'quota-exhausted', providerExhaustedState(provider)?.status));
-      throw new Error(`${providerLabel(provider)} is marked out of credits (skipped)`);
+    const markedState = (provider === 'groq' || provider === 'anthropic' || provider === 'gemini') ? providerExhaustedState(provider) : null;
+    if (markedState) {
+      addWarning(warningFor(provider, markedState.kind, markedState.status));
+      throw new Error(`${providerLabel(provider)} is marked ${markedState.kind} (skipped)`);
     }
     const viaDirect = provider === 'openrouter' ? await directSynthesis() : null;
     if (viaDirect !== null) {
@@ -1532,7 +1538,7 @@ export async function answerCodeQuestion(
   } catch (err) {
     // Cloud provider failed (missing key, network, etc.) — fall back to sidecar.
     console.warn(`[answerCodeQuestion] provider '${provider}' failed: ${(err as Error).message}; trying the remaining paths`);
-    if (!/marked out of credits/.test((err as Error).message)) noteProviderFailure(provider, err);
+    if (!/ is marked [a-z-]+ \(skipped\)/.test((err as Error).message)) noteProviderFailure(provider, err);
     try {
       // OpenRouter first, then the local sidecar. The old order went straight
       // to the sidecar, which under "OpenRouter only" advertises neither 'llm'
@@ -1559,7 +1565,7 @@ export async function answerCodeQuestion(
         usedModel = 'unavailable';
         // A known cause (out of credits, bad key) beats the raw text of the
         // last fallback that failed.
-        const known = warnings.find(w => w.kind === 'provider-quota-exhausted') ?? warnings[0];
+        const known = warnings.find(w => w.kind === 'provider-quota-exhausted' || w.kind === 'provider-auth-invalid') ?? warnings[0];
         const why = known ? known.message : (err as Error).message.split('\n')[0].slice(0, 200);
         answer =
           'Synthesis was unavailable, so this is the retrieved evidence without a written answer.\n\n'

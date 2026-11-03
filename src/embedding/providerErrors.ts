@@ -11,14 +11,21 @@
  * short retryDelay with a per-minute quota means "try again soon".
  */
 
-export type ProviderErrorKind = 'quota-exhausted' | 'rate-limited' | 'auth' | 'other';
+export type ProviderErrorKind = 'quota-exhausted' | 'rate-limited' | 'auth-invalid' | 'other';
+
+/** Kinds that will fail again on the next call: stop using that provider for a while. */
+export function isHardKind(k: ProviderErrorKind): boolean {
+  return k === 'quota-exhausted' || k === 'auth-invalid';
+}
 
 export interface ProviderWarning {
-  kind: 'provider-quota-exhausted' | 'provider-rate-limited' | 'provider-auth-failed' | 'provider-failed';
+  kind: 'provider-quota-exhausted' | 'provider-rate-limited' | 'provider-auth-invalid' | 'provider-failed';
   provider: string;
   message: string;
   /** HTTP status the provider returned, when known. */
   status?: number;
+  /** Short cause for a plain failure, e.g. "bad model ID". */
+  reason?: string;
 }
 
 /** An HTTP failure from a provider's own API, already classified. */
@@ -36,6 +43,17 @@ export class ProviderHttpError extends Error {
     this.kind = classifyProviderError(status, body);
   }
 }
+
+/** A rejected key. Gemini answers 400 API_KEY_INVALID, not 401. */
+const AUTH_TEXT = [
+  /API_KEY_INVALID/,
+  /API key not valid/i,
+  /invalid[ _-]?x-api-key/i,
+  /authentication_error/i,
+  /invalid (api )?key/i,
+  /incorrect api key/i,
+  /no auth credentials/i,
+];
 
 const QUOTA_TEXT = [
   /exceeded your current quota/i,
@@ -58,8 +76,9 @@ export function classifyProviderError(status: number, body: string): ProviderErr
   if (status === 401 || status === 403) {
     // 403 with billing text is a disabled billing account, not a bad key.
     if (status === 403 && QUOTA_TEXT.some(r => r.test(text))) return 'quota-exhausted';
-    return 'auth';
+    return 'auth-invalid';
   }
+  if (status === 400 && AUTH_TEXT.some(r => r.test(text))) return 'auth-invalid';
   if (status === 402) return 'quota-exhausted';
   if (status === 429 || /RESOURCE_EXHAUSTED/.test(text)) {
     if (QUOTA_TEXT.some(r => r.test(text))) {
@@ -103,14 +122,15 @@ export function providerLabel(provider: string): string {
     case 'anthropic': return 'Anthropic';
     case 'groq': return 'Groq';
     case 'openrouter': return 'OpenRouter';
+    case 'sidecar': return 'the local sidecar';
     default: return provider;
   }
 }
 
 /** The user-facing warning for a classified failure. `fallback` names what answered instead, if anything. */
-export function warningFor(provider: string, kind: ProviderErrorKind, status?: number, fallback?: string): ProviderWarning {
+export function warningFor(provider: string, kind: ProviderErrorKind, status?: number, fallback?: string, reason?: string): ProviderWarning {
   const name = providerLabel(provider);
-  const tail = fallback ? ` This answer used ${fallback}.` : '';
+  const tail = fallback ? ` This answer came from ${fallback}.` : '';
   const where = 'Config → LLM providers';
   switch (kind) {
     case 'quota-exhausted':
@@ -123,15 +143,15 @@ export function warningFor(provider: string, kind: ProviderErrorKind, status?: n
         kind: 'provider-rate-limited', provider, status,
         message: `${name} is rate-limiting requests right now. Try again in a minute.${tail}`,
       };
-    case 'auth':
+    case 'auth-invalid':
       return {
-        kind: 'provider-auth-failed', provider, status,
-        message: `${name} refused the API key. Check the key in ${where}.${tail}`,
+        kind: 'provider-auth-invalid', provider, status,
+        message: `${name} rejected the API key. Update it in ${where}.${tail}`,
       };
     default:
       return {
-        kind: 'provider-failed', provider, status,
-        message: `${name} failed${status ? ` with HTTP ${status}` : ''}.${tail}`,
+        kind: 'provider-failed', provider, status, ...(reason ? { reason } : {}),
+        message: `${name} failed (${reason ?? (status ? `HTTP ${status}` : 'error')}).${tail}`,
       };
   }
 }
@@ -141,9 +161,19 @@ export function kindOfWarning(w: ProviderWarning): ProviderErrorKind {
   switch (w.kind) {
     case 'provider-quota-exhausted': return 'quota-exhausted';
     case 'provider-rate-limited': return 'rate-limited';
-    case 'provider-auth-failed': return 'auth';
+    case 'provider-auth-invalid': return 'auth-invalid';
     default: return 'other';
   }
+}
+
+/** A short cause for a failure the classifier calls 'other', for the popup. */
+export function shortFailureReason(err: unknown): string | undefined {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/is not a valid model ID|not allow-listed|model .*not found/i.test(msg)) return 'bad model ID';
+  if (/did not finish within|deadline|timed? ?out/i.test(msg)) return 'timed out';
+  if (/fetch failed|ECONNREFUSED|ENOTFOUND|no WS tunnel/i.test(msg)) return 'unreachable';
+  const m = /\b([45]\d\d)\b/.exec(msg);
+  return m ? `HTTP ${m[1]}` : undefined;
 }
 
 /**
@@ -151,11 +181,14 @@ export function kindOfWarning(w: ProviderWarning): ProviderErrorKind {
  * say that nothing could. `usedProvider` 'none' = citations-only.
  */
 export function finalizeWarnings(warnings: ProviderWarning[], usedProvider: string, usedModel?: string): ProviderWarning[] {
+  const model = usedModel && usedModel !== usedProvider && usedModel !== 'unavailable' ? usedModel : undefined;
   const answeredBy = usedProvider === 'none'
     ? undefined
-    : `${providerLabel(usedProvider)}${usedModel && usedModel !== usedProvider ? ` (${usedModel})` : ''}`;
+    : usedProvider === 'sidecar'
+      ? `local ${model ?? 'sidecar model'}`
+      : `${providerLabel(usedProvider)}${model ? ` (${model})` : ''}`;
   return warnings.map((w) => {
-    if (answeredBy && w.provider !== usedProvider) return warningFor(w.provider, kindOfWarning(w), w.status, answeredBy);
+    if (answeredBy && w.provider !== usedProvider) return warningFor(w.provider, kindOfWarning(w), w.status, answeredBy, w.reason);
     if (!answeredBy) return { ...w, message: `${w.message} No other provider could answer, so no answer was written.` };
     return w;
   });
@@ -164,27 +197,35 @@ export function finalizeWarnings(warnings: ProviderWarning[], usedProvider: stri
 // ─── Remember exhausted providers ─────────────────────────────────────────
 
 const DEFAULT_EXHAUSTED_TTL_MS = 30 * 60_000;
-const exhausted = new Map<string, { at: number; until: number; status?: number }>();
+const exhausted = new Map<string, { at: number; until: number; status?: number; kind: ProviderErrorKind }>();
 
 function ttlMs(): number {
   const v = Number(process.env.FANTOM_PROVIDER_EXHAUSTED_TTL_MS);
   return Number.isFinite(v) && v >= 0 ? v : DEFAULT_EXHAUSTED_TTL_MS;
 }
 
-/** Remember that a provider is out of credits, so later asks skip it at once. */
-export function markProviderExhausted(provider: string, status?: number, now = Date.now()): void {
+/**
+ * Remember that a provider is out of credits (or its key is rejected), so
+ * later asks skip it at once. Saving the key again clears the mark.
+ */
+export function markProviderExhausted(
+  provider: string, status?: number, now = Date.now(), kind: ProviderErrorKind = 'quota-exhausted',
+): void {
   const ttl = ttlMs();
   if (ttl === 0) return;
-  exhausted.set(provider, { at: now, until: now + ttl, status });
-  console.warn(`[provider-quota] ${providerLabel(provider)} is out of credits — skipping it for ${Math.round(ttl / 60_000)} min.`);
+  exhausted.set(provider, { at: now, until: now + ttl, status, kind });
+  const what = kind === 'auth-invalid' ? 'rejected the API key' : 'is out of credits';
+  console.warn(`[provider-quota] ${providerLabel(provider)} ${what} — skipping it for ${Math.round(ttl / 60_000)} min.`);
 }
 
-/** Null when the provider is usable; otherwise when it was marked and when the mark ends. */
-export function providerExhaustedState(provider: string, now = Date.now()): { since: string; until: string; status?: number } | null {
+/** Null when the provider is usable; otherwise why, when it was marked and when the mark ends. */
+export function providerExhaustedState(
+  provider: string, now = Date.now(),
+): { since: string; until: string; status?: number; kind: ProviderErrorKind } | null {
   const e = exhausted.get(provider);
   if (!e) return null;
   if (e.until <= now) { exhausted.delete(provider); return null; }
-  return { since: new Date(e.at).toISOString(), until: new Date(e.until).toISOString(), status: e.status };
+  return { since: new Date(e.at).toISOString(), until: new Date(e.until).toISOString(), status: e.status, kind: e.kind };
 }
 
 export function clearProviderExhausted(provider?: string): void {
