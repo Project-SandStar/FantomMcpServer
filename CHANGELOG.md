@@ -3,6 +3,49 @@
 All notable changes to FantomMcpServer. Public releases are snapshots; see
 `scripts/release-public.sh`.
 
+## 1.1.8 — 2026-11-19
+
+### Installers for Haxall and SkySpark
+- **Check & add Haxall.** The Instances page checks GitHub for Haxall
+  releases. For each missing version it gets the source from the release
+  tag, compiles `home/`, builds the docs and adds the instance.
+- **Check & add SkySpark.** The page reads SkySpark zips from a file share
+  set in the admin settings, installs the missing versions and runs
+  `bin/fan docgen`. Docgen needs no license. 3.x needs `bin/setup` first,
+  which runs only when the EULA setting is on.
+- **Set home and Compile home.** Each instance can point to a new `home/`
+  folder or rebuild it, with a live job log.
+- **Installer sources.** Settings > Fantom Source holds the JDK path, a
+  daily auto-check switch, and per product the source, paths and oldest
+  version. The share password and GitHub token go to the secrets store.
+- **Build script.** `scripts/haxall/` holds the Haxall build script with no
+  personal paths. It no longer skips `docker.pod`.
+- **Docker image.** Adds JDK 17, rsync, curl and unzip. Skips the
+  onnxruntime-node CUDA download, which now returns 404.
+
+### Dashboard
+- **Instances page.** Compact cards, an "+ Add" menu, an actions menu, and
+  docs and code counts (pods, functions, types) on each card.
+- **Embed one instance.** The Docs and Instance Docs pages embed only the
+  chosen instance, not all docs. The vector label no longer shows the count
+  of every instance.
+
+### Parsers
+- **tree-sitter.** New Fantom, Axon and Trio grammars, tested on real
+  code. `.fan` files go to the tree-sitter Fantom parser. The Docker image
+  ships the grammars.
+- **Indexing.** Each file goes to its parser by extension. The pod comes
+  from the nearest `build.fan`.
+
+### Search index and server
+- **One pass per project.** Only one index pass runs per project at a time,
+  and a re-sync covers only that project. New `remove` and `reindexFiles`
+  tools.
+- **Remote folders.** Client folders map to `/mirror` projects on the
+  server.
+- **Caddy.** `CADDY_EXTRA_PROXIES` adds more HTTPS ports on the same
+  NetBird name.
+
 ## 1.1.7 — 2026-11-03
 
 ### OpenRouter page

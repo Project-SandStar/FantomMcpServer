@@ -9,6 +9,7 @@ import type { PrismaClient } from '@prisma/client';
 import { getFantomCodeIndexer } from './indexer.js';
 import { clearProjectGraph } from '../graph/ladybugSchema.js';
 import { getVectorStore } from '../embedding/vectorStore.js';
+import { resetProjectGraphDatabase } from '../graph/projectGraphConnection.js';
 
 export type StepStatus = 'ok' | 'failed' | 'skipped';
 
@@ -19,6 +20,10 @@ export interface RemoveProjectResult {
   inMemoryCleared: boolean;
   graphNodesDeleted: number;
   vectorsDeleted: number;
+  /** cross_project_edges rows with this project on either side. */
+  crossProjectEdgesDeleted: number;
+  /** True when .cache/graph/<id>.db and its Kuzu sidecar files were removed. */
+  graphFilesRemoved: boolean;
   prismaRowDeleted: boolean;
   steps: {
     inMemory: StepStatus;
@@ -54,6 +59,8 @@ export async function removeProject(
   };
   let graphNodesDeleted = 0;
   let vectorsDeleted = 0;
+  let crossProjectEdgesDeleted = 0;
+  let graphFilesRemoved = false;
   let prismaRowDeleted = false;
 
   // Resolve name up front for the result.
@@ -97,6 +104,17 @@ export async function removeProject(
     errors.push(`deleteProjectVectors failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // 3b. Cross-project edges that point at or from this project. They are
+  // not a Prisma relation, so the row delete does not cascade to them.
+  try {
+    const r = await prisma.crossProjectEdge.deleteMany({
+      where: { OR: [{ sourceProjectId: projectId }, { targetProjectId: projectId }] },
+    });
+    crossProjectEdgesDeleted = r.count;
+  } catch (err) {
+    errors.push(`crossProjectEdge.deleteMany failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   // 4. Prisma row. By default we ABORT the row deletion if any prior step
   // errored — leaving a partially-cleaned project with the row intact is
   // safer than removing the row and orphaning graph/vector data the user
@@ -118,6 +136,13 @@ export async function removeProject(
         void import('../projects/versionGroup.js').then((m) => m.invalidateVersionGroupCache()).catch(() => {});
         prismaRowDeleted = true;
         steps.prismaRow = 'ok';
+        // The project is gone: drop its graph store file too, or
+        // .cache/graph/<id>.db stays behind for ever.
+        try {
+          graphFilesRemoved = await resetProjectGraphDatabase(projectId);
+        } catch (err) {
+          errors.push(`graph store removal failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
       } catch (err) {
         steps.prismaRow = 'failed';
         errors.push(`prisma.fantomProject.delete failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -152,6 +177,8 @@ export async function removeProject(
     inMemoryCleared,
     graphNodesDeleted,
     vectorsDeleted,
+    crossProjectEdgesDeleted,
+    graphFilesRemoved,
     prismaRowDeleted,
     steps,
     errors,

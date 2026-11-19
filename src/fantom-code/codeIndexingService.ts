@@ -10,15 +10,15 @@
 import type { PrismaClient } from '@prisma/client';
 import { createHash } from 'crypto';
 import * as fsp from 'fs/promises';
+import * as path from 'path';
 import { createLogger } from '../utils/index.js';
 import { FantomCodeIndexer, getFantomCodeIndexer } from './indexer.js';
 import { getFantomFunctionSearchIndex } from './searchIndex.js';
 import { FantomFileScanner } from './scanner.js';
-import { FantomCodeParser } from './codeParser.js';
 import { buildLadybugGraph } from '../graph/ladybugGraphBuilder.js';
 import { ladybugQuery } from '../graph/ladybugConnection.js';
 import { clearFileGraph } from '../graph/ladybugSchema.js';
-import { beginProjectIndexing } from './activeIndexing.js';
+import { beginProjectIndexing, withProjectIndexLock } from './activeIndexing.js';
 import { patchProjectGraph, replacePendingRefs, type GraphPatchResult } from '../indexing/graphPatch.js';
 import { loadLazyConfig } from '../indexing/lazyConfig.js';
 import {
@@ -26,7 +26,8 @@ import {
   createTreeSitterParser,
   createMultiLanguageScanner
 } from './treeSitterAdapter.js';
-import { TrioParser } from './trioParser.js';
+import { PodParserSet, buildPodMap, expandBuildFanPaths, rootPodMeta } from './podParsers.js';
+import { scannerFor } from '../indexing/changeDetector.js';
 import { PARSER_SCHEMA_VERSION, indexVersionFor } from './indexVersion.js';
 import { applySymbolKeys, createKeyBaseResolver, KEY_SCHEME_STABLE, storedKeyBase, type SymbolIdMapping } from './symbolKey.js';
 import type { SupportedLanguage } from '../parser/treeSitter/types.js';
@@ -141,21 +142,15 @@ export interface ExtendedProject extends FantomProject {
 export class CodeIndexingService {
   private prisma: PrismaClient;
   private indexer: FantomCodeIndexer;
-  // Per-project mutex. Serializes indexProject + reindexFiles calls so an
-  // in-flight rebuild can't trample concurrent writes.
-  private projectLocks = new Map<number, Promise<unknown>>();
-
   constructor(prisma: PrismaClient) {
     this.prisma = prisma;
     this.indexer = getFantomCodeIndexer();
   }
 
-  private async withProjectLock<T>(projectId: number, fn: () => Promise<T>): Promise<T> {
-    const prev = this.projectLocks.get(projectId) ?? Promise.resolve();
-    const next = prev.then(fn, fn);
-    // Swallow rejections from the chained promise so subsequent waiters don't inherit it.
-    this.projectLocks.set(projectId, next.catch(() => undefined));
-    return next as Promise<T>;
+  // Per-project mutex shared by indexProject, reindexFiles and rebuildGraph
+  // (activeIndexing.ts). Process-wide, so separate instances serialize too.
+  private withProjectLock<T>(projectId: number, fn: () => Promise<T>): Promise<T> {
+    return withProjectIndexLock(projectId, fn);
   }
 
   /**
@@ -303,9 +298,11 @@ export class CodeIndexingService {
   ): Promise<FullIndexResult> {
     // Marks the project busy so DELETE …/index-runs/:runId refuses with 409
     // (activeIndexing.ts — finished_at IS NULL also covers crashed runs).
+    // The project lock keeps a second run (bulk admin-reindex, lazy task,
+    // MCP refresh) from writing the same graph store at the same time.
     const endIndexing = beginProjectIndexing(project.id);
     try {
-      return await this.indexProjectImpl(project, options);
+      return await this.withProjectLock(project.id, () => this.indexProjectImpl(project, options));
     } finally {
       endIndexing();
     }
@@ -412,6 +409,19 @@ export class CodeIndexingService {
     }
 
     logger.info(`[phase] scan DONE project=${project.name} files=${files.length}`);
+
+    // Pod map for every project language: each .fan/.trio/.axon file gets the
+    // pod of the nearest build.fan (pod/vizExt/build.fan → bassgViz). Files
+    // under no pod dir get the root pod, or the project's pod name, or its name.
+    const podMap = await buildPodMap(project.path);
+    const rootMeta = rootPodMeta(
+      podMeta ?? podMap.get(path.resolve(project.path)),
+      (project as { podName?: string | null }).podName,
+      project.name,
+    );
+    if (podMap.size > 1) {
+      logger.info(`[phase] pods project=${project.name} ${podMap.size} build.fan files: ${[...podMap.values()].map(m => m.podName).join(', ')}`);
+    }
 
     // Pathological-project guard: extremely large file counts almost always
     // indicate a misconfigured project.path (pointed at a monorepo root or
@@ -659,16 +669,19 @@ export class CodeIndexingService {
     // so when parserType=tree-sitter-wasm we initialize the parser for Fantom too.
     // If the WASM is missing or fails to load on a Fantom project, we fall back
     // to the regex parser (it's still correct for Fantom, just less precise).
-    let useTreeSitter = parserType === 'tree-sitter-wasm' || parserType === 'tree-sitter';
+    // The primary tree-sitter parser reads the project's main language
+    // (.ts, .vue, .php, .md, ...). Fantom-family files never use it: the
+    // router (fileRouter.ts) sends .fan to the regex parser, .trio to
+    // TrioParser and .axon to the axon grammar, whatever the project language.
+    let useTreeSitter = (parserType === 'tree-sitter-wasm' || parserType === 'tree-sitter') && !isFanLike;
     let treeSitterParser: TreeSitterCodeParser | null = null;
 
-    if (useTreeSitter && langStr !== 'trio') {
-      // Namespace for qualified names. Fantom pods come from build.fan; for
-      // TS/Vue/PHP projects there is no pod, and without a namespace the adapter
-      // falls back to the FULL FILE PATH ("/Users/…/nodes.ts::createSedonaNode"),
-      // which leaks into citations, embeddings and every name-based lookup. Use
-      // the project's pod name or its name instead ("sedonaWebEditor::createSedonaNode").
-      treeSitterParser = createTreeSitterParser(project.id, language, podMeta?.podName ?? (project as { podName?: string | null }).podName ?? project.name);
+    if (useTreeSitter) {
+      // Namespace for qualified names. Without one the adapter falls back to
+      // the FULL FILE PATH ("/Users/…/nodes.ts::createSedonaNode"), which
+      // leaks into citations and every name-based lookup. Use the root pod
+      // name, the project's pod name or its name ("sedonaWebEditor::createSedonaNode").
+      treeSitterParser = createTreeSitterParser(project.id, language, rootMeta.podName);
       // Wrap in try/catch — initialize() can throw (e.g. wasm load failure),
       // not just return false. Without this, an exception escapes into the
       // background pipeline and the dashboard's "Reindex" mutation never
@@ -682,8 +695,7 @@ export class CodeIndexingService {
         logger.error(`Tree-sitter initialize() threw for ${language}: ${initError.message}`);
       }
       if (!initialized) {
-        const fanLike = langStr === 'fantom' || langStr === 'axon';
-        if (!fanLike && !options.allowRegexFallback) {
+        if (!options.allowRegexFallback) {
           // Soft fail instead of throwing — produce zero nodes for this run
           // and let the operator see the structured error. Throwing here
           // crashes the entire indexing pipeline silently in the background
@@ -693,35 +705,16 @@ export class CodeIndexingService {
               `Cause: ${initError?.message ?? 'initialize() returned false'}. ` +
               `Run \`tsx scripts/check-grammars.mts\` to verify grammars in src/parser/treeSitter/grammars/.`,
           );
-          useTreeSitter = false;
-          treeSitterParser = null;
         } else {
           logger.warn(`Tree-sitter not available for ${language}, falling back to regex`);
-          useTreeSitter = false;
-          treeSitterParser = null;
         }
+        useTreeSitter = false;
+        treeSitterParser = null;
       }
     }
 
-    // Initialize tree-sitter axon parser for trio files (to parse Axon src blocks)
-    let axonTreeSitter: TreeSitterCodeParser | null = null;
-    if (useTreeSitter || langStr === 'trio' || langStr === 'axon') {
-      try {
-        axonTreeSitter = createTreeSitterParser(project.id, 'axon' as any, podMeta?.podName);
-        const initialized = await axonTreeSitter.initialize();
-        if (!initialized) {
-          logger.debug('Tree-sitter axon not available for trio parsing, using regex fallback');
-          axonTreeSitter = null;
-        }
-      } catch {
-        axonTreeSitter = null;
-      }
-    }
-
-    // Create fallback regex parser for Fantom
-    const regexParser = new FantomCodeParser(project.id, podMeta);
-    // Create trio parser for .trio files (with optional tree-sitter for Axon src)
-    const trioParser = new TrioParser(project.id, podMeta?.podName, axonTreeSitter);
+    // One parser per (pod, family), picked per file by extension.
+    const parsers = new PodParserSet({ projectId: project.id, rootMeta, podMap, primary: treeSitterParser });
 
     // Parse each file. Per-file logging here is deliberately verbose at
     // the info level because previously a single pathological file could
@@ -762,15 +755,7 @@ export class CodeIndexingService {
       const memBefore = process.memoryUsage().heapUsed;
       logger.info(`[parse] START ${filePath} (${sizeBytes}B)`);
       try {
-        let parsed: ParsedFile;
-        const isTrioFile = filePath.endsWith('.trio');
-        if (isTrioFile) {
-          parsed = await trioParser.parseFile(filePath);
-        } else if (useTreeSitter && treeSitterParser) {
-          parsed = await treeSitterParser.parseFile(filePath);
-        } else {
-          parsed = regexParser.parseFile(filePath);
-        }
+        const parsed = await parsers.parse(filePath);
         this.applyStableKeys(parsed, project.id, keyBaseOf, options.onSymbolKeys);
         const ms = Date.now() - parseStart;
         const heapDeltaMb = Math.round((process.memoryUsage().heapUsed - memBefore) / 1024 / 1024);
@@ -1164,7 +1149,7 @@ export class CodeIndexingService {
   private async reindexFilesLocked(args: ReindexFilesArgs): Promise<ReindexFilesResult> {
     const { projectId, trigger = 'mcp-incremental', lazy, embed = true } = args;
     // Removed paths go through the same patch (an empty new node set).
-    const paths = [...new Set([...args.paths, ...(args.removed ?? [])])];
+    let paths = [...new Set([...args.paths, ...(args.removed ?? [])])];
     {
       const startTime = Date.now();
       const startedAt = new Date(startTime);
@@ -1185,15 +1170,13 @@ export class CodeIndexingService {
         parserType = 'tree-sitter-wasm';
       }
 
-      // Resolve podMeta for fan/trio paths so the parser can attribute symbols correctly.
-      let podMeta: PodMeta | undefined;
-      if (isFanLike) {
-        const scanner = new FantomFileScanner();
-        try {
-          // Cheaper than re-scanning: read the project's build.fan if any.
-          podMeta = (await scanner.scanDirectory(projectRow.path)).projectMeta;
-        } catch { /* best-effort */ }
-      }
+      // Pod map (nearest build.fan per file) for every project language.
+      const podMap = await buildPodMap(projectRow.path);
+      const rootMeta = rootPodMeta(podMap.get(path.resolve(projectRow.path)), projectRow.podName, projectRow.name);
+
+      // A changed build.fan renames every symbol under its directory, so the
+      // change expands to all source files of that pod.
+      paths = await expandBuildFanPaths(paths, scannerFor(projectRow.language));
 
       // Open the IndexRun row up front.
       const indexRun = await this.prisma.indexRun.create({
@@ -1219,28 +1202,18 @@ export class CodeIndexingService {
       });
 
       // Initialize parsers (mirroring indexProject's setup).
-      let useTreeSitter = parserType === 'tree-sitter-wasm' || parserType === 'tree-sitter';
+      const useTreeSitter = (parserType === 'tree-sitter-wasm' || parserType === 'tree-sitter') && !isFanLike;
       let treeSitterParser: TreeSitterCodeParser | null = null;
-      if (useTreeSitter && langStr !== 'trio') {
-        // Same namespace rule as indexProject (pod name → project name → file path).
-        treeSitterParser = createTreeSitterParser(projectId, language, podMeta?.podName ?? projectRow.podName ?? projectRow.name);
+      if (useTreeSitter) {
+        // Same namespace rule as indexProject (root pod → project pod name → project name).
+        treeSitterParser = createTreeSitterParser(projectId, language, rootMeta.podName);
         const ok = await treeSitterParser.initialize();
         if (!ok) {
           logger.warn(`Tree-sitter not available for ${language}, falling back to regex`);
-          useTreeSitter = false;
           treeSitterParser = null;
         }
       }
-      let axonTreeSitter: TreeSitterCodeParser | null = null;
-      if (useTreeSitter || langStr === 'trio' || langStr === 'axon') {
-        try {
-          axonTreeSitter = createTreeSitterParser(projectId, 'axon' as any, podMeta?.podName);
-          const ok = await axonTreeSitter.initialize();
-          if (!ok) axonTreeSitter = null;
-        } catch { axonTreeSitter = null; }
-      }
-      const regexParser = new FantomCodeParser(projectId, podMeta);
-      const trioParser = new TrioParser(projectId, podMeta?.podName, axonTreeSitter);
+      const parsers = new PodParserSet({ projectId, rootMeta, podMap, primary: treeSitterParser });
       const keyBaseOf = await this.keyBaseResolver(projectId, projectRow.path);
 
       // Snapshot per-file existing symbols (for diff) BEFORE clearing.
@@ -1277,14 +1250,7 @@ export class CodeIndexingService {
           continue;
         }
         try {
-          let parsed: ParsedFile;
-          if (fp.endsWith('.trio')) {
-            parsed = await trioParser.parseFile(fp);
-          } else if (useTreeSitter && treeSitterParser) {
-            parsed = await treeSitterParser.parseFile(fp);
-          } else {
-            parsed = regexParser.parseFile(fp);
-          }
+          const parsed = await parsers.parse(fp);
           this.applyStableKeys(parsed, projectId, keyBaseOf);
           parsedFiles.push(parsed);
           filesProcessed++;
@@ -1617,6 +1583,13 @@ export class CodeIndexingService {
    */
   async rebuildGraph(
     projectId: number,
+    onProgress?: Parameters<CodeIndexingService['rebuildGraphLocked']>[1],
+  ): Promise<GraphBuildResult> {
+    return this.withProjectLock(projectId, () => this.rebuildGraphLocked(projectId, onProgress));
+  }
+
+  private async rebuildGraphLocked(
+    projectId: number,
     onProgress?: (ev: {
       phase: 'scanning' | 'parsing' | 'graph-building';
       filesTotal?: number;
@@ -1639,10 +1612,12 @@ export class CodeIndexingService {
     logger.info(`Rebuilding graph for project ${project.name} (language: ${language})`);
 
     let files: string[] = [];
-    const podMeta = { podName: project.podName ?? project.name, dependencies: [], srcDirs: ['fan'] };
+    const langStr = language as string;
+    const isFanLike = langStr === 'fantom' || langStr === 'trio' || langStr === 'axon';
 
+    // Same scanner gate as indexProject.
     onProgress?.({ phase: 'scanning' });
-    if (language === 'fantom') {
+    if (isFanLike) {
       const scanner = new FantomFileScanner();
       const scanResult = await scanner.scanDirectory(project.path);
       files = scanResult.files;
@@ -1651,16 +1626,17 @@ export class CodeIndexingService {
       const scanResult = await scanner.scanDirectory(project.path);
       files = scanResult.files;
     }
+    const podMap = await buildPodMap(project.path);
+    const rootMeta = rootPodMeta(podMap.get(path.resolve(project.path)), project.podName, project.name);
     onProgress?.({ phase: 'parsing', filesTotal: files.length, filesProcessed: 0 });
 
-    // Select parser. Fantom now has a tree-sitter grammar, so the previous
-    // `language !== 'fantom'` exclusion has been dropped — when parserType
-    // is tree-sitter-wasm we use tree-sitter for .fan too.
-    const useTreeSitter = parserType === 'tree-sitter-wasm' || parserType === 'tree-sitter';
+    // Primary tree-sitter parser for the project's main language. Fantom-family
+    // files are routed to their own parsers by PodParserSet (fileRouter.ts).
+    const useTreeSitter = (parserType === 'tree-sitter-wasm' || parserType === 'tree-sitter') && !isFanLike;
     let treeSitterParser: TreeSitterCodeParser | null = null;
 
     if (useTreeSitter) {
-      treeSitterParser = createTreeSitterParser(project.id, language, podMeta?.podName);
+      treeSitterParser = createTreeSitterParser(project.id, language, rootMeta.podName);
       const initialized = await treeSitterParser.initialize();
       if (!initialized) {
         logger.warn(`Tree-sitter not available for ${language}, falling back to regex`);
@@ -1668,19 +1644,16 @@ export class CodeIndexingService {
       }
     }
 
-    const regexParser = new FantomCodeParser(project.id, podMeta);
+    const parsers = new PodParserSet({ projectId: project.id, rootMeta, podMap, primary: treeSitterParser });
     const parsedFiles: ParsedFile[] = [];
     const keyBaseOf = await this.keyBaseResolver(project.id, project.path);
 
     for (let i = 0; i < files.length; i++) {
       const filePath = files[i];
       try {
-        if (treeSitterParser) {
-          parsedFiles.push(await treeSitterParser.parseFile(filePath));
-        } else {
-          parsedFiles.push(regexParser.parseFile(filePath));
-        }
-        this.applyStableKeys(parsedFiles[parsedFiles.length - 1], project.id, keyBaseOf);
+        const parsed = await parsers.parse(filePath);
+        parsedFiles.push(parsed);
+        this.applyStableKeys(parsed, project.id, keyBaseOf);
       } catch (err) {
         logger.warn(`Failed to parse ${filePath}: ${err}`);
       }

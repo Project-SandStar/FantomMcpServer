@@ -1,0 +1,65 @@
+================================================================================
+Using with semicolon and case after default
+================================================================================
+
+using concurrent;
+using [java] com.stripe.model::Token as Token;
+class A {
+  Void f(Int x) {
+    switch (x) {
+      case 1:
+      default:
+        return
+      case 16:
+        echo(x)
+    }
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (using_statement
+    (dotted_name
+      (identifier)))
+  (using_statement
+    (ffi
+      (identifier))
+    (dotted_name
+      (identifier)
+      (identifier)
+      (identifier)
+      (identifier))
+    (identifier))
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list
+          (param
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))
+            (identifier)))
+        (block
+          (switch_stmt
+            (identifier)
+            (case_block
+              (literal
+                (int_lit)))
+            (default_block
+              (return_stmt))
+            (case_block
+              (literal
+                (int_lit))
+              (expr_stmt
+                (postfix_expr
+                  (identifier)
+                  (call_args
+                    (identifier)))))))))))

@@ -1,0 +1,5 @@
+# haxall-version  fantom-version
+# Each Haxall home uses its own Fantom release from FANTOM_ROOT.
+# Do not point a new Haxall version at another version's home/.
+4.0.6  1.0.83
+4.0.7  1.0.84

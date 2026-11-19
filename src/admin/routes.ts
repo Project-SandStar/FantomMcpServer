@@ -11,6 +11,7 @@ import { registerSidecarSyncRoutes } from './sidecarSyncRoutes.js';
 import { registerNetbirdRoutes } from './netbirdRoutes.js';
 import { registerPathMappingRoutes } from './pathMappingRoutes.js';
 import { registerFsBrowseRoutes } from './fsBrowseRoutes.js';
+import { registerInstallerRoutes } from '../installers/routes.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -490,6 +491,8 @@ export function createAdminRouter(context: AdminContext): Router {
   registerPathMappingRoutes(router);
   // Server folder picker: /admin/fs/dirs (src/admin/fsBrowseRoutes.ts)
   registerFsBrowseRoutes(router);
+  // Haxall/SkySpark installers: /admin/installers/* (src/installers/routes.ts)
+  registerInstallerRoutes(router);
 
   // Pretty-print JSON for all admin routes
   router.use((_req: Request, res: Response, next: NextFunction) => {

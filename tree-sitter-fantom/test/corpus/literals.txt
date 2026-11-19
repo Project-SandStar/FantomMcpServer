@@ -1,0 +1,291 @@
+================================================================================
+Number literal suffixes
+================================================================================
+
+class Foo {
+  Void bar() {
+    a := 69f
+    b := 1.5e3f
+    c := 10_000
+    d := 3d
+    e := 5sec
+    g := 1e9
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (literal
+              (float_lit)))
+          (local_def
+            (identifier)
+            (literal
+              (float_lit)))
+          (local_def
+            (identifier)
+            (literal
+              (int_lit)))
+          (local_def
+            (identifier)
+            (literal
+              (decimal_lit)))
+          (local_def
+            (identifier)
+            (literal
+              (duration_lit)))
+          (local_def
+            (identifier)
+            (literal
+              (float_lit))))))))
+
+================================================================================
+Unicode brace escape in char literal
+================================================================================
+
+class Foo {
+  Void bar() {
+    c := '\u{1f973}'
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (literal
+              (char_lit
+                (escape)))))))))
+
+================================================================================
+Try statement without braces ends with semicolon
+================================================================================
+
+class Foo {
+  Void bar() {
+    try x = make("bad"); catch (Err e) e1 = e
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (try_stmt
+            (expr_stmt
+              (assign_expr
+                (identifier)
+                (postfix_expr
+                  (identifier)
+                  (call_args
+                    (literal
+                      (str_lit))))))
+            (catch_block
+              (type_ref
+                (simple_type
+                  (qualified_type_name
+                    (identifier))))
+              (identifier)
+              (expr_stmt
+                (assign_expr
+                  (identifier)
+                  (identifier))))))))))
+
+================================================================================
+Nested block comment
+================================================================================
+
+class Foo {
+  Void bar() {
+    /*
+    x.each |n|
+    {
+      /* inner */
+      names[name] = code
+    }
+    */
+    10.times |i| { echo(i) }
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (comment)
+          (expr_stmt
+            (postfix_expr
+              (postfix_expr
+                (literal
+                  (int_lit))
+                (identifier))
+              (closure
+                (func_type
+                  (closure_param
+                    (identifier)))
+                (block
+                  (expr_stmt
+                    (postfix_expr
+                      (identifier)
+                      (call_args
+                        (identifier)))))))))))))
+
+================================================================================
+Field storage access with ampersand
+================================================================================
+
+class Foo {
+  Void bar() {
+    verifyEq(&count, 0)
+    &count = 3
+    x := this.&count
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (expr_stmt
+            (postfix_expr
+              (identifier)
+              (call_args
+                (storage_expr
+                  (identifier))
+                (literal
+                  (int_lit)))))
+          (expr_stmt
+            (assign_expr
+              (storage_expr
+                (identifier))
+              (literal
+                (int_lit))))
+          (local_def
+            (identifier)
+            (postfix_expr
+              (this_expr)
+              (storage_expr
+                (identifier)))))))))
+
+================================================================================
+Uri literal with escapes
+================================================================================
+
+class Foo {
+  Void bar() {
+    u := `foo \$ bar \\ baz \` qoo`
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (literal
+              (uri_lit))))))))
+
+================================================================================
+Decimal literal with leading dot
+================================================================================
+
+class Foo {
+  Void bar() {
+    a := .2D
+    b := .12345d
+    c := .5f
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (literal
+              (decimal_lit)))
+          (local_def
+            (identifier)
+            (literal
+              (decimal_lit)))
+          (local_def
+            (identifier)
+            (literal
+              (float_lit))))))))

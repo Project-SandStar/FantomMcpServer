@@ -18,6 +18,8 @@ import { projectForPath } from '../indexing/focusSet.js';
 import { isLazyEnabledFor, type LazyIndexingConfig } from '../indexing/lazyConfig.js';
 import { versionGroupForProject } from '../projects/versionGroup.js';
 import { getInstallRoot } from '../utils/installRoot.js';
+import { mapPath } from '../utils/pathMapping.js';
+import { mirrorRoot } from '../indexing/mirror.js';
 
 export interface SessionContextRun {
   id: number;
@@ -53,6 +55,8 @@ export interface SessionContextProject {
   lastRun: SessionContextRun | null;
   /** Files of this project in the focus set (recently read/edited by AIs). */
   focusFiles: number;
+  /** The client's folder for this project (differs from `path` on a remote server). */
+  clientRoot?: string;
 }
 
 export interface SessionContextProjectRef {
@@ -96,6 +100,49 @@ export interface SessionContextArgs {
   version?: string;
 }
 
+/**
+ * Project for a CLIENT working directory. The client (a Mac running Claude
+ * Code) sends its own path, but a remote server stores the sidecar mirror
+ * path: /Users/dev/Code/mcpfantom is /mirror/mac-dev/mcpfantom here.
+ * Order: exact prefix, then pathMappings (mapPath), then the mirror layout
+ * {mirror}/{sidecar}/{rootName}/{sub...} matched against the cwd segments.
+ * The mirror step only answers when one project wins (no tie across
+ * sidecars). `clientRoot` is the client-side folder of the project, so the
+ * hook can tell the agent which local folder the server paths mean.
+ */
+export function projectForClientPath<P extends { id: number; path: string }>(
+  rows: P[], cwd: string, mirror: string = mirrorRoot(),
+): { project: P; clientRoot: string } | null {
+  const direct = projectForPath(rows, cwd);
+  if (direct) return { project: direct, clientRoot: path.resolve(direct.path) };
+
+  const mapped = mapPath(cwd);
+  if (mapped && mapped !== cwd) {
+    const viaMap = projectForPath(rows, mapped);
+    if (viaMap) return { project: viaMap, clientRoot: cwd.slice(0, cwd.length - (mapped.length - path.resolve(viaMap.path).length)) || cwd };
+  }
+
+  const segs = cwd.split(/[\\/]+/).filter(Boolean);
+  const mirrorPrefix = path.resolve(mirror) + '/';
+  let best: { project: P; len: number; clientRoot: string } | null = null;
+  let tie = false;
+  for (const r of rows) {
+    const root = path.resolve(r.path);
+    if (!root.startsWith(mirrorPrefix)) continue;
+    const tail = root.slice(mirrorPrefix.length).split('/').filter(Boolean).slice(1); // drop {sidecar}
+    if (tail.length === 0) continue;
+    // Find the tail as a run of cwd segments; the cwd may go deeper.
+    for (let i = 0; i + tail.length <= segs.length; i++) {
+      if (!tail.every((t, k) => segs[i + k] === t)) continue;
+      const clientRoot = '/' + segs.slice(0, i + tail.length).join('/');
+      if (!best || tail.length > best.len) { best = { project: r, len: tail.length, clientRoot }; tie = false; }
+      else if (tail.length === best.len && best.project.id !== r.id) tie = true;
+      break;
+    }
+  }
+  return best && !tie ? { project: best.project, clientRoot: best.clientRoot } : null;
+}
+
 function iso(d: Date | null | undefined): string | null {
   return d instanceof Date ? d.toISOString() : null;
 }
@@ -110,7 +157,8 @@ export async function buildSessionContext(a: SessionContextArgs): Promise<Sessio
     orderBy: { id: 'asc' },
   });
   const cwd = path.resolve(a.cwd);
-  const hit = projectForPath(rows, cwd);
+  const match = projectForClientPath(rows, cwd);
+  const hit = match?.project ?? null;
 
   let project: SessionContextProject | null = null;
   if (hit) {
@@ -163,6 +211,7 @@ export async function buildSessionContext(a: SessionContextArgs): Promise<Sessio
           }
         : null,
       focusFiles,
+      clientRoot: match?.clientRoot,
     };
   }
 

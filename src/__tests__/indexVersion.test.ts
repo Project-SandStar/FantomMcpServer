@@ -35,7 +35,20 @@ describe('indexVersionFor', () => {
 
   it('a parser type flip changes the version (regex → tree-sitter re-parses)', () => {
     expect(indexVersionFor('/p/a.fan', 'regex')).not.toBe(indexVersionFor('/p/a.fan', TS));
-    expect(extractorVersionFor('/p/a.fan', 'regex')).toMatch(/^fan-regex:/);
+    expect(extractorVersionFor('/p/a.fan', 'regex')).toMatch(/^fan:/);
+  });
+
+  it('Fantom-family files have the same extractor under every parser type', () => {
+    expect(extractorVersionFor('/p/a.fan', TS)).toBe(extractorVersionFor('/p/a.fan', 'regex'));
+    expect(extractorVersionFor('/p/a.fan', TS)).toMatch(/^fan:/);
+    expect(extractorVersionFor('/p/lib.trio', TS)).toBe(extractorVersionFor('/p/lib.trio', 'regex'));
+    expect(extractorVersionFor('/p/f.axon', TS)).toBe(extractorVersionFor('/p/f.axon', 'regex'));
+    expect(extractorVersionFor('/p/f.axon', TS)).toMatch(/^axon:/);
+  });
+
+  it('build.fan has its own no-symbol family', () => {
+    expect(extractorVersionFor('/p/pod/x/build.fan', TS)).toMatch(/^skip:/);
+    expect(extractorVersionFor('/p/pod/x/build.fan', 'regex')).toMatch(/^skip:/);
   });
 
   it('is case-insensitive on the extension', () => {

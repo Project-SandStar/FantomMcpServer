@@ -16,26 +16,34 @@ module.exports = grammar({
 
   word: $ => $.identifier,
 
+  // src/scanner.c: nested /* */ block comments (Tokenizer.fan skipCommentML).
+  externals: $ => [
+    // `comment` is also an internal `//` token below; the scanner produces
+    // the nested `/* */` form under the same node name.
+    $.comment,
+    // `[` on the same line as the previous token, not followed by `]`
+    // (TokenVal.isIndexOpenBracket = lbracket && !newline). Only this form
+    // may start an index expression; a `[` that starts a new line begins a
+    // new statement, e.g. `[Str:Obj?]? map := null`. Literals accept both.
+    $._lbracket_same_line,
+    // zero-width: an identifier starts on the same line (no newline in the gap).
+    $._same_line,
+    // zero-width: a `|...|` func-type signature followed by `{` starts here
+    // (Parser.fan tryClosure: a closure needs its block, else it is not a
+    // closure). Keeps `x := null` + newline + `|A,B|? f` from being a call.
+    $._closure_ahead,
+  ],
+
   conflicts: $ => [
-    [$.type_ref, $._primary],
-    [$.enum_val, $.type_ref],
     [$.local_def, $.expr_stmt],
     [$._stmt, $.if_stmt],
     [$.simple_type, $._primary],
-    [$.qualified_type_name, $._primary],
     [$.type_literal, $.slot_literal],
-    [$.list_type, $.list_lit],
-    [$.type_ref, $.nullable_type],
-    [$.type_ref, $.list_type],
-    [$.func_type, $.closure],
-    [$.qualified_type_name, $.closure_param],
-    [$.simple_type, $.shorthand_map_type],  // Str vs Str:Int
-    [$.type_ref, $.shorthand_map_type],  // [Str:Int] vs Str:Int
-    [$.closure_param, $.type_ref],  // |This| vs |This name|
-    [$.func_type, $.closure_param],  // |Type,... vs |Type name|
-    [$.qualified_type_name, $._arg],  // Type: vs name: in args
-    [$.return_stmt],                   // `return` with/without expr (statement-boundary lookahead)
+    [$.return_stmt],
     [$._stmt, $.return_stmt],
+    [$.func_type],
+    [$.qualified_type_name, $.static_type_expr],
+    [$.qualified_type_name, $._primary],
   ],
 
   rules: {
@@ -43,22 +51,32 @@ module.exports = grammar({
     // Top Level
     // ============================================
     source_file: $ => seq(
+      optional($.shebang),
       repeat($.using_statement),
       repeat($._type_definition),
     ),
+
+    shebang: $ => token(/#![^\n]*/),
 
     // ============================================
     // Using Statements
     // ============================================
     using_statement: $ => seq(
       'using',
+      optional(field('ffi', $.ffi)),
       field('path', $.dotted_name),
       optional(seq('as', field('alias', $.identifier))),
+      optional(';'),
     ),
+
+    _lbracket: $ => choice('[', $._lbracket_same_line),
+
+    ffi: $ => seq($._lbracket, $.identifier, ']'),
 
     dotted_name: $ => seq(
       $.identifier,
       repeat(seq(choice('.', '::'), $.identifier)),
+      repeat(seq('$', $.identifier)),
     ),
 
     // ============================================
@@ -76,7 +94,6 @@ module.exports = grammar({
       repeat($.modifier),
       'class',
       field('name', $.identifier),
-      optional($.type_params),
       optional(seq(':', $.type_list)),
       field('body', $.class_body),
     ),
@@ -86,7 +103,6 @@ module.exports = grammar({
       repeat($.modifier),
       'mixin',
       field('name', $.identifier),
-      optional($.type_params),
       optional(seq(':', $.type_list)),
       field('body', $.class_body),
     ),
@@ -114,7 +130,7 @@ module.exports = grammar({
     enum_body: $ => seq(
       '{',
       optional($.enum_vals),
-      repeat($._slot),
+      repeat(choice($._slot, ';')),
       '}',
     ),
 
@@ -124,6 +140,7 @@ module.exports = grammar({
     )),
 
     enum_val: $ => prec(2, seq(
+      repeat($.facet),
       field('name', $.identifier),
       optional($.call_args),
     )),
@@ -144,13 +161,6 @@ module.exports = grammar({
       'virtual',
     ),
 
-    type_params: $ => seq(
-      '<',
-      $.identifier,
-      repeat(seq(',', $.identifier)),
-      '>',
-    ),
-
     type_list: $ => seq(
       $.type_ref,
       repeat(seq(',', $.type_ref)),
@@ -158,7 +168,7 @@ module.exports = grammar({
 
     class_body: $ => seq(
       '{',
-      repeat($._slot),
+      repeat(choice($._slot, ';')),
       '}',
     ),
 
@@ -181,11 +191,21 @@ module.exports = grammar({
       optional(seq(':=', field('init', $._expr))),
     ),
 
+    // `{ get { .. } private set { .. } }`, `{ private set }` (Parser.fan getOrSet)
     field_accessors: $ => seq(
       '{',
-      repeat(choice('get', 'set', $.block)),
+      repeat($.field_accessor),
       '}',
     ),
+
+    field_accessor: $ => prec.right(seq(
+      choice(
+        seq(repeat($.modifier), choice('get', 'set'), optional($.block)),
+        repeat1($.modifier),            // `{ private }` is legal
+      ),
+      optional(';'),
+    )),
+
 
     method_def: $ => seq(
       repeat($.facet),
@@ -200,14 +220,17 @@ module.exports = grammar({
       repeat($.facet),
       repeat($.modifier),
       'new',
+      repeat($.modifier),
       field('name', $.identifier),
       field('params', $.param_list),
-      optional(seq(':', $._ctor_chain)),
+      optional(seq(':', $.ctor_chain)),
       optional(field('body', $.block)),
     ),
 
-    _ctor_chain: $ => seq(
+    // `: super(args)`, `: this(args)`, `: super.named(args)` (Parser.fan ctorChain)
+    ctor_chain: $ => seq(
       choice('this', 'super'),
+      optional(seq('.', $.identifier)),
       $.call_args,
     ),
 
@@ -232,72 +255,59 @@ module.exports = grammar({
     ),
 
     // ============================================
-    // Types
+    // Types  (mirrors Parser.fan ctype(): base, then postfix ? / [] / :V)
     // ============================================
     type_ref: $ => choice(
       $.simple_type,
-      $.nullable_type,
-      $.list_type,
-      $.map_type,
-      $.shorthand_map_type,  // Key:Val without brackets
       $.func_type,
+      $.map_type,            // [K:V]
+      $.nullable_type,       // T?   (no whitespace before ?)
+      $.list_type,           // T[]
+      $.shorthand_map_type,  // K:V  (lowest binding, right assoc)
     ),
 
-    simple_type: $ => prec.right(seq(
-      $.qualified_type_name,
-      optional($.type_args),
-    )),
+    simple_type: $ => $.qualified_type_name,
 
     qualified_type_name: $ => seq(
       $.identifier,
       repeat(seq('::', $.identifier)),
     ),
 
-    // Nullable type can wrap any type form: `Foo?`, `Foo[]?`, `[Str:Int]?`,
-    // `Func?`. Previously only wrapped `simple_type`, so common signatures
-    // like `FacetDef[]? facets` failed to parse and cascaded into method-def
-    // failure.
-    nullable_type: $ => prec(2, seq(
-      choice($.simple_type, $.list_type, $.map_type),
-      '?',
-    )),
+    nullable_type: $ => prec(20, seq($.type_ref, $._q_immediate)),
 
-    list_type: $ => prec.right(2, seq(
-      choice($.simple_type, $.list_type),  // permit nested `Foo[][]`
-      '[',
-      ']',
-    )),
+    // `?` with no whitespace before it (Parser.fan ctype: `!cur.whitespace`).
+    // Shared with ternary_expr so `flag? a : b` lexes one way and GLR picks.
+    _q_immediate: $ => token.immediate('?'),
+
+    list_type: $ => prec(20, seq($.type_ref, '[]')),
 
     map_type: $ => seq(
-      '[',
+      $._lbracket,
       field('key', $.type_ref),
       ':',
       field('val', $.type_ref),
       ']',
     ),
 
-    // Shorthand map type without brackets: Str:Int, Str:Str:Obj
-    // Used in field/variable declarations
-    // Lower precedence than bracketed map_type
-    shorthand_map_type: $ => prec.right(-1, seq(
-      $.simple_type,
+    shorthand_map_type: $ => prec.right(1, seq(
+      field('key', $.type_ref),
       ':',
-      choice($.shorthand_map_type, $.simple_type),
+      field('val', $.type_ref),
     )),
 
+    // |A a, B b -> R|   |->|   |Int a|   |Str? -> Void|   |Str?->Void|
     func_type: $ => seq(
       '|',
-      optional(seq($.type_ref, repeat(seq(',', $.type_ref)))),
-      '->',
-      $.type_ref,
+      optional(seq($.closure_param, repeat(seq(',', $.closure_param)))),
+      optional(seq(choice('->', '?->'), optional($.type_ref))),
       '|',
     ),
 
-    type_args: $ => seq(
-      '<',
-      $.type_ref,
-      repeat(seq(',', $.type_ref)),
-      '>',
+    // Formal: `Type name`, `Type` (it-block style |This|), or `name` (inferred)
+    closure_param: $ => choice(
+      prec(2, seq(field('type', $.type_ref), field('name', $.identifier))),
+      prec(1, field('name', $.identifier)),
+      field('type', $.type_ref),
     ),
 
     // ============================================
@@ -308,10 +318,7 @@ module.exports = grammar({
       $.identifier,
       optional(seq(
         '{',
-        optional(seq(
-          $.facet_pair,
-          repeat(seq(choice(',', ';'), $.facet_pair)),
-        )),
+        repeat(seq($.facet_pair, optional(choice(',', ';')))),
         '}',
       )),
     ),
@@ -371,7 +378,13 @@ module.exports = grammar({
       ),
     )),
 
-    expr_stmt: $ => $._expr,
+    // `<expr> ("," <expr>)* <eos>` — Parser.fan itAdd: a comma after an
+    // expression statement is sugar for it.add(expr), in any block.
+    expr_stmt: $ => prec.right(seq(
+      $._expr,
+      repeat(seq(',', $._expr)),
+      optional(','),
+    )),
 
     // `return` with optional value. Without an external scanner emitting a
     // virtual newline/semicolon, `prec.right` made tree-sitter greedily fold
@@ -399,8 +412,9 @@ module.exports = grammar({
       $._expr,
       ')',
       '{',
-      repeat($.case_block),
-      optional($.default_block),
+      // Parser.fan switchStmt loops over case/default in any order; cases
+      // may follow default (it only rejects a second default).
+      repeat(choice($.case_block, $.default_block)),
       '}',
     ),
 
@@ -447,7 +461,7 @@ module.exports = grammar({
 
     // Fantom allows a single statement in place of a braced block after
     // try / catch / finally.
-    _try_body: $ => choice($.block, $._stmt),
+    _try_body: $ => choice($.block, prec.right(seq($._stmt, optional(';')))),
 
     // prec.right binds catch/finally to the nearest try (dangling-else style).
     try_stmt: $ => prec.right(seq(
@@ -498,16 +512,19 @@ module.exports = grammar({
 
     ternary_expr: $ => prec.right(2, seq(
       $._expr,
-      '?',
-      $._expr,
+      choice('?', $._q_immediate),
+      choice($._expr, $.throw_expr),
       ':',
-      $._expr,
+      choice($._expr, $.throw_expr),
     )),
+
+    // `throw <expr>` in a ternary/elvis branch (Parser.fan ifExprBody)
+    throw_expr: $ => prec.right(seq('throw', $._expr)),
 
     elvis_expr: $ => prec.right(3, seq(
       $._expr,
       '?:',
-      $._expr,
+      choice($._expr, $.throw_expr),
     )),
 
     or_expr: $ => prec.left(4, seq($._expr, '||', $._expr)),
@@ -548,13 +565,13 @@ module.exports = grammar({
       $._expr,
       choice(
         seq($.call_args, optional($.it_block)), // call with optional trailing it-block
-        seq('[', $._expr, ']'),
-        seq('.', $.identifier),
+        seq($._lbracket_same_line, $._expr, ']'),
+        seq('.', choice($.identifier, $.storage_expr)),
         seq('?.', $.identifier),
         seq('->', $.identifier),
         seq('?->', $.identifier),
         $.it_block,
-        $.closure,
+        seq($._closure_ahead, $.closure),
         '++',
         '--',
       ),
@@ -571,6 +588,8 @@ module.exports = grammar({
 
     _primary: $ => choice(
       $.identifier,
+      $.static_type_expr,
+      $.storage_expr,
       $.literal,
       $.this_expr,
       $.super_expr,
@@ -584,20 +603,29 @@ module.exports = grammar({
       $.dsl_string,
     ),
 
+    // `&count` raw field storage access; also `this.&count` via postfix
+    storage_expr: $ => seq('&', $.identifier),
+
+    // Pod-qualified type used as a term base (Grammar.md <staticCall>,
+    // <ctorBlock>, <simple>). Requires `::` so a bare identifier stays
+    // an identifier.
+    static_type_expr: $ => seq($.identifier, repeat1(seq('::', $.identifier))),
+
     this_expr: $ => 'this',
     super_expr: $ => 'super',
     it_expr: $ => 'it',
 
     // Type literal: Str#, sys::Str#
     type_literal: $ => prec(1, seq(
-      $.qualified_type_name,
+      $.type_ref,
       '#',
     )),
 
     // Slot literal: Int#plus, #echo (higher precedence because more specific)
     slot_literal: $ => prec(2, seq(
-      optional($.qualified_type_name),
+      optional($.type_ref),
       '#',
+      $._same_line,      // Parser.fan: slot literal only if id is on the same line
       $.identifier,
     )),
 
@@ -612,16 +640,13 @@ module.exports = grammar({
       ')',
     ),
 
-    _arg: $ => seq(
-      optional(seq($.identifier, ':')),
-      $._expr,
-    ),
+    _arg: $ => $._expr,
 
     // List literals. Fantom additionally allows `Type[,]` — a typed empty
     // list — which is conventional in test code (e.g. `XAttr[,]`).
     list_lit: $ => seq(
-      optional($.simple_type),
-      '[',
+      optional($.type_ref),
+      $._lbracket,
       optional(choice(
         ',',                        // Type[,]  empty typed list
         seq(
@@ -635,14 +660,16 @@ module.exports = grammar({
 
     // Map literals: [key:val, ...], [:], Str:Int[key:val, :]
     map_lit: $ => seq(
-      optional(choice($.map_type, $.shorthand_map_type)),
-      '[',
-      optional(seq(
-        $.map_pair,
-        repeat(seq(',', $.map_pair)),
-        optional(','),
-      )),
-      ':',
+      optional($.type_ref),
+      $._lbracket,
+      choice(
+        ':',                        // [:]  empty map
+        seq(
+          $.map_pair,
+          repeat(seq(',', $.map_pair)),
+          optional(','),
+        ),
+      ),
       ']',
     ),
 
@@ -651,30 +678,12 @@ module.exports = grammar({
     // Closure literal. Fantom return-type annotation lives INSIDE the pipe
     // delimiters: `|TypeDef def -> Bool| { ... }`. The previous grammar placed
     // it after the closing `|`, which never matched real Fantom code.
-    closure: $ => seq(
-      '|',
-      optional(seq($.closure_param, repeat(seq(',', $.closure_param)))),
-      optional(seq('->', $.type_ref)),
-      '|',
-      choice($.block, $._expr),
-    ),
-
-    // Closure params can be:
-    // - typed with name: Int a
-    // - type only (it-block style): This, It
-    // - name only (inferred): a
-    closure_param: $ => choice(
-      seq(field('type', $.type_ref), field('name', $.identifier)),
-      field('type', $.type_ref),  // Type only (for |This| f syntax)
-      field('name', $.identifier),
-    ),
+    closure: $ => seq($.func_type, $.block),
 
     // DSL string: Type<|...|>
     dsl_string: $ => seq(
-      $.identifier,
-      '<|',
-      /[^|]*(\|[^>][^|]*)*/,
-      '|>',
+      $.type_ref,
+      token(seq('<|', /([^|]|\|+[^|>])*/, /\|+>/)),
     ),
 
     // ============================================
@@ -696,47 +705,33 @@ module.exports = grammar({
     null_lit: $ => 'null',
     bool_lit: $ => choice('true', 'false'),
 
-    // Integer: decimal, hex, binary
+    // Number literals per Tokenizer.fan number(): digits with `_`,
+    // optional fraction, optional exponent, then suffix f/F (float),
+    // d/D (decimal), or a duration unit. A bare fraction/exponent is a float.
     int_lit: $ => token(choice(
       /0x[0-9a-fA-F_]+/,
       /0b[01_]+/,
       /[0-9][0-9_]*/,
     )),
 
-    // Float: with f/F/d/D suffix optional
-    float_lit: $ => token(
-      /[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9]+)?[fF]?/
-    ),
-
-    // Decimal: ends with d or D
-    decimal_lit: $ => token(choice(
-      /[0-9][0-9_]*[dD]/,
-      /[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9]+)?[dD]/,
+    float_lit: $ => token(choice(
+      /[0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9][0-9_]*)?[fF]/,
+      /[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?/,
+      /[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*/,
+      /\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?[fF]?/,
     )),
 
-    // Regular string with interpolation
-    str_lit: $ => seq(
-      '"',
-      repeat(choice(
-        /[^"\\$]+/,
-        $.escape,
-        $.interpolation,
-      )),
-      '"',
-    ),
+    decimal_lit: $ => token(choice(
+      /[0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9][0-9_]*)?[dD]/,
+      /\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?[dD]/,
+    )),
 
-    // Triple-quoted string
-    triple_str_lit: $ => seq(
-      '"""',
-      repeat(choice(
-        /[^"\\$]+/,
-        '"',
-        '""',
-        $.escape,
-        $.interpolation,
-      )),
-      '"""',
-    ),
+    // Strings are single tokens. A seq-based rule let `extras` (comments,
+    // whitespace) match inside the literal, so "//u:***@host" became a
+    // line comment. Interpolation `$x` / `${expr}` is kept inside the token.
+    str_lit: $ => token(/"([^"\\]|\\.|\$\{[^}]*\})*"/),
+
+    triple_str_lit: $ => token(/"""(("|"")?([^"\\]|\\.))*("|"")?"""/),
 
     // Character literal (produces Int)
     char_lit: $ => seq(
@@ -753,6 +748,7 @@ module.exports = grammar({
     escape: $ => token(choice(
       /\\[nrtbf"'\\$`0]/,
       /\\u[0-9a-fA-F]{4}/,
+      /\\u\{[0-9a-fA-F]+\}/,
     )),
 
     interpolation: $ => seq(
@@ -763,25 +759,23 @@ module.exports = grammar({
       ),
     ),
 
-    uri_lit: $ => /`[^`]*`/,
+    uri_lit: $ => token(/`([^`\\]|\\.)*`/),
     // Duration literals: 100ms, 5sec, 1.5sec, 30min, 1day. Tokenizer.fan
     // accepts both integer and float magnitudes.
-    duration_lit: $ => /[0-9][0-9_]*(\.[0-9][0-9_]*)?(ns|ms|sec|min|hr|day)/,
+    duration_lit: $ => token(/[0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9][0-9_]*)?(ns|ms|sec|min|hr|day)/),
 
     // ============================================
     // Identifiers and Comments
     // ============================================
     identifier: $ => /[a-zA-Z_][a-zA-Z0-9_]*/,
 
-    comment: $ => token(choice(
-      seq('//', /.*/),
-      seq('/*', /[^*]*\*+([^/*][^*]*\*+)*/, '/'),
-    )),
+    comment: $ => token(seq('//', /.*/)),
 
     // Doc comments are `** ...` line-comments. The previous greedy `**` + `/.*/`
     // happily ate the `**` inside string literals (`"**"`, `"****"`), trashing
     // any source that contained those — notably FandocParser.fan. Require
     // whitespace OR end-of-line after the `**` so `**"` stays as two tokens.
-    doc_comment: $ => token(seq('**', /[ \t][^\n]*|[\t ]*/)),
+    // `**` plus any further `*` (Tokenizer.fan docComment eats a run of stars).
+    doc_comment: $ => token(/\*\*+[^\n]*/),
   },
 });

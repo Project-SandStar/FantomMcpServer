@@ -45,7 +45,7 @@ else
     condition: (compare_expr
       left: (var (identifier))
       right: (number))
-    (string)
+    then: (do_block (string))
     else: (string)))
 
 ==================
@@ -147,8 +147,9 @@ catch (e)
 
 (source_file
   (try_catch_expr
-    (call_expr function: (var (identifier)))
-    (call_expr function: (var (identifier)))
+    body: (do_block
+      (call_expr function: (var (identifier)))
+      (call_expr function: (var (identifier))))
     error_var: (identifier)
     handler: (call_expr
       function: (var (identifier))

@@ -650,8 +650,8 @@ export default function DocsExplorerPage() {
                     <span className="mx-2">|</span>
                     <span className={vectorStats.docs.totalVectors > 0 ? 'text-indigo-600' : 'text-gray-400'}>
                       {vectorStats.docs.totalVectors > 0
-                        ? `${vectorStats.docs.totalVectors} vectors`
-                        : 'No vectors'}
+                        ? `${vectorStats.docs.totalVectors} vectors (all instances)`
+                        : 'No vectors (all instances)'}
                     </span>
                     {vectorStats.tables?.docs?.model && (
                       <span className="text-xs text-gray-400 ml-1">
@@ -686,6 +686,20 @@ export default function DocsExplorerPage() {
                 </button>
                 {docStatus?.hasCache && (
                   <button
+                    onClick={() => {
+                      setEmbedResult(null);
+                      setIsEmbedding(true);
+                      embedDocsMutation.mutate(selectedInstance.id);
+                    }}
+                    disabled={embedDocsMutation.isPending || isEmbedding}
+                    title={`Embed only ${selectedInstance.name} docs (already embedded docs are skipped)`}
+                    className="px-3 py-1.5 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-md disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+                  >
+                    {embedDocsMutation.isPending ? 'Embedding...' : 'Embed This Instance'}
+                  </button>
+                )}
+                {docStatus?.hasCache && (
+                  <button
                     onClick={() => clearCacheMutation.mutate(selectedInstance.id)}
                     disabled={clearCacheMutation.isPending}
                     className="px-3 py-1.5 text-sm font-medium text-yellow-700 bg-yellow-100 hover:bg-yellow-200 rounded-md disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
@@ -710,9 +724,9 @@ export default function DocsExplorerPage() {
                 )}
               </div>
             </div>
-            {(indexDocsMutation.isError || clearCacheMutation.isError) && (
+            {(indexDocsMutation.isError || clearCacheMutation.isError || embedDocsMutation.isError) && (
               <div className="mt-2 text-sm text-red-600">
-                {indexDocsMutation.error?.message || clearCacheMutation.error?.message || 'An error occurred'}
+                {indexDocsMutation.error?.message || clearCacheMutation.error?.message || embedDocsMutation.error?.message || 'An error occurred'}
               </div>
             )}
             {indexDocsMutation.isSuccess && (

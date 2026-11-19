@@ -15,9 +15,10 @@ class Foo {
       (field_def
         type: (type_ref
           (nullable_type
-            (simple_type
-              (qualified_type_name
-                (identifier)))))
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))))
         name: (identifier)))))
 
 ================================================================================
@@ -37,9 +38,10 @@ class Foo {
       (field_def
         type: (type_ref
           (list_type
-            (simple_type
-              (qualified_type_name
-                (identifier)))))
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))))
         name: (identifier)))))
 
 ================================================================================
@@ -93,12 +95,13 @@ class Foo {
         name: (identifier)
         params: (param_list)
         body: (block
-          (expr_stmt
-            (assign_expr
-              (identifier)
-              (type_literal
-                (qualified_type_name
-                  (identifier))))))))))
+          (local_def
+            name: (identifier)
+            init: (type_literal
+              (type_ref
+                (simple_type
+                  (qualified_type_name
+                    (identifier)))))))))))
 
 ================================================================================
 Is operator
@@ -124,12 +127,77 @@ class Foo {
         name: (identifier)
         params: (param_list)
         body: (block
-          (expr_stmt
-            (assign_expr
+          (local_def
+            name: (identifier)
+            init: (type_check_expr
               (identifier)
-              (type_check_expr
-                (identifier)
-                (type_ref
-                  (simple_type
-                    (qualified_type_name
-                      (identifier))))))))))))
+              (type_ref
+                (simple_type
+                  (qualified_type_name
+                    (identifier)))))))))))
+
+================================================================================
+Nullable list type in as and is expressions
+================================================================================
+
+class Foo {
+  Void bar() {
+    list := val as Obj?[]
+    if (x is Dict?[]) return
+    y := (a as Int?[]).size
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (type_check_expr
+              (identifier)
+              (type_ref
+                (list_type
+                  (type_ref
+                    (nullable_type
+                      (type_ref
+                        (simple_type
+                          (qualified_type_name
+                            (identifier))))))))))
+          (if_stmt
+            (type_check_expr
+              (identifier)
+              (type_ref
+                (list_type
+                  (type_ref
+                    (nullable_type
+                      (type_ref
+                        (simple_type
+                          (qualified_type_name
+                            (identifier)))))))))
+            (return_stmt))
+          (local_def
+            (identifier)
+            (postfix_expr
+              (paren_expr
+                (type_check_expr
+                  (identifier)
+                  (type_ref
+                    (list_type
+                      (type_ref
+                        (nullable_type
+                          (type_ref
+                            (simple_type
+                              (qualified_type_name
+                                (identifier))))))))))
+              (identifier))))))))

@@ -340,7 +340,7 @@ class FantomMCPServer {
     this.server = new Server(
       {
         name: 'mcp-fantom',
-        version: '1.1.7',
+        version: '1.1.8',
       },
       {
         capabilities: {
@@ -1568,7 +1568,7 @@ class FantomMCPServer {
         };
       })(),
       initialized: this.initializationComplete,
-      version: '1.1.7',
+      version: '1.1.8',
       serverPath: path.resolve(dirname(fileURLToPath(import.meta.url)), 'index.js'),
       port: getServerPort(),
       stats: {
@@ -2877,7 +2877,7 @@ class FantomMCPServer {
 
           // Create a NEW Server instance for this session
           const sessionServer = new Server(
-            { name: 'mcp-fantom', version: '1.1.7' },
+            { name: 'mcp-fantom', version: '1.1.8' },
             { capabilities: { tools: {}, resources: {} }, instructions: SERVER_INSTRUCTIONS }
           );
 
@@ -4815,7 +4815,7 @@ class FantomMCPServer {
                   language: (proj as { language?: string }).language || 'fantom',
                   parserType: (proj as { parserType?: string }).parserType,
                 } as any);
-                searchIndex.rebuild(getFantomCodeIndexer());
+                searchIndex.rebuildProject(getFantomCodeIndexer(), projectId);
                 rawResults = searchIndex.search(query, options);
               }
             } catch (err) {
@@ -5552,7 +5552,7 @@ class FantomMCPServer {
           try {
             const codeIndexer = getFantomCodeIndexer();
             const searchIndex = getFantomFunctionSearchIndex();
-            searchIndex.rebuild(codeIndexer);
+            searchIndex.rebuildProject(codeIndexer, pid);
           } catch { /* best-effort */ }
 
           return {
@@ -5624,7 +5624,7 @@ class FantomMCPServer {
           try {
             const codeIndexer = getFantomCodeIndexer();
             const searchIndex = getFantomFunctionSearchIndex();
-            searchIndex.rebuild(codeIndexer);
+            searchIndex.rebuildProject(codeIndexer, projectId!);
           } catch (err) {
             this.log(`FlexSearch rebuild failed: ${err instanceof Error ? err.message : String(err)}`);
           }

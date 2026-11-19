@@ -1,0 +1,130 @@
+==================
+Nested do block with semicolon inside a call
+==================
+
+f(do
+  do
+    c;
+  end
+end)
+
+---
+
+(source_file
+  (call_expr
+    function: (var (identifier))
+    args: (arg_list
+      (do_block
+        (do_block
+          (var (identifier)))))))
+
+==================
+If do else inside a lambda body (implicit end before else)
+==================
+
+g.map(row => do
+  if (a) do
+    x: 1
+  else return null
+end)
+
+---
+
+(source_file
+  (call_expr
+    function: (dot_call
+      target: (var (identifier))
+      method: (identifier))
+    args: (arg_list
+      (lambda
+        params: (param_single (identifier))
+        body: (do_block
+          (if_expr
+            condition: (var (identifier))
+            then: (do_block
+              (define_var name: (identifier) value: (number)))
+            else: (return_expr (null))))))))
+
+==================
+Dangling else binds to the nearest if
+==================
+
+if (a) do if (b) x else y else z
+
+---
+
+(source_file
+  (if_expr
+    condition: (var (identifier))
+    then: (do_block
+      (if_expr
+        condition: (var (identifier))
+        then: (var (identifier))
+        else: (var (identifier))))
+    else: (var (identifier))))
+
+==================
+Try do catch inside a lambda body
+==================
+
+d.each(dt => do
+  try do
+    a: 1
+  catch (e) c
+end)
+
+---
+
+(source_file
+  (call_expr
+    function: (dot_call
+      target: (var (identifier))
+      method: (identifier))
+    args: (arg_list
+      (lambda
+        params: (param_single (identifier))
+        body: (do_block
+          (try_catch_expr
+            body: (do_block
+              (define_var name: (identifier) value: (number)))
+            error_var: (identifier)
+            handler: (var (identifier))))))))
+
+==================
+Nested block comment
+==================
+
+/* a /* b */ c */
+x: 1
+
+---
+
+(source_file
+  (block_comment)
+  (define_var name: (identifier) value: (number)))
+
+==================
+Number with non-ASCII unit
+==================
+
+x: 1€
+y: 2Δ°C
+
+---
+
+(source_file
+  (define_var name: (identifier) value: (number))
+  (define_var name: (identifier) value: (number)))
+
+==================
+No-break space is whitespace
+==================
+
+x: 1 
+y: 2
+
+---
+
+(source_file
+  (define_var name: (identifier) value: (number))
+  (define_var name: (identifier) value: (number)))

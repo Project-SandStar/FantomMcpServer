@@ -99,7 +99,8 @@ ok "tag v$VERSION is free"
 say "Build and tests"
 npx tsc --noEmit -p tsconfig.json >/dev/null || fail "typecheck failed"
 ok "typecheck"
-npm test --silent >/dev/null 2>&1 || fail "tests failed"
+TEST_LOG="${TMPDIR:-/tmp}/release-tests.log"
+npm test --silent >"$TEST_LOG" 2>&1 || fail "tests failed (log: $TEST_LOG)"
 ok "tests"
 
 # ── Assemble the public file list ──────────────────────────────────────────

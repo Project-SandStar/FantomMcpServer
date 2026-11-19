@@ -96,3 +96,171 @@ class Foo {
         name: (identifier)
         init: (literal
           (str_lit))))))
+
+================================================================================
+Java FFI using statement
+================================================================================
+
+using [java] java.lang::Float as JavaFloat
+using [java] java.util::HashMap
+
+class Foo {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (using_statement
+    (ffi
+      (identifier))
+    (dotted_name
+      (identifier)
+      (identifier)
+      (identifier))
+    (identifier))
+  (using_statement
+    (ffi
+      (identifier))
+    (dotted_name
+      (identifier)
+      (identifier)
+      (identifier)))
+  (class_definition
+    (identifier)
+    (class_body)))
+
+================================================================================
+Fields separated by semicolons and dollar in FFI names
+================================================================================
+
+using [java] java.awt.geom::Line2D$Double as Line2D
+
+class Foo {
+  Dict? a; Dict? b; Dict? c
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (using_statement
+    (ffi
+      (identifier))
+    (dotted_name
+      (identifier)
+      (identifier)
+      (identifier)
+      (identifier)
+      (identifier))
+    (identifier))
+  (class_definition
+    (identifier)
+    (class_body
+      (field_def
+        (type_ref
+          (nullable_type
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))))
+        (identifier))
+      (field_def
+        (type_ref
+          (nullable_type
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))))
+        (identifier))
+      (field_def
+        (type_ref
+          (nullable_type
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))))
+        (identifier)))))
+
+================================================================================
+Field accessors with semicolons and triple star doc
+================================================================================
+
+class Foo {
+  protected Int flags { get; internal set; }
+
+  *** Return pi
+  static Float pi() { return 3.14 }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (field_def
+        (modifier)
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (field_accessors
+          (field_accessor)
+          (field_accessor
+            (modifier))))
+      (doc_comment)
+      (method_def
+        (modifier)
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (return_stmt
+            (literal
+              (float_lit))))))))
+
+================================================================================
+Static ctor and protection-only accessor
+================================================================================
+
+class Foo {
+  new static fromStr(Str s, Bool checked := true) {}
+  Ast ast { private }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (ctor_def
+        (modifier)
+        (identifier)
+        (param_list
+          (param
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))
+            (identifier))
+          (param
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))
+            (identifier)
+            (literal
+              (bool_lit))))
+        (block))
+      (field_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (field_accessors
+          (field_accessor
+            (modifier)))))))

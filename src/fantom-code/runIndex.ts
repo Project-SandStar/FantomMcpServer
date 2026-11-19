@@ -121,7 +121,7 @@ export async function runPatch(
     trigger: (opts.trigger ?? 'auto') as any, lazy: opts.lazy, embed: false,
   });
   try {
-    getFantomFunctionSearchIndex().rebuild(getFantomCodeIndexer());
+    getFantomFunctionSearchIndex().rebuildProject(getFantomCodeIndexer(), projectId);
   } catch { /* best-effort, as in runIndex */ }
 
   const needsEmbed = !r.patch || r.patch.changedIds.length > 0;
@@ -244,7 +244,10 @@ export async function runIndex(
   try {
     const codeIndexer = getFantomCodeIndexer();
     const searchIndex = getFantomFunctionSearchIndex();
-    searchIndex.rebuild(codeIndexer);
+    const t0 = Date.now();
+    searchIndex.rebuildProject(codeIndexer, project.id);
+    const ms = Date.now() - t0;
+    if (ms > 500) console.error(`[runIndex] search index sync project=${project.id} took ${ms}ms`);
   } catch {
     // FlexSearch rebuild is best-effort; never block on it.
   }

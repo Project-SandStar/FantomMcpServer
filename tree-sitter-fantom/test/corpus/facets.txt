@@ -35,3 +35,41 @@ class Foo {
           (bool_lit))))
     name: (identifier)
     body: (class_body)))
+
+================================================================================
+Facet values separated by newlines
+================================================================================
+
+class Foo {
+  @CommandOpt
+  {
+    name   = "r"
+    help   = "Repository"
+  }
+  Bool x := false
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (field_def
+        (facet
+          (identifier)
+          (facet_pair
+            (identifier)
+            (literal
+              (str_lit)))
+          (facet_pair
+            (identifier)
+            (literal
+              (str_lit))))
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (literal
+          (bool_lit))))))

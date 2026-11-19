@@ -4,7 +4,7 @@ Simple closure expression
 
 class Foo {
   Void bar() {
-    x := |Int a| a + 1
+    x := |Int a->Int| { a + 1 }
   }
 }
 
@@ -22,20 +22,26 @@ class Foo {
         name: (identifier)
         params: (param_list)
         body: (block
-          (expr_stmt
-            (assign_expr
-              (identifier)
-              (closure
+          (local_def
+            name: (identifier)
+            init: (closure
+              (func_type
                 (closure_param
                   type: (type_ref
                     (simple_type
                       (qualified_type_name
                         (identifier))))
                   name: (identifier))
-                (add_expr
-                  (identifier)
-                  (literal
-                    (int_lit)))))))))))
+                (type_ref
+                  (simple_type
+                    (qualified_type_name
+                      (identifier)))))
+              (block
+                (expr_stmt
+                  (add_expr
+                    (identifier)
+                    (literal
+                      (int_lit))))))))))))
 
 ================================================================================
 Closure with untyped param
@@ -67,11 +73,77 @@ class Foo {
                 (identifier)
                 (identifier))
               (closure
-                (closure_param
-                  name: (identifier))
+                (func_type
+                  (closure_param
+                    name: (identifier)))
                 (block
                   (expr_stmt
                     (postfix_expr
                       (identifier)
                       (call_args
                         (identifier)))))))))))))
+
+================================================================================
+Func type field after a statement is not a trailing closure
+================================================================================
+
+class Foo {
+  Void bar() {
+    r := null
+
+    |->|? repaint := null
+  }
+  |Str,Int|? cbSub := null
+  |Str,Int|? cbMsg := null
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (literal
+              (null_lit)))
+          (local_def
+            (type_ref
+              (nullable_type
+                (type_ref
+                  (func_type))))
+            (identifier)
+            (literal
+              (null_lit)))))
+      (field_def
+        (type_ref
+          (nullable_type
+            (type_ref
+              (func_type
+                (closure_param
+                  (identifier))
+                (closure_param
+                  (identifier))))))
+        (identifier)
+        (literal
+          (null_lit)))
+      (field_def
+        (type_ref
+          (nullable_type
+            (type_ref
+              (func_type
+                (closure_param
+                  (identifier))
+                (closure_param
+                  (identifier))))))
+        (identifier)
+        (literal
+          (null_lit))))))

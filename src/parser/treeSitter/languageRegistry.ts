@@ -240,19 +240,19 @@ const scalaMappings: NodeTypeMappings = {
   bodyField: 'body'
 };
 
-// Fantom mappings - based on tree-sitter-fantom grammar
-// Note: The Fantom grammar has some limitations:
-// - Map type syntax (Str:Str:Type[:]) partially supported
-// - It-block closures (|This| f) not fully supported
+// Fantom mappings - based on tree-sitter-fantom grammar (2026-11-11 rebuild:
+// 100% of fantom-1.0.84 and haxall-4.0.4 parse clean, see
+// tree-sitter-fantom/CORPUS.md). Enums and facets are types with slots like
+// classes; enum values are listed under `enum_vals` and extracted as fields.
 const fantomMappings: NodeTypeMappings = {
   functionTypes: ['method_def', 'ctor_def'], // Methods and constructors
-  classTypes: ['class_definition'],
+  classTypes: ['class_definition', 'enum_definition', 'facet_definition'],
   interfaceTypes: ['mixin_definition'],
-  variableTypes: ['field_def'],
+  variableTypes: ['field_def', 'enum_val'],
   importTypes: ['using_statement'],
   exportTypes: [],
   commentTypes: ['comment', 'doc_comment'],
-  callTypes: ['postfix_expr', 'call_args'],
+  callTypes: ['postfix_expr'], // call_args alone is not a call; see extractFantomCall
   // Fantom AST uses child nodes, not fields for names
   nameField: 'identifier', // Actually a child type, handled specially
   parametersField: 'param_list',

@@ -2,263 +2,30 @@
 
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import Link from 'next/link';
 import { PathInput } from '@/components/ui/FolderPicker';
-import { api, FantomInstance, CreateInstanceInput, InstanceType, DocStatus, SourceStatus, FantomVersion, DetectFantomVersionResult, SkySarkInstancesResponse } from '@/lib/api';
-
-// ============================================
-// Source Status Component
-// ============================================
-function SourceStatusPanel({ instanceId }: { instanceId: number }) {
-  const { data: sourceStatus, isLoading } = useQuery({
-    queryKey: ['source-status', instanceId],
-    queryFn: () => api.getInstanceSourceStatus(instanceId),
-  });
-
-  if (isLoading) {
-    return (
-      <div className="text-sm text-gray-500">Loading source status...</div>
-    );
-  }
-
-  if (!sourceStatus || !sourceStatus.hasSourcePath) {
-    return (
-      <div className="text-sm text-gray-500">
-        No source path configured. Edit this instance to add one.
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-3">
-      <div className="text-sm text-gray-600">
-        <span className="font-medium">Source Path:</span>{' '}
-        <span className="font-mono text-xs">{sourceStatus.sourcePath}</span>
-      </div>
-
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <div className="p-3 bg-gray-50 rounded-lg">
-          <div className="text-xs text-gray-500">Status</div>
-          <div className={`font-semibold ${sourceStatus.hasCache ? 'text-green-600' : 'text-gray-400'}`}>
-            {sourceStatus.hasCache ? 'Indexed' : 'Not Indexed'}
-          </div>
-        </div>
-        {sourceStatus.hasCache && (
-          <>
-            <div className="p-3 bg-purple-50 rounded-lg">
-              <div className="text-xs text-purple-600">Pods</div>
-              <div className="font-semibold text-purple-800">
-                {sourceStatus.podCount || 0}
-              </div>
-            </div>
-            <div className="p-3 bg-blue-50 rounded-lg">
-              <div className="text-xs text-blue-600">Functions</div>
-              <div className="font-semibold text-blue-800">
-                {sourceStatus.totalFunctions?.toLocaleString() || 0}
-              </div>
-            </div>
-            <div className="p-3 bg-green-50 rounded-lg">
-              <div className="text-xs text-green-600">Types</div>
-              <div className="font-semibold text-green-800">
-                {sourceStatus.totalTypes?.toLocaleString() || 0}
-              </div>
-            </div>
-          </>
-        )}
-      </div>
-
-      {sourceStatus.lastIndexed && (
-        <div className="text-xs text-gray-500">
-          Last indexed: {new Date(sourceStatus.lastIndexed).toLocaleString()}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ============================================
-// Instance Card Component
-// ============================================
-interface InstanceCardProps {
-  instance: FantomInstance;
-  isActive: boolean;
-  isExpanded: boolean;
-  isIndexingSource: boolean;
-  onToggleExpand: () => void;
-  onSetActive: () => void;
-  onValidate: () => void;
-  onEdit: () => void;
-  onDelete: () => void;
-  onIndexSource: () => void;
-  isSetActivePending: boolean;
-  isValidatePending: boolean;
-  isDeletePending: boolean;
-  getTypeBadgeColor: (type: string) => string;
-}
-
-function InstanceCard({
-  instance,
-  isActive,
-  isExpanded,
-  isIndexingSource,
-  onToggleExpand,
-  onSetActive,
-  onValidate,
-  onEdit,
-  onDelete,
-  onIndexSource,
-  isSetActivePending,
-  isValidatePending,
-  isDeletePending,
-  getTypeBadgeColor,
-}: InstanceCardProps) {
-  const hasSourcePath = instance.sourcePath && instance.sourcePath.trim() !== '';
-  const isHaxallOrSkySpark = instance.type === 'haxall' || instance.type === 'skyspark';
-
-  return (
-    <div
-      className={`bg-white rounded-lg shadow ${
-        isActive ? 'ring-2 ring-blue-500' : ''
-      }`}
-    >
-      {/* Main row */}
-      <div className="p-4">
-        <div className="flex items-start justify-between">
-          <div className="flex-1">
-            <div className="flex items-center gap-2 mb-1">
-              {/* Expand button for instances with source path */}
-              {isHaxallOrSkySpark && hasSourcePath && (
-                <button
-                  onClick={onToggleExpand}
-                  className="p-1 hover:bg-gray-100 rounded transition-colors"
-                  title={isExpanded ? 'Collapse' : 'Expand source details'}
-                >
-                  <svg
-                    className={`w-4 h-4 text-gray-500 transition-transform ${isExpanded ? 'rotate-90' : ''}`}
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M9 5l7 7-7 7"
-                    />
-                  </svg>
-                </button>
-              )}
-              <h3 className={`font-semibold ${!instance.isValid ? 'text-red-600' : 'text-gray-900'}`}>
-                {instance.name}
-              </h3>
-              <span className={`text-xs px-2 py-0.5 rounded ${getTypeBadgeColor(instance.type)}`}>
-                {instance.type}
-              </span>
-              {instance.version && (
-                <span className="text-xs text-gray-500">v{instance.version}</span>
-              )}
-              {isActive && (
-                <span className="text-xs bg-blue-600 text-white px-2 py-0.5 rounded">
-                  Active
-                </span>
-              )}
-              {!instance.isValid && (
-                <span className="text-xs bg-red-100 text-red-800 px-2 py-0.5 rounded">
-                  Invalid
-                </span>
-              )}
-              {hasSourcePath && (
-                <span className="text-xs bg-teal-100 text-teal-700 px-2 py-0.5 rounded">
-                  Source
-                </span>
-              )}
-              {instance.fantomVersion && (
-                <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded">
-                  Fantom {instance.fantomVersion}
-                </span>
-              )}
-              {/* Doc source badges for Haxall instances */}
-              {instance.type === 'haxall' && instance.docSourceInstanceId && (
-                <span className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded">
-                  Docs: SkySpark
-                </span>
-              )}
-              {instance.type === 'haxall' && !instance.docSourceInstanceId && (
-                <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded">
-                  No Docs
-                </span>
-              )}
-            </div>
-            <div className="text-sm text-gray-600 font-mono mb-1">{instance.path}</div>
-            <div className="text-xs text-gray-500">
-              Fan: {instance.fanExecutable}
-              {instance.description && (
-                <span className="ml-4">{instance.description}</span>
-              )}
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            {!isActive && (
-              <button
-                onClick={onSetActive}
-                disabled={isSetActivePending}
-                className="px-3 py-1.5 text-sm bg-blue-50 text-blue-700 rounded hover:bg-blue-100 transition-colors"
-              >
-                Set Active
-              </button>
-            )}
-            <Link
-              href={`/instance-docs?id=${instance.id}`}
-              className="px-3 py-1.5 text-sm bg-purple-50 text-purple-700 rounded hover:bg-purple-100 transition-colors"
-            >
-              Docs
-            </Link>
-            {isHaxallOrSkySpark && hasSourcePath && (
-              <button
-                onClick={onIndexSource}
-                disabled={isIndexingSource}
-                className="px-3 py-1.5 text-sm bg-teal-50 text-teal-700 rounded hover:bg-teal-100 disabled:opacity-50 transition-colors"
-              >
-                {isIndexingSource ? 'Indexing...' : 'Index Source'}
-              </button>
-            )}
-            <button
-              onClick={onValidate}
-              disabled={isValidatePending}
-              className="px-3 py-1.5 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200 transition-colors"
-            >
-              Validate
-            </button>
-            <button
-              onClick={onEdit}
-              className="px-3 py-1.5 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200 transition-colors"
-            >
-              Edit
-            </button>
-            <button
-              onClick={onDelete}
-              disabled={isDeletePending}
-              className="px-3 py-1.5 text-sm bg-red-50 text-red-700 rounded hover:bg-red-100 transition-colors"
-            >
-              Delete
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Expanded source status section */}
-      {isExpanded && isHaxallOrSkySpark && hasSourcePath && (
-        <div className="border-t border-gray-100 p-4 bg-gray-50">
-          <h4 className="text-sm font-semibold text-gray-700 mb-3">Source Code Indexing</h4>
-          <SourceStatusPanel instanceId={instance.id} />
-        </div>
-      )}
-    </div>
-  );
-}
+import { InstallersPanel, InstallerCheckRequest } from '@/components/InstallersPanel';
+import { InstanceCard, ActionMenu } from '@/components/instances/InstanceCard';
+import { api, FantomInstance, CreateInstanceInput, InstanceType, FantomVersion } from '@/lib/api';
 
 export default function InstancesPage() {
   const queryClient = useQueryClient();
+  const [installerJobId, setInstallerJobId] = useState<string | null>(null);
+  const [installerMsg, setInstallerMsg] = useState<string | null>(null);
+  const [checkRequest, setCheckRequest] = useState<InstallerCheckRequest>(null);
+  const requestCheck = (product: 'haxall' | 'skyspark') => setCheckRequest(r => ({ product, n: (r?.n ?? 0) + 1 }));
+  const setHomeMutation = useMutation({
+    mutationFn: (id: number) => api.setHaxallHome(id),
+    onSuccess: r => {
+      setInstallerMsg(r.changed ? `Home set: ${r.path}` : `Home already set: ${r.path}`);
+      queryClient.invalidateQueries({ queryKey: ['instances'] });
+    },
+    onError: e => setInstallerMsg((e as Error).message),
+  });
+  const compileHomeMutation = useMutation({
+    mutationFn: (id: number) => api.compileHaxallHome(id),
+    onSuccess: r => { setInstallerJobId(r.jobId); setInstallerMsg(null); },
+    onError: e => setInstallerMsg((e as Error).message),
+  });
   const [showAddForm, setShowAddForm] = useState(false);
   const [editingInstance, setEditingInstance] = useState<FantomInstance | null>(null);
   const [formData, setFormData] = useState<CreateInstanceInput>({
@@ -273,7 +40,6 @@ export default function InstancesPage() {
     fantomSourcePath: '',
     docSourceInstanceId: null,
   });
-  const [expandedInstance, setExpandedInstance] = useState<number | null>(null);
   const [indexingSource, setIndexingSource] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -469,9 +235,6 @@ export default function InstancesPage() {
     indexSourceMutation.mutate(instanceId);
   };
 
-  const toggleExpanded = (instanceId: number) => {
-    setExpandedInstance(expandedInstance === instanceId ? null : instanceId);
-  };
 
   const handleDelete = (instance: FantomInstance) => {
     if (confirm(`Are you sure you want to delete "${instance.name}"?`)) {
@@ -524,17 +287,20 @@ export default function InstancesPage() {
   const instances = data?.instances || [];
   const activeInstance = activeData?.active ? activeData.instance : null;
 
-  // Type badge colors
-  const getTypeBadgeColor = (type: string) => {
-    switch (type) {
-      case 'skyspark':
-        return 'bg-blue-100 text-blue-800';
-      case 'haxall':
-        return 'bg-green-100 text-green-800';
-      default:
-        return 'bg-gray-100 text-gray-800';
-    }
-  };
+  // Group by product, newest version first.
+  const verKey = (v?: string) => (v || '').split(/[.\-]/).map(x => x.padStart(6, '0')).join('.');
+  const GROUPS: { type: string; title: string }[] = [
+    { type: 'haxall', title: 'Haxall' },
+    { type: 'skyspark', title: 'SkySpark' },
+    { type: 'fantom', title: 'Fantom' },
+  ];
+  const groups = [
+    ...GROUPS.map(g => ({ ...g, items: instances.filter(i => i.type === g.type) })),
+    { type: 'other', title: 'Other', items: instances.filter(i => !GROUPS.some(g => g.type === i.type)) },
+  ]
+    .filter(g => g.items.length > 0)
+    .map(g => ({ ...g, items: [...g.items].sort((a, b) => verKey(b.version).localeCompare(verKey(a.version))) }));
+
 
   if (isLoading) {
     return (
@@ -547,25 +313,29 @@ export default function InstancesPage() {
   return (
     <div>
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
+      <div className="flex flex-wrap items-start justify-between gap-3 mb-6">
+        <div className="min-w-0">
           <h1 className="text-2xl font-bold text-gray-900">Fantom Instances</h1>
-          <p className="text-gray-600 mt-1">
-            Manage Fantom, SkySpark, and Haxall installations
-          </p>
+          <p className="text-gray-600 mt-1 text-sm">Fantom, SkySpark and Haxall installations</p>
         </div>
-        {!showAddForm && (
-          <button
-            onClick={() => {
-              setShowAddForm(true);
-              setEditingInstance(null);
-              resetForm();
-            }}
-            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors"
-          >
-            Add Instance
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          <ActionMenu
+            label="Add instance"
+            trigger={<span className="inline-flex items-center gap-1 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm font-medium whitespace-nowrap">+ Add <span aria-hidden>▾</span></span>}
+            actions={[
+              { label: 'Add manually', onClick: () => { setShowAddForm(true); setEditingInstance(null); resetForm(); } },
+              { label: 'Check & add Haxall', onClick: () => requestCheck('haxall'), title: 'Look for new Haxall releases on GitHub' },
+              { label: 'Check & add SkySpark', onClick: () => requestCheck('skyspark'), title: 'Look for new SkySpark installers in the installer source' },
+            ]}
+          />
+          <a href="../config/#fantom-source" title="Installer settings" aria-label="Installer settings"
+            className="h-9 w-9 flex items-center justify-center rounded-md border border-gray-200 text-gray-600 hover:bg-gray-50">⚙</a>
+        </div>
+      </div>
+
+      <div className="mb-6 space-y-2 empty:hidden">
+        <InstallersPanel jobId={installerJobId} setJobId={setInstallerJobId} request={checkRequest} />
+        {installerMsg && <div className="text-sm text-gray-700 bg-gray-50 rounded px-3 py-2">{installerMsg}</div>}
       </div>
 
       {/* Status messages */}
@@ -843,25 +613,29 @@ export default function InstancesPage() {
           </button>
         </div>
       ) : (
-        <div className="space-y-4">
-          {instances.map((instance) => (
-            <InstanceCard
-              key={instance.id}
-              instance={instance}
-              isActive={activeInstance?.id === instance.id}
-              isExpanded={expandedInstance === instance.id}
-              isIndexingSource={indexingSource === instance.id}
-              onToggleExpand={() => toggleExpanded(instance.id)}
-              onSetActive={() => setActiveMutation.mutate(instance.id)}
-              onValidate={() => validateMutation.mutate(instance.id)}
-              onEdit={() => handleEdit(instance)}
-              onDelete={() => handleDelete(instance)}
-              onIndexSource={() => handleIndexSource(instance.id)}
-              isSetActivePending={setActiveMutation.isPending}
-              isValidatePending={validateMutation.isPending}
-              isDeletePending={deleteMutation.isPending}
-              getTypeBadgeColor={getTypeBadgeColor}
-            />
+        <div className="space-y-6">
+          {groups.map(g => (
+            <section key={g.type}>
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-2">{g.title} <span className="text-gray-400">({g.items.length})</span></h2>
+              <div className="grid gap-3 grid-cols-1 2xl:grid-cols-2">
+                {g.items.map(instance => (
+                  <InstanceCard
+                    key={instance.id}
+                    instance={instance}
+                    isActive={activeInstance?.id === instance.id}
+                    isIndexingSource={indexingSource === instance.id}
+                    installerBusy={!!installerJobId || compileHomeMutation.isPending}
+                    onSetActive={() => setActiveMutation.mutate(instance.id)}
+                    onValidate={() => validateMutation.mutate(instance.id)}
+                    onEdit={() => handleEdit(instance)}
+                    onDelete={() => handleDelete(instance)}
+                    onIndexSource={() => handleIndexSource(instance.id)}
+                    onSetHome={() => setHomeMutation.mutate(instance.id)}
+                    onCompileHome={() => compileHomeMutation.mutate(instance.id)}
+                  />
+                ))}
+              </div>
+            </section>
           ))}
         </div>
       )}

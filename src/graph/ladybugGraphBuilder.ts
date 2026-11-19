@@ -25,6 +25,7 @@ import { ladybugExecute } from './ladybugConnection.js';
 import { projectHasWal } from './projectGraphConnection.js';
 import { initLadybugSchema, clearProjectGraph } from './ladybugSchema.js';
 import { invalidateProjectNodeCount } from './projectNodeCounts.js';
+import { routeFile } from '../fantom-code/fileRouter.js';
 
 const logger = createLogger('ladybug-graph-builder');
 
@@ -36,11 +37,14 @@ export function yieldToEventLoop(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve));
 }
 
-/** Detect language from file extension */
+/**
+ * Language stored on a node, from the file router (typescript, vue, fantom,
+ * axon, ...). Same-language call resolution needs this in a mixed project;
+ * before, every node in every project was 'fantom'.
+ */
 function langFromPath(fp: string): string {
-  if (fp.endsWith('.trio') || fp.endsWith('.axon')) return 'axon';
-  if (fp.endsWith('.fan') || fp.endsWith('.fwt')) return 'fantom';
-  return 'fantom';
+  const lang = routeFile(fp).language;
+  return lang === 'unknown' ? 'fantom' : lang;
 }
 
 // ============================================

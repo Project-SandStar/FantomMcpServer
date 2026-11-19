@@ -473,6 +473,26 @@ export class FantomFunctionSearchIndex {
   }
 
   /**
+   * Re-sync one project only. A full rebuild re-adds every symbol of every
+   * project (~25 s of main-thread CPU on the server after each project of a
+   * bulk reindex); this costs only the changed project's symbols.
+   */
+  rebuildProject(indexer: FantomCodeIndexer, projectId: number): void {
+    const pid = Number(projectId);
+    for (const [id, f] of this.functions) {
+      if (Number(f.projectId) === pid) this.remove(id);
+    }
+    const project = indexer.getProject(pid);
+    if (project) this.projects.set(pid, project);
+    else this.projects.delete(pid);
+
+    for (const func of indexer.getFunctionsByProject(pid)) this.add(func);
+    for (const t of indexer.getAllTypes()) {
+      if (Number(t.projectId) === pid && !this.functions.has(t.id)) this.addTypeDef(t);
+    }
+  }
+
+  /**
    * Get a project by ID
    */
   getProject(projectId: number): FantomProject | undefined {

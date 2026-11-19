@@ -37,9 +37,22 @@ module.exports = grammar({
     // Prevents newline-separated [list] from being misinterpreted as
     // index access on the preceding expression (matches Haxall isEos).
     $._index_ahead,
+    // Nested /* ... */ comments (Tokenizer.fan skipCommentML counts depth);
+    // an unterminated comment runs to EOF. Token regexes cannot nest.
+    $.block_comment,
+    // Zero-width token emitted when the next token is "else" or "catch":
+    // Parser.fan doBlock() breaks there without consuming an "end".
+    $._implicit_end,
+    // Listed so the scanner can see when an open `if` / `try` may still take
+    // the keyword (valid_symbols); the scanner never produces them itself,
+    // the internal lexer does. Dangling else binds to the nearest `if`
+    // (Parser.fan ifExpr), so _implicit_end must not fire there.
+    "else",
+    "catch",
   ],
 
-  extras: ($) => [/\s/, $.line_comment, $.block_comment],
+  // Tokenizer.fan: space, tab and 0xA0 (no-break space) are whitespace.
+  extras: ($) => [/[\s\u00A0]/, $.line_comment, $.block_comment],
 
   word: ($) => $.identifier,
 
@@ -120,28 +133,27 @@ module.exports = grammar({
       ),
 
     // ── Do / End block ────────────────────────────────────────────────
-    // Parser.fan: doBlock() breaks on "end", "else", "catch" keywords
+    // Parser.fan: doBlock() reads at least one expr (`exprs := [expr]`) and
+    // stops at "end" (consumed) or at "else" / "catch" (not consumed, any
+    // nesting depth). The scanner's zero-width _implicit_end stands for the
+    // second case, so `if (a) do x else y` and `try do x catch y` nest freely.
     do_block: ($) =>
-      seq("do", repeat(seq($._expr, optional(";"))), "end"),
+      seq(
+        "do",
+        repeat1(seq($._expr, optional(";"))),
+        choice("end", $._implicit_end)
+      ),
 
     // ── If / Else ─────────────────────────────────────────────────────
     // Parser.fan: if (cond) expr [else expr]
-    // do blocks can omit "end" before "else":
-    //   if (cond) do ... else do ... end
+    // do blocks may omit "end" before "else" (see do_block).
     if_expr: ($) =>
       prec.right(
         0,
-        choice(
-          seq(
-            "if", "(", field("condition", $._expr), ")",
-            "do", repeat(seq($._expr, optional(";"))),
-            "else", field("else", $._expr)
-          ),
-          seq(
-            "if", "(", field("condition", $._expr), ")",
-            field("then", $._expr),
-            optional(seq("else", field("else", $._expr)))
-          )
+        seq(
+          "if", "(", field("condition", $._expr), ")",
+          field("then", $._expr),
+          optional(seq("else", field("else", $._expr)))
         )
       ),
 
@@ -153,24 +165,15 @@ module.exports = grammar({
 
     // ── Try / Catch ───────────────────────────────────────────────────
     // Parser.fan: try expr catch [(id)] expr
-    // do blocks can omit "end" before "catch":
-    //   try do ... catch (e) handler
+    // do blocks may omit "end" before "catch" (see do_block).
     try_catch_expr: ($) =>
       prec.right(
         0,
-        choice(
-          seq(
-            "try", "do", repeat(seq($._expr, optional(";"))),
-            "catch",
-            optional(seq("(", field("error_var", $.identifier), ")")),
-            field("handler", $._expr)
-          ),
-          seq(
-            "try", field("body", $._expr),
-            "catch",
-            optional(seq("(", field("error_var", $.identifier), ")")),
-            field("handler", $._expr)
-          )
+        seq(
+          "try", field("body", $._expr),
+          "catch",
+          optional(seq("(", field("error_var", $.identifier), ")")),
+          field("handler", $._expr)
         )
       ),
 
@@ -487,8 +490,10 @@ module.exports = grammar({
             /[0-9][0-9_]*/,
             optional(seq(".", /[0-9][0-9_]*/)),
             optional(seq(/[eE]/, optional(/[+-]/), /[0-9]+/)),
+            // Tokenizer.fan num(): unit chars are isAlpha, %, $, _, any
+            // char > 128, and / when not followed by another / (comment).
             optional(
-              /[a-zA-Z_%$\u00B0\u0394\u00B2\u00B3\u2080-\u2089][a-zA-Z0-9_%$\/\u00B0\u0394\u00B2\u00B3\u2080-\u2089]*/
+              /[a-zA-Z_%$\u0080-\uFFFF][a-zA-Z0-9_%$\/\u0080-\uFFFF]*/
             )
           )
         )
@@ -553,10 +558,6 @@ module.exports = grammar({
     // Tokenizer.fan: skipCommentSL() — // to end of line
     line_comment: (_$) => token(seq("//", /[^\n]*/)),
 
-    // Tokenizer.fan: skipCommentML() — /* ... */ (nested in Axon, but
-    // tree-sitter token rules can't recurse; this handles non-nested cases)
-    // Also handles unterminated /* at EOF (SkySpark tolerates these)
-    block_comment: (_$) =>
-      token(seq("/*", /[^*]*(\*+([^/*][^*]*\*+)*\/|\*+)?/)),
+    // block_comment comes from src/scanner.c (see externals).
   },
 });

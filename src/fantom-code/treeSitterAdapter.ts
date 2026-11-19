@@ -517,7 +517,12 @@ export class TreeSitterCodeParser {
     const bodyNode = tsNode.childForFieldName('body') || this.findChildByType(tsNode.children, ['class_body', 'body', 'block']);
     if (bodyNode) {
       const body = bodyNode as { children: unknown[] };
-      for (const child of body.children || []) {
+      // Fantom enum bodies list their values under one `enum_vals` node
+      // (`doc, elem, text`); walk into it so each value becomes a field.
+      const members = (body.children || []).flatMap(c =>
+        (c as { type: string }).type === 'enum_vals' ? ((c as { children: unknown[] }).children || []) : [c]
+      );
+      for (const child of members) {
         const childNode = child as { type: string };
         if (mappings.functionTypes.includes(childNode.type)) {
           const method = this.extractFunction(child, mappings);
@@ -552,7 +557,8 @@ export class TreeSitterCodeParser {
       methods,
       fields,
       implements: implementsList,
-      isAbstract: tsNode.text.includes('abstract class')
+      isAbstract: tsNode.text.includes('abstract class'),
+      documentation: this.fantomDocFor(tsNode)
     };
   }
 
@@ -583,7 +589,9 @@ export class TreeSitterCodeParser {
         if (childNode.type === 'method_signature' || mappings.functionTypes.includes(childNode.type)) {
           const method = this.extractFunction(child, mappings);
           if (method) methods.push(method);
-        } else if (childNode.type === 'property_signature') {
+        } else if (childNode.type === 'property_signature' || mappings.variableTypes?.includes(childNode.type)) {
+          // Fantom mixins may declare fields (`const static Str key := "cx"`);
+          // they used to be dropped because only TS property_signature matched.
           const field = this.extractFieldFromNode(child);
           if (field) properties.push(field);
         }
@@ -607,7 +615,8 @@ export class TreeSitterCodeParser {
       },
       methods,
       properties,
-      extends: extendsList
+      extends: extendsList,
+      documentation: this.fantomDocFor(tsNode)
     };
   }
 
@@ -673,7 +682,7 @@ export class TreeSitterCodeParser {
     }
 
     // Extract parameters
-    const paramsNode = tsNode.childForFieldName('parameters') || this.findChildByType(tsNode.children, ['formal_parameters']);
+    const paramsNode = tsNode.childForFieldName('parameters') || tsNode.childForFieldName('params') || this.findChildByType(tsNode.children, ['formal_parameters', 'param_list']);
     const parameters = this.extractParameters(paramsNode);
 
     // Extract return type
@@ -709,7 +718,67 @@ export class TreeSitterCodeParser {
       isAsync: tsNode.type === 'arrow_function' ? false : tsNode.text.startsWith('async'),
       isStatic: tsNode.text.includes('static '),
       isAbstract: tsNode.text.startsWith('abstract '),
-      calls
+      calls,
+      documentation: this.fantomDocFor(tsNode)
+    };
+  }
+
+  /**
+   * Fantom `** ...` doc lines are `doc_comment` extras that sit right before
+   * the slot or type they describe. Collect the run of them, strip the stars.
+   */
+  private fantomDocFor(node: unknown): string | undefined {
+    if (this.language !== 'fantom') return undefined;
+    type N = { type: string; text: string; previousNamedSibling: N | null };
+    const lines: string[] = [];
+    let p = (node as N).previousNamedSibling;
+    while (p && p.type === 'doc_comment') {
+      lines.unshift(p.text.replace(/^\*\*+ ?/, ''));
+      p = p.previousNamedSibling;
+    }
+    if (!lines.length) return undefined;
+    return lines.join('\n').trim() || undefined;
+  }
+
+  /**
+   * Fantom call from a `postfix_expr`: `foo(1)`, `obj.m(x)`, `a.b.c(x)`,
+   * `Type(x)` (ctor), `pod::Type.m(x)`, `list.each |x| {..}` and the
+   * paren-less form `obj.m` / `Type.m`. Returns null for plain field access
+   * on a lower-case receiver with no args (`this.x`), which regex also skips.
+   */
+  private extractFantomCall(node: { type: string; text: string; children: unknown[]; startPosition: { row: number; column: number } }): ExtractedCall | null {
+    type N = { type: string; text: string; isNamed: boolean; children: N[] };
+    const kids = (node.children as N[]).filter(c => c.isNamed);
+    if (kids.length < 2) return null;
+    const last = kids[kids.length - 1];
+    const hasArgs = last.type === 'call_args' || last.type === 'closure';
+    const callee = hasArgs ? kids[kids.length - 2] : last;
+    const receiver = hasArgs ? (kids.length > 2 ? kids[kids.length - 3] : null) : kids[kids.length - 2];
+    if (callee.type !== 'identifier') return null;
+    const name = callee.text;
+    const isTypeName = (s: string) => /^(?:[a-z][\w]*::)?[A-Z]/.test(s);
+    if (!receiver) {
+      // `Foo(..)` is a ctor call; a bare lower-case `foo(..)` is a call on this.
+      if (!hasArgs) return null;
+      if (isTypeName(name)) return this.mkCall('make', name, node, { isConstructor: true, isStatic: true });
+      return this.mkCall(name, undefined, node, {});
+    }
+    if (receiver.type === 'postfix_expr' && !hasArgs) return null; // `a.b.c` chain tail without args: keep only real calls
+    // `obj.m` with no args may be a field read; regex records it too, so keep it.
+    const target = receiver.text.length > 120 ? undefined : receiver.text;
+    const stat = !!target && isTypeName(target);
+    return this.mkCall(name, target, node, { isStatic: stat, isConstructor: stat && name === 'make' });
+  }
+
+  private mkCall(name: string, target: string | undefined, node: { text: string; startPosition: { row: number; column: number } }, f: { isConstructor?: boolean; isStatic?: boolean }): ExtractedCall {
+    return {
+      name,
+      expression: node.text.slice(0, 200),
+      target,
+      location: { startLine: node.startPosition.row + 1, startColumn: node.startPosition.column, endLine: node.startPosition.row + 1, endColumn: node.startPosition.column, startIndex: 0, endIndex: 0 },
+      isAsync: false,
+      isConstructor: !!f.isConstructor,
+      isStatic: !!f.isStatic,
     };
   }
 
@@ -753,7 +822,20 @@ export class TreeSitterCodeParser {
     const params: Array<{ name: string; type?: string; defaultValue?: string; isOptional: boolean; isRest: boolean }> = [];
     for (const child of node.children || []) {
       const childNode = child as { type: string; text: string; childForFieldName: (n: string) => unknown | null; children: unknown[] };
-      if (childNode.type === 'required_parameter' || childNode.type === 'optional_parameter' || childNode.type === 'formal_parameter' || childNode.type === 'rest_parameter') {
+      if (childNode.type === 'param') {
+        // Fantom: `Type name` or `Type name := default` (param node of tree-sitter-fantom)
+        const nameN = childNode.childForFieldName('name');
+        const typeN = childNode.childForFieldName('type');
+        const defN = childNode.childForFieldName('default') as { text: string } | null;
+        if (!nameN) continue;
+        params.push({
+          name: (nameN as { text: string }).text,
+          type: typeN ? (typeN as { text: string }).text : undefined,
+          defaultValue: defN ? defN.text : undefined,
+          isOptional: !!defN,
+          isRest: false,
+        });
+      } else if (childNode.type === 'required_parameter' || childNode.type === 'optional_parameter' || childNode.type === 'formal_parameter' || childNode.type === 'rest_parameter') {
         const nameN = childNode.childForFieldName('pattern') || childNode.childForFieldName('name') || this.findChildByType(childNode.children, ['identifier']);
         const typeN = childNode.childForFieldName('type') || this.findChildByType(childNode.children, ['type_annotation']);
         const name = nameN ? (nameN as { text: string }).text : childNode.text;
@@ -785,6 +867,7 @@ export class TreeSitterCodeParser {
    * Extract a call expression into an ExtractedCall
    */
   private extractCallExpression(node: { type: string; text: string; children: unknown[]; startPosition: { row: number; column: number }; childForFieldName: (n: string) => unknown | null }): ExtractedCall | null {
+    if (node.type === 'postfix_expr') return this.extractFantomCall(node);
     const funcNode = node.childForFieldName('function') || (node.children && node.children[0]);
     if (!funcNode) return null;
 
@@ -845,7 +928,8 @@ export class TreeSitterCodeParser {
       },
       visibility: tsNode.text.includes('private') ? 'private' as const : tsNode.text.includes('protected') ? 'protected' as const : 'public' as const,
       isStatic: tsNode.text.includes('static '),
-      isReadonly: tsNode.text.includes('readonly ')
+      isReadonly: tsNode.text.includes('readonly '),
+      documentation: this.fantomDocFor(tsNode)
     };
   }
 
@@ -925,7 +1009,7 @@ export class TreeSitterCodeParser {
     for (const iface of tsResult.interfaces) {
       const typeDef = this.convertInterface(iface, filePath);
       result.types.push(typeDef);
-      result.functions.push(...typeDef.methods);
+      result.functions.push(...typeDef.methods, ...typeDef.fields);
     }
 
     // Convert standalone functions
@@ -1012,11 +1096,12 @@ export class TreeSitterCodeParser {
       })
       .map(c => ({
         calledName: c.name,
+        calledQualifiedName: c.isStatic && c.target?.includes('::') ? `${c.target}.${c.name}` : undefined,
         target: c.target,
         lineNumber: c.location.startLine,
-        isStatic: false,
+        isStatic: !!c.isStatic,
         isDynamic: false,
-        isConstructor: false,
+        isConstructor: !!c.isConstructor,
         resolved: false
       }));
 

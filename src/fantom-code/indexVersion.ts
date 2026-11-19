@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getLanguageRegistry } from '../parser/treeSitter/languageRegistry.js';
 import type { SupportedLanguage } from '../parser/treeSitter/types.js';
+import { routeFile } from './fileRouter.js';
 
 /** Bump by hand on any change that affects every language. Stored on index_runs.parser_version. */
 // 2 = stable symbol keys (3.8): the graph nodes carry symbol_key / body_sha,
@@ -32,11 +33,14 @@ export const PARSER_SCHEMA_VERSION = 2;
 
 /** Per extractor family; bump the one whose rules changed. */
 export const EXTRACTOR_VERSIONS = {
-  fanRegex: 1,   // FantomCodeParser (.fan, regex)
-  treeSitter: 2, // treeSitterAdapter: 2 = named callbacks + test blocks (2026-10-15)
-  vue: 1,        // parseVueFile (template + script blocks)
-  markdown: 1,   // parseMarkdownFile (heading sections)
-  trio: 1,       // TrioParser (+ axon src via tree-sitter)
+  fanRegex: 1,   // FantomCodeParser (.fan, regex fallback)
+  fan: 1,        // .fan through the fantom tree-sitter grammar (2026-11-11), pod of the nearest build.fan
+  treeSitter: 3, // treeSitterAdapter: 3 = node language by extension, not 'fantom' (2026-11-09)
+  vue: 2,        // parseVueFile: 2 = node language 'vue' (2026-11-09)
+  markdown: 2,   // parseMarkdownFile: 2 = node language 'markdown' (2026-11-09)
+  trio: 2,       // TrioParser: 2 = pod from the nearest build.fan, never 'unknown::' (2026-11-09)
+  axon: 1,       // .axon through the axon grammar, with the pod of the nearest build.fan
+  skip: 1,       // build.fan: no symbols
   regexOther: 1, // generic regex fallback for languages without a grammar
 } as const;
 
@@ -83,24 +87,27 @@ export function resetGrammarFingerprints(): void {
 
 /**
  * Version of the code that extracts symbols from `filePath` under the given
- * project parser type. Mirrors the routing in codeIndexingService.indexProject
- * (trio → TrioParser; tree-sitter → treeSitterAdapter, which routes .vue and
- * .md itself; otherwise the Fantom regex parser).
+ * project parser type. The parser family comes from the same router the
+ * dispatch sites use (src/fantom-code/fileRouter.ts), so the two cannot
+ * drift. Fantom-family files (.fan, .trio, .axon) have the same family under
+ * every project language and parser type.
  */
 export function extractorVersionFor(filePath: string, parserType: string): string {
-  const ext = path.extname(filePath).slice(1).toLowerCase();
+  const route = routeFile(filePath);
   const treeSitter = parserType === 'tree-sitter-wasm' || parserType === 'tree-sitter';
-  if (ext === 'trio') {
-    return `trio:${EXTRACTOR_VERSIONS.trio}:${grammarFingerprint(GRAMMARS_FOR_EXT.trio)}`;
+  switch (route.kind) {
+    case 'skip': return `skip:${EXTRACTOR_VERSIONS.skip}`;
+    case 'fan': return `fan:${EXTRACTOR_VERSIONS.fan}:${grammarFingerprint(['fantom'])}`;
+    case 'trio': return `trio:${EXTRACTOR_VERSIONS.trio}:${grammarFingerprint(GRAMMARS_FOR_EXT.trio)}`;
+    case 'axon': return `axon:${EXTRACTOR_VERSIONS.axon}:${grammarFingerprint(['axon'])}`;
   }
   if (!treeSitter) return `fan-regex:${EXTRACTOR_VERSIONS.fanRegex}`;
-  if (ext === 'md' || ext === 'mdx') return `md:${EXTRACTOR_VERSIONS.markdown}`;
-  if (ext === 'vue') {
+  if (route.kind === 'markdown') return `md:${EXTRACTOR_VERSIONS.markdown}`;
+  if (route.kind === 'vue') {
     return `vue:${EXTRACTOR_VERSIONS.vue}:${EXTRACTOR_VERSIONS.treeSitter}:${grammarFingerprint(GRAMMARS_FOR_EXT.vue)}`;
   }
-  let lang: SupportedLanguage | undefined;
-  try { lang = getLanguageRegistry().getLanguageByExtension(ext); } catch { lang = undefined; }
-  if (!lang) return `regex:${EXTRACTOR_VERSIONS.regexOther}`;
+  if (route.language === 'unknown') return `regex:${EXTRACTOR_VERSIONS.regexOther}`;
+  const lang = route.language as SupportedLanguage;
   return `ts:${EXTRACTOR_VERSIONS.treeSitter}:${lang}:${grammarFingerprint([lang])}`;
 }
 

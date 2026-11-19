@@ -24,6 +24,9 @@ export const SECRET_NAMES = [
   'ANTHROPIC_API_KEY',
   'GEMINI_API_KEY',
   'TYPESAFE_API_KEY',
+  // Installer sources (src/installers/settings.ts): share password, GitHub token.
+  'FANTOM_INSTALLER_SKYSPARK_PASSWORD',
+  'FANTOM_INSTALLER_GITHUB_TOKEN',
 ] as const;
 export type SecretName = typeof SECRET_NAMES[number];
 

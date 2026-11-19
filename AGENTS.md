@@ -46,7 +46,9 @@ Short, targeted shell commands are fine: `git status`, `git log --oneline -5`,
 Never search these folders: node_modules/, build/, dist/, dashboard/.next/, dashboard/node_modules/, claudePlugin/dist/, config/ backups, cache folders.
 
 Several agents may work in this repo at once: work in your own git worktree
-under `.worktrees/<name>` (ignored by git), commit only your own files, and
+under `.worktrees/<name>` (ignored by git). Use worktrunk (`wt`): `wt switch -c <name>`
+creates and enters it, `wt list` shows all worktrees, `wt merge` merges it back
+and removes it, `wt remove` drops it. Commit only your own files, and
 never print secrets (tokens, passwords, keys, `.env` values).
 
 ## What it is
@@ -127,7 +129,10 @@ The server initializes lazily in the background; tool handlers wait for initiali
 ### Index data flow
 
 ```
-project path → fantom-code parser (.fan, Axon .trio/.axon via tree-sitter)
+project path → scan (every source language) → per-file router (src/fantom-code/fileRouter.ts):
+               .fan → FantomCodeParser (regex) · .trio → TrioParser · .axon → axon grammar
+               · .vue/.md/other → the project's primary tree-sitter parser · build.fan → skipped
+             → pod = nearest build.fan above the file (src/fantom-code/podParsers.ts), else the project
              → CodeNode/CodeEdge → LadybugDB .cache/graph/<projectId>.db
              → embed text (v3: statement-level chunks, comments kept, defcomp cells surfaced)
              → LanceDB code_vectors (+ ANN index)

@@ -205,6 +205,14 @@ function readTextSafe(file: string): string | null {
   }
 }
 
+/** `podName = "x"` from a build.fan, or null. */
+function podNameFromBuildFan(file: string): string | null {
+  const content = readTextSafe(file);
+  if (!content) return null;
+  const m = content.match(/podName\s*=\s*["']?(\w+)["']?/);
+  return m ? m[1] : null;
+}
+
 /** build.fan files belonging to a project: its own plus one level of pod/* and src/* sub-pods. */
 function listBuildFanFiles(projectPath: string): Array<{ file: string; label: string }> {
   const out: Array<{ file: string; label: string }> = [];
@@ -254,6 +262,15 @@ class ProjectCatalogue {
         const list = this.byPodName.get(p.podName) ?? [];
         list.push(p);
         this.byPodName.set(p.podName, list);
+      }
+      // Nested pods (pod/*/build.fan, src/*/build.fan) also resolve to this
+      // project, so a mixed Vue/TS repo that holds Fantom pods is one project.
+      for (const bf of listBuildFanFiles(p.path)) {
+        const nested = podNameFromBuildFan(bf.file);
+        if (!nested || nested === p.podName) continue;
+        const list = this.byPodName.get(nested) ?? [];
+        if (!list.includes(p)) list.push(p);
+        this.byPodName.set(nested, list);
       }
       const ln = p.name.toLowerCase();
       const nl = this.byLowerName.get(ln) ?? [];

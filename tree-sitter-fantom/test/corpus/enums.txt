@@ -45,3 +45,106 @@ enum class Color {
           (call_args
             (literal
               (int_lit))))))))
+
+================================================================================
+Enum values with facets and blank lines
+================================================================================
+
+enum class Suits
+{
+  clubs("black"),
+
+  @FacetM2 hearts("red"),
+  spades("black")
+
+  private new make(Str c) { color = c }
+  const Str color
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (enum_definition
+    (identifier)
+    (enum_body
+      (enum_vals
+        (enum_val
+          (identifier)
+          (call_args
+            (literal
+              (str_lit))))
+        (enum_val
+          (facet
+            (identifier))
+          (identifier)
+          (call_args
+            (literal
+              (str_lit))))
+        (enum_val
+          (identifier)
+          (call_args
+            (literal
+              (str_lit)))))
+      (ctor_def
+        (modifier)
+        (identifier)
+        (param_list
+          (param
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))
+            (identifier)))
+        (block
+          (expr_stmt
+            (assign_expr
+              (identifier)
+              (identifier)))))
+      (field_def
+        (modifier)
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)))))
+
+================================================================================
+Enum body with semicolon terminated slots
+================================================================================
+
+enum class T {
+  eof("eof");
+  const Str color;
+  private new make(Str s) {}
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (enum_definition
+    (identifier)
+    (enum_body
+      (enum_vals
+        (enum_val
+          (identifier)
+          (call_args
+            (literal
+              (str_lit)))))
+      (field_def
+        (modifier)
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier))
+      (ctor_def
+        (modifier)
+        (identifier)
+        (param_list
+          (param
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))
+            (identifier)))
+        (block)))))

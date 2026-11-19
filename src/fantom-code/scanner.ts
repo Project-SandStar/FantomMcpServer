@@ -185,7 +185,7 @@ export class FantomFileScanner {
    * Parse basic build.fan to extract pod metadata
    * This is a simplified parser for common build.fan patterns
    */
-  private parseBasicBuildFan(buildFanPath: string): PodMeta {
+  parseBasicBuildFan(buildFanPath: string): PodMeta {
     const content = fs.readFileSync(buildFanPath, 'utf-8');
 
     const meta: PodMeta = {

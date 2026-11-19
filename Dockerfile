@@ -18,6 +18,9 @@ FROM node:22-bookworm-slim AS build
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates openssl \
     && rm -rf /var/lib/apt/lists/*
+# onnxruntime-node's postinstall downloads a CUDA build on linux-x64; that
+# release asset now returns 404 and the image runs CPU-only anyway.
+ENV ONNXRUNTIME_NODE_INSTALL_CUDA=skip
 COPY package.json package-lock.json ./
 COPY prisma ./prisma
 # `npm ci` runs the `prepare` script (npm run build), so the sources must be here first.
@@ -29,9 +32,16 @@ RUN npm ci && npm prune --omit=dev
 
 FROM node:22-bookworm-slim
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates openssl \
-    && rm -rf /var/lib/apt/lists/*
-ENV NODE_ENV=production \
+# JDK 17 + rsync/curl/unzip: Haxall builds and SkySpark docgen (src/installers/).
+# The man dir must exist or the openjdk postinst fails on slim images.
+RUN mkdir -p /usr/share/man/man1 \
+    && apt-get update && apt-get install -y --no-install-recommends git ca-certificates openssl \
+       openjdk-17-jdk-headless rsync curl unzip tar \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s "$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")" /opt/jdk17
+ENV JAVA_HOME=/opt/jdk17 \
+    FANTOM_INSTALL_ROOT=/app/.cache/installs \
+    NODE_ENV=production \
     MCP_TRANSPORT=http \
     MCP_PORT=3848 \
     DATABASE_URL=file:../.cache/fantom.db \
@@ -46,7 +56,12 @@ COPY --from=dashboard /dashboard/out ./dashboard/out
 COPY --from=build /app/workflows ./workflows-builtin
 # tree-sitter grammars are loaded from src/parser/treeSitter/grammars when not next to build/
 COPY --from=build /app/src/parser/treeSitter/grammars ./src/parser/treeSitter/grammars
+# vendored Axon grammar (src/axon/axonTreeSitter.ts looks here first); from the
+# build context, not the build stage, which never copies assets/.
+COPY assets/grammars ./assets/grammars
 COPY config/*.example.json ./config/
+# Haxall build script (src/installers/haxall.ts runs it from the install root).
+COPY scripts/haxall ./scripts/haxall
 RUN mkdir -p /app/.cache/models /mirror
 VOLUME ["/app/.cache", "/app/.cache/models"]
 EXPOSE 3848

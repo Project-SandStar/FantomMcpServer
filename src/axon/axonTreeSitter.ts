@@ -72,7 +72,13 @@ let loadedFrom: string | null = null;
  * only a fallback for a dev tree that has not vendored one.
  */
 function grammarCandidates(): string[] {
-  const out = [path.join(getInstallRoot(), 'assets', 'grammars', 'tree-sitter-axon.wasm')];
+  const root = getInstallRoot();
+  const out = [
+    path.join(root, 'assets', 'grammars', 'tree-sitter-axon.wasm'),
+    // The Docker image copies only src/parser/treeSitter/grammars (Dockerfile);
+    // the server's own copy lives there, so look in it as well.
+    path.join(root, 'src', 'parser', 'treeSitter', 'grammars', 'tree-sitter-axon.wasm'),
+  ];
   try {
     const s = getAxonSettings();
     if (s.projectPath) {

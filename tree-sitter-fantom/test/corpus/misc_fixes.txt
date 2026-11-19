@@ -1,0 +1,308 @@
+================================================================================
+Shebang line
+================================================================================
+
+#! /usr/bin/env fan
+
+class Build {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (shebang)
+  (class_definition
+    (identifier)
+    (class_body)))
+
+================================================================================
+Strings with comment markers, dotted interpolation, triple quotes
+================================================================================
+
+class Foo {
+  Void bar() {
+    out.print("$ind */\n")
+    verify(d.contains("//u:***@host"), d)
+    s := "x=${a.b.c} y=$name"
+    t := """line "one"
+    line two"""
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (expr_stmt
+            (postfix_expr
+              (postfix_expr
+                (identifier)
+                (identifier))
+              (call_args
+                (literal
+                  (str_lit)))))
+          (expr_stmt
+            (postfix_expr
+              (identifier)
+              (call_args
+                (postfix_expr
+                  (postfix_expr
+                    (identifier)
+                    (identifier))
+                  (call_args
+                    (literal
+                      (str_lit))))
+                (identifier))))
+          (local_def
+            (identifier)
+            (literal
+              (str_lit)))
+          (local_def
+            (identifier)
+            (literal
+              (triple_str_lit))))))))
+
+================================================================================
+DSL string with pipes inside
+================================================================================
+
+class Foo {
+  Void bar() {
+    y := Str<|a~!@#$%\^&*( )?;=||>
+    z := Str<|plain|>
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (dsl_string
+              (type_ref
+                (simple_type
+                  (qualified_type_name
+                    (identifier))))))
+          (local_def
+            (identifier)
+            (dsl_string
+              (type_ref
+                (simple_type
+                  (qualified_type_name
+                    (identifier)))))))))))
+
+================================================================================
+Ctor chain to named super ctor
+================================================================================
+
+class Foo : Bar {
+  new make(OutStream out) : super.makeTop(out) {}
+  new make2() : this.make(null) {}
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (type_list
+      (type_ref
+        (simple_type
+          (qualified_type_name
+            (identifier)))))
+    (class_body
+      (ctor_def
+        (identifier)
+        (param_list
+          (param
+            (type_ref
+              (simple_type
+                (qualified_type_name
+                  (identifier))))
+            (identifier)))
+        (ctor_chain
+          (identifier)
+          (call_args
+            (identifier)))
+        (block))
+      (ctor_def
+        (identifier)
+        (param_list)
+        (ctor_chain
+          (identifier)
+          (call_args
+            (literal
+              (null_lit))))
+        (block)))))
+
+================================================================================
+Typed empty list, typed empty map, list and nullable type literals
+================================================================================
+
+class Foo {
+  Void bar() {
+    a := Str[,]
+    b := Str:Int[:]
+    c := Int[]#
+    d := Str?#
+    e := [:]
+    f := ["a": ["b": "c",], "d": 1,]
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (list_lit
+              (type_ref
+                (simple_type
+                  (qualified_type_name
+                    (identifier))))))
+          (local_def
+            (identifier)
+            (map_lit
+              (type_ref
+                (shorthand_map_type
+                  (type_ref
+                    (simple_type
+                      (qualified_type_name
+                        (identifier))))
+                  (type_ref
+                    (simple_type
+                      (qualified_type_name
+                        (identifier))))))))
+          (local_def
+            (identifier)
+            (type_literal
+              (type_ref
+                (list_type
+                  (type_ref
+                    (simple_type
+                      (qualified_type_name
+                        (identifier))))))))
+          (local_def
+            (identifier)
+            (type_literal
+              (type_ref
+                (nullable_type
+                  (type_ref
+                    (simple_type
+                      (qualified_type_name
+                        (identifier))))))))
+          (local_def
+            (identifier)
+            (map_lit))
+          (local_def
+            (identifier)
+            (map_lit
+              (map_pair
+                (literal
+                  (str_lit))
+                (map_lit
+                  (map_pair
+                    (literal
+                      (str_lit))
+                    (literal
+                      (str_lit)))))
+              (map_pair
+                (literal
+                  (str_lit))
+                (literal
+                  (int_lit))))))))))
+
+================================================================================
+Func type parameter with names and return type
+================================================================================
+
+class Foo {
+  Void bar(|Int a, Str b -> Void| f, |->| g, |Str? -> Int|? h) {}
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list
+          (param
+            (type_ref
+              (func_type
+                (closure_param
+                  (type_ref
+                    (simple_type
+                      (qualified_type_name
+                        (identifier))))
+                  (identifier))
+                (closure_param
+                  (type_ref
+                    (simple_type
+                      (qualified_type_name
+                        (identifier))))
+                  (identifier))
+                (type_ref
+                  (simple_type
+                    (qualified_type_name
+                      (identifier))))))
+            (identifier))
+          (param
+            (type_ref
+              (func_type))
+            (identifier))
+          (param
+            (type_ref
+              (nullable_type
+                (type_ref
+                  (func_type
+                    (closure_param
+                      (type_ref
+                        (nullable_type
+                          (type_ref
+                            (simple_type
+                              (qualified_type_name
+                                (identifier)))))))
+                    (type_ref
+                      (simple_type
+                        (qualified_type_name
+                          (identifier))))))))
+            (identifier)))
+        (block)))))

@@ -165,6 +165,10 @@ export interface ExtractedCall {
   location: ASTLocation;
   /** Whether call is async (await) */
   isAsync: boolean;
+  /** Fantom: `Type(...)` / `Type.make(...)` */
+  isConstructor?: boolean;
+  /** Fantom: receiver is a type name (`Etc.emptyGrid`, `haystack::Etc.x`) */
+  isStatic?: boolean;
 }
 
 export interface ExtractedClass {

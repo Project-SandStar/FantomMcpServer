@@ -91,6 +91,9 @@ function describe(c) {
     `Workflows live on the server: listWorkflows, then getWorkflow. Never read local workflow files.`,
     `When you start a subagent (Agent/Task) for code search in this project, put this in its prompt: "Fantom MCP project ${p.id}: load ToolSearch(\"fantom\", 30) and use askCodebase / searchFantomCode before grep." Edits made with Edit/Write are reported by the plugin hook; call reportChanges only for files changed by shell commands.`,
   ];
+  if (p.clientRoot && p.clientRoot !== p.path) {
+    out.push(`The server is remote: file paths in Fantom MCP results under ${p.path} are this machine's ${p.clientRoot}. Swap the prefix before Read/Edit.`);
+  }
   if (p.lastRun && p.lastRun.error) out.push(`The last index run failed: ${String(p.lastRun.error).slice(0, 160)}. Results may be stale; refreshFantomProject or /fantom-mcp:doctor.`);
   else if (!p.lastIndexed) out.push('This project has never been indexed: call refreshFantomProject before relying on search results.');
   return out;

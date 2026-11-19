@@ -12,6 +12,7 @@ import { RunFromSidecarToggle } from '@/components/config/RunFromSidecarToggle';
 import { DebugLogPanel } from '@/components/config/DebugLogPanel';
 import { NetbirdPanel } from '@/components/config/NetbirdPanel';
 import { PathMappingsPanel } from '@/components/config/PathMappingsPanel';
+import { InstallerSourcesPanel } from '@/components/config/InstallerSourcesPanel';
 import { PathInput } from '@/components/ui/FolderPicker';
 
 function formatBytes(bytes: number): string {
@@ -405,7 +406,9 @@ export default function ConfigPage() {
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const sync = () => {
-      const h = window.location.hash.replace(/^#/, '') as SettingsGroup;
+      const raw = window.location.hash.replace(/^#/, '');
+      // Installer settings live on the Fantom Source tab; keep old #installers links working.
+      const h = (raw === 'installers' || raw === 'installer-sources' ? 'fantom-source' : raw) as SettingsGroup;
       const next = (h && validGroups.includes(h)) ? h : 'connection';
       setActiveGroupState(next);
       setTabUrl(`${window.location.origin}${window.location.pathname}#${next}`);
@@ -1320,6 +1323,7 @@ export default function ConfigPage() {
               <p className="text-sm text-gray-500 italic">{fantomVersionsData.message}</p>
             )}
             <PathMappingsPanel />
+            <div id="installer-sources" className="border-t pt-4 mt-4 scroll-mt-4"><InstallerSourcesPanel /></div>
           </div>
         );
 

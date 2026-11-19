@@ -2137,7 +2137,7 @@
     "fields": {},
     "children": {
       "multiple": true,
-      "required": false,
+      "required": true,
       "types": [
         {
           "type": "add_expr",
@@ -2859,7 +2859,7 @@
       },
       "then": {
         "multiple": false,
-        "required": false,
+        "required": true,
         "types": [
           {
             "type": "add_expr",
@@ -3027,176 +3027,6 @@
           }
         ]
       }
-    },
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "add_expr",
-          "named": true
-        },
-        {
-          "type": "and_expr",
-          "named": true
-        },
-        {
-          "type": "assignment",
-          "named": true
-        },
-        {
-          "type": "call_expr",
-          "named": true
-        },
-        {
-          "type": "compare_expr",
-          "named": true
-        },
-        {
-          "type": "date",
-          "named": true
-        },
-        {
-          "type": "date_time",
-          "named": true
-        },
-        {
-          "type": "defcomp",
-          "named": true
-        },
-        {
-          "type": "define_var",
-          "named": true
-        },
-        {
-          "type": "dict",
-          "named": true
-        },
-        {
-          "type": "do_block",
-          "named": true
-        },
-        {
-          "type": "dot_call",
-          "named": true
-        },
-        {
-          "type": "false",
-          "named": true
-        },
-        {
-          "type": "if_expr",
-          "named": true
-        },
-        {
-          "type": "index_expr",
-          "named": true
-        },
-        {
-          "type": "lambda",
-          "named": true
-        },
-        {
-          "type": "list",
-          "named": true
-        },
-        {
-          "type": "mult_expr",
-          "named": true
-        },
-        {
-          "type": "neg_expr",
-          "named": true
-        },
-        {
-          "type": "not_expr",
-          "named": true
-        },
-        {
-          "type": "null",
-          "named": true
-        },
-        {
-          "type": "number",
-          "named": true
-        },
-        {
-          "type": "or_expr",
-          "named": true
-        },
-        {
-          "type": "paren_expr",
-          "named": true
-        },
-        {
-          "type": "qname",
-          "named": true
-        },
-        {
-          "type": "range_expr",
-          "named": true
-        },
-        {
-          "type": "raw_string",
-          "named": true
-        },
-        {
-          "type": "ref",
-          "named": true
-        },
-        {
-          "type": "return_expr",
-          "named": true
-        },
-        {
-          "type": "string",
-          "named": true
-        },
-        {
-          "type": "symbol",
-          "named": true
-        },
-        {
-          "type": "throw_expr",
-          "named": true
-        },
-        {
-          "type": "time",
-          "named": true
-        },
-        {
-          "type": "trailing_lambda_call",
-          "named": true
-        },
-        {
-          "type": "trap_call",
-          "named": true
-        },
-        {
-          "type": "triple_string",
-          "named": true
-        },
-        {
-          "type": "true",
-          "named": true
-        },
-        {
-          "type": "try_catch_expr",
-          "named": true
-        },
-        {
-          "type": "typename",
-          "named": true
-        },
-        {
-          "type": "uri",
-          "named": true
-        },
-        {
-          "type": "var",
-          "named": true
-        }
-      ]
     }
   },
   {
@@ -5469,6 +5299,7 @@
   {
     "type": "source_file",
     "named": true,
+    "root": true,
     "fields": {},
     "children": {
       "multiple": true,
@@ -6081,7 +5912,7 @@
     "fields": {
       "body": {
         "multiple": false,
-        "required": false,
+        "required": true,
         "types": [
           {
             "type": "add_expr",
@@ -6429,176 +6260,6 @@
           }
         ]
       }
-    },
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "add_expr",
-          "named": true
-        },
-        {
-          "type": "and_expr",
-          "named": true
-        },
-        {
-          "type": "assignment",
-          "named": true
-        },
-        {
-          "type": "call_expr",
-          "named": true
-        },
-        {
-          "type": "compare_expr",
-          "named": true
-        },
-        {
-          "type": "date",
-          "named": true
-        },
-        {
-          "type": "date_time",
-          "named": true
-        },
-        {
-          "type": "defcomp",
-          "named": true
-        },
-        {
-          "type": "define_var",
-          "named": true
-        },
-        {
-          "type": "dict",
-          "named": true
-        },
-        {
-          "type": "do_block",
-          "named": true
-        },
-        {
-          "type": "dot_call",
-          "named": true
-        },
-        {
-          "type": "false",
-          "named": true
-        },
-        {
-          "type": "if_expr",
-          "named": true
-        },
-        {
-          "type": "index_expr",
-          "named": true
-        },
-        {
-          "type": "lambda",
-          "named": true
-        },
-        {
-          "type": "list",
-          "named": true
-        },
-        {
-          "type": "mult_expr",
-          "named": true
-        },
-        {
-          "type": "neg_expr",
-          "named": true
-        },
-        {
-          "type": "not_expr",
-          "named": true
-        },
-        {
-          "type": "null",
-          "named": true
-        },
-        {
-          "type": "number",
-          "named": true
-        },
-        {
-          "type": "or_expr",
-          "named": true
-        },
-        {
-          "type": "paren_expr",
-          "named": true
-        },
-        {
-          "type": "qname",
-          "named": true
-        },
-        {
-          "type": "range_expr",
-          "named": true
-        },
-        {
-          "type": "raw_string",
-          "named": true
-        },
-        {
-          "type": "ref",
-          "named": true
-        },
-        {
-          "type": "return_expr",
-          "named": true
-        },
-        {
-          "type": "string",
-          "named": true
-        },
-        {
-          "type": "symbol",
-          "named": true
-        },
-        {
-          "type": "throw_expr",
-          "named": true
-        },
-        {
-          "type": "time",
-          "named": true
-        },
-        {
-          "type": "trailing_lambda_call",
-          "named": true
-        },
-        {
-          "type": "trap_call",
-          "named": true
-        },
-        {
-          "type": "triple_string",
-          "named": true
-        },
-        {
-          "type": "true",
-          "named": true
-        },
-        {
-          "type": "try_catch_expr",
-          "named": true
-        },
-        {
-          "type": "typename",
-          "named": true
-        },
-        {
-          "type": "uri",
-          "named": true
-        },
-        {
-          "type": "var",
-          "named": true
-        }
-      ]
     }
   },
   {
@@ -6718,7 +6379,8 @@
   },
   {
     "type": "block_comment",
-    "named": true
+    "named": true,
+    "extra": true
   },
   {
     "type": "catch",
@@ -6762,7 +6424,8 @@
   },
   {
     "type": "line_comment",
-    "named": true
+    "named": true,
+    "extra": true
   },
   {
     "type": "not",

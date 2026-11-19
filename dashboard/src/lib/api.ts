@@ -1173,6 +1173,41 @@ export interface PodsResponse {
 }
 
 // ============================================
+// Installer types (src/installers/*)
+export type InstallerProviderType = 'nextcloud-share' | 'webdav' | 'local' | 'http' | 'google-drive';
+export interface InstallerSource { provider: InstallerProviderType; location: string; username?: string }
+export interface InstallerSettings {
+  jdkHome: string;
+  autoCheckDaily: boolean;
+  haxall: {
+    githubRepo: string; installRoot: string; fantomRoot: string; xetoRoot: string; xetoRepoUrl: string;
+    haystackDefsDir: string; haystackDefsRepoUrl: string; fantomVersions: Record<string, string>; minVersion: string;
+  };
+  skyspark: { source: InstallerSource | null; downloadDir: string; installRoot: string; minVersion: string; acceptEula: boolean };
+}
+export interface InstallerSettingsView extends InstallerSettings {
+  secrets: { skysparkSourcePassword: boolean; githubToken: boolean };
+}
+export type InstallerSettingsSave = Partial<InstallerSettings> & {
+  secrets?: { skysparkSourcePassword?: string | null; githubToken?: string | null };
+};
+export interface HaxallCheck {
+  releases: { version: string; publishedAt: string; fantomVersion: string | null; fantomRule: string; instanceId: number | null; instancePath: string | null; hasDocs: boolean }[];
+  missing: string[];
+  minVersion: string;
+}
+export interface SkysparkCheck {
+  installers: { version: string; file: { name: string; folder: string; size?: number }; instanceId: number | null }[];
+  missing: string[];
+  unrecognized: string[];
+  minVersion: string;
+}
+export interface InstallerJob {
+  id: string; kind: string; label: string; status: 'running' | 'succeeded' | 'failed' | 'cancelled';
+  step: string; startedAt: string; finishedAt?: string; error?: string; notes: string[];
+  result?: Record<string, unknown>;
+}
+
 // Fantom Instance and Pod Types
 // ============================================
 
@@ -2026,6 +2061,25 @@ export const api = {
   // Fantom Instances
   // ============================================
   getInstances: () => apiRequest<{ count: number; instances: FantomInstance[] }>('/instances'),
+  // Installers (Haxall / SkySpark): src/installers/routes.ts
+  getInstallerSettings: () => apiRequest<InstallerSettingsView>('/installers/settings'),
+  saveInstallerSettings: (body: InstallerSettingsSave) =>
+    apiRequest<InstallerSettingsView>('/installers/settings', { method: 'PUT', body }),
+  checkHaxall: () => apiRequest<HaxallCheck>('/installers/haxall/check'),
+  installHaxall: (version: string) =>
+    apiRequest<{ jobId: string }>('/installers/haxall/install', { method: 'POST', body: { version } }),
+  compileHaxallHome: (id: number) =>
+    apiRequest<{ jobId: string }>(`/installers/haxall/${id}/compile`, { method: 'POST' }),
+  setHaxallHome: (id: number) =>
+    apiRequest<{ changed: boolean; path: string }>(`/installers/haxall/${id}/set-home`, { method: 'POST' }),
+  checkSkyspark: () => apiRequest<SkysparkCheck>('/installers/skyspark/check'),
+  installSkyspark: (version: string) =>
+    apiRequest<{ jobId: string }>('/installers/skyspark/install', { method: 'POST', body: { version } }),
+  getActiveInstallerJob: () => apiRequest<InstallerJob | { status: 'none' }>('/installers/jobs/active'),
+  getInstallerJob: (id: string, since = 0) =>
+    apiRequest<InstallerJob & { lines: string[]; next: number }>(`/installers/jobs/${id}?since=${since}`),
+  cancelInstallerJob: (id: string) =>
+    apiRequest<{ success: boolean }>(`/installers/jobs/${id}/cancel`, { method: 'POST' }),
   getInstance: (id: number) => apiRequest<FantomInstance>(`/instances/${id}`),
   createInstance: (input: CreateInstanceInput) =>
     apiRequest<FantomInstance>('/instances', { method: 'POST', body: input }),

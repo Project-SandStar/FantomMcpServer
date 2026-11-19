@@ -22,12 +22,11 @@ class Foo {
         name: (identifier)
         params: (param_list)
         body: (block
-          (expr_stmt
-            (assign_expr
+          (local_def
+            name: (identifier)
+            init: (elvis_expr
               (identifier)
-              (elvis_expr
-                (identifier)
-                (identifier)))))))))
+              (identifier))))))))
 
 ================================================================================
 Safe navigation
@@ -53,12 +52,11 @@ class Foo {
         name: (identifier)
         params: (param_list)
         body: (block
-          (expr_stmt
-            (assign_expr
+          (local_def
+            name: (identifier)
+            init: (postfix_expr
               (identifier)
-              (postfix_expr
-                (identifier)
-                (identifier)))))))))
+              (identifier))))))))
 
 ================================================================================
 Range expression
@@ -85,19 +83,275 @@ class Foo {
         name: (identifier)
         params: (param_list)
         body: (block
-          (expr_stmt
-            (assign_expr
+          (local_def
+            name: (identifier)
+            init: (range_expr
+              (literal
+                (int_lit))
+              (literal
+                (int_lit))))
+          (local_def
+            name: (identifier)
+            init: (range_expr
+              (literal
+                (int_lit))
+              (literal
+                (int_lit)))))))))
+
+================================================================================
+Bracket on a new line starts a statement
+================================================================================
+
+class Foo {
+  Void bar() {
+    if (d.isEmpty) return d
+    [Str:Obj?]? map := null
+    x := list[0]
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (if_stmt
+            (postfix_expr
               (identifier)
-              (range_expr
-                (literal
-                  (int_lit))
-                (literal
-                  (int_lit)))))
-          (expr_stmt
-            (assign_expr
+              (identifier))
+            (return_stmt
+              (identifier)))
+          (local_def
+            (type_ref
+              (nullable_type
+                (type_ref
+                  (map_type
+                    (type_ref
+                      (simple_type
+                        (qualified_type_name
+                          (identifier))))
+                    (type_ref
+                      (nullable_type
+                        (type_ref
+                          (simple_type
+                            (qualified_type_name
+                              (identifier))))))))))
+            (identifier)
+            (literal
+              (null_lit)))
+          (local_def
+            (identifier)
+            (postfix_expr
               (identifier)
-              (range_expr
+              (literal
+                (int_lit)))))))))
+
+================================================================================
+Pod-qualified type as expression base
+================================================================================
+
+class Foo {
+  Void bar() {
+    p := yaml::Person { name = "Bart" }
+    s := sys::Str.fromChars(cs)
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (postfix_expr
+              (static_type_expr
+                (identifier)
+                (identifier))
+              (it_block
+                (expr_stmt
+                  (assign_expr
+                    (identifier)
+                    (literal
+                      (str_lit)))))))
+          (local_def
+            (identifier)
+            (postfix_expr
+              (postfix_expr
+                (static_type_expr
+                  (identifier)
+                  (identifier))
+                (identifier))
+              (call_args
+                (identifier)))))))))
+
+================================================================================
+It-add comma after closure argument
+================================================================================
+
+class Foo {
+  Void bar() {
+    Elem {
+      it.onEvent("a", false) |e| { e.stop }
+    },
+    Elem { it.x = 1 },
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (expr_stmt
+            (postfix_expr
+              (identifier)
+              (it_block
+                (expr_stmt
+                  (postfix_expr
+                    (postfix_expr
+                      (postfix_expr
+                        (it_expr)
+                        (identifier))
+                      (call_args
+                        (literal
+                          (str_lit))
+                        (literal
+                          (bool_lit))))
+                    (closure
+                      (func_type
+                        (closure_param
+                          (identifier)))
+                      (block
+                        (expr_stmt
+                          (postfix_expr
+                            (identifier)
+                            (identifier)))))))))
+            (postfix_expr
+              (identifier)
+              (it_block
+                (expr_stmt
+                  (assign_expr
+                    (postfix_expr
+                      (it_expr)
+                      (identifier))
+                    (literal
+                      (int_lit))))))))))))
+
+================================================================================
+Ternary with question mark attached to the condition
+================================================================================
+
+class Foo {
+  Void bar() {
+    c := noHeader? gen(rows[0]) : norm(rows)
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (ternary_expr
+              (identifier)
+              (postfix_expr
+                (identifier)
+                (call_args
+                  (postfix_expr
+                    (identifier)
+                    (literal
+                      (int_lit)))))
+              (postfix_expr
+                (identifier)
+                (call_args
+                  (identifier))))))))))
+
+================================================================================
+Throw in elvis and ternary branches
+================================================================================
+
+class Foo {
+  Void bar() {
+    ts := res["ts"] ?: throw Err("x")
+    v := ok ? 1 : throw Err("y")
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_definition
+    (identifier)
+    (class_body
+      (method_def
+        (type_ref
+          (simple_type
+            (qualified_type_name
+              (identifier))))
+        (identifier)
+        (param_list)
+        (block
+          (local_def
+            (identifier)
+            (elvis_expr
+              (postfix_expr
+                (identifier)
                 (literal
-                  (int_lit))
-                (literal
-                  (int_lit))))))))))
+                  (str_lit)))
+              (throw_expr
+                (postfix_expr
+                  (identifier)
+                  (call_args
+                    (literal
+                      (str_lit)))))))
+          (local_def
+            (identifier)
+            (ternary_expr
+              (identifier)
+              (literal
+                (int_lit))
+              (throw_expr
+                (postfix_expr
+                  (identifier)
+                  (call_args
+                    (literal
+                      (str_lit))))))))))))

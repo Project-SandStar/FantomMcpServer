@@ -208,6 +208,17 @@ function InstanceDocsContent() {
                       Reindex
                     </button>
                     <button
+                      onClick={() => {
+                        setIsEmbedding(true);
+                        embedMutation.mutate(selectedInstance.id);
+                      }}
+                      disabled={isEmbedding || embedMutation.isPending}
+                      title={`Embed only ${selectedInstance.name} docs`}
+                      className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+                    >
+                      {isEmbedding ? 'Embedding...' : 'Embed This Instance'}
+                    </button>
+                    <button
                       onClick={() => clearCacheMutation.mutate(selectedInstance.id)}
                       disabled={clearCacheMutation.isPending}
                       className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50"
