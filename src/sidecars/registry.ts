@@ -63,7 +63,7 @@ export function getSidecar(id: string): Sidecar | null {
  */
 const FRESHNESS_MS = 5 * 60_000;
 
-function isFreshAndHealthy(s: Sidecar, now = Date.now()): boolean {
+export function isFreshAndHealthy(s: Sidecar, now = Date.now()): boolean {
   if (s.healthStatus === 'unhealthy') return false;
   if (!s.lastSeen) return true; // manual / http-ping entries never heartbeat
   const seen = Date.parse(s.lastSeen);

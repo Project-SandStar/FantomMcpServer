@@ -232,9 +232,21 @@ function toolHandler(tool: 'search_code' | 'search_symbols' | 'search_files') {
       try {
         crossEncoderReranker = readConfigFileWithRecovery(configPath())?.semanticSearch?.crossEncoderReranker;
       } catch { /* the executor treats undefined as "no reranker" */ }
+      // Tag the call to its ask when the sandbox passes the id on (header
+      // X-FantomMCP-Ask, which Fantom sends on the sandbox call, or "askId"
+      // in the body), so the ask feed shows each search. Without one it is
+      // only logged — never guessed.
+      const askIdRaw = req.get('x-fantommcp-ask') ?? (typeof body.askId === 'string' ? body.askId : undefined);
+      const askId = askIdRaw && /^[A-Za-z0-9_-]{1,80}$/.test(askIdRaw) ? askIdRaw : undefined;
+      const callId = `sbx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      const t0 = Date.now();
+      const { emitAskEvent } = await import('../embedding/askEvents.js');
+      if (askId) emitAskEvent(askId, { kind: 'ask', text: `sandbox: ${tool}("${query.slice(0, 120)}")`, id: callId, detail: tool });
       const execute = buildRlmExecutor({ projectId, crossEncoderReranker });
       const raw = await execute(tool, { query, limit });
       const results = blocksToRows(raw).slice(0, limit);
+      console.log(`[rlm-tools] ${tool}("${query.slice(0, 60)}") project=${projectId} → ${results.length} row(s) in ${Date.now() - t0}ms${askId ? ` ask=${askId}` : ''}`);
+      if (askId) emitAskEvent(askId, { kind: 'answer', text: `${results.length} result(s)`, id: callId, detail: tool, ms: Date.now() - t0 });
       res.json({ tool, projectId, results });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

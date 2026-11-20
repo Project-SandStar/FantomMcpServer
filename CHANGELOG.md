@@ -3,6 +3,56 @@
 All notable changes to FantomMcpServer. Public releases are snapshots; see
 `scripts/release-public.sh`.
 
+## 1.1.9 — 2026-11-20
+
+### Knowledge cards for AI coders
+- **New MCP tools `getKnowledgeCard` and `listKnowledgeCards`.** A short,
+  checked summary of a symbol (what it does, callers and callees from the code
+  graph, claims with file:line) in one fast call, with no model call. Stale,
+  flagged or low-confidence cards are never shown as fact. Each card lists the
+  sha256 every source file had when it was built.
+- **Claude plugin** tells the model about the new tools (skill table and
+  session-start hint).
+- **Cards on local models.** Writer, checker and answer can use the sidecar
+  `ss-completion` (qwen3.5:9b), at no cost. Each call picks whichever host
+  serves the model at that moment. Thinking is turned off for card calls.
+- **Card builds retry the embedding step** on timeouts, 429 and 5xx (up to
+  15 min) instead of failing the whole build.
+- **Rebuild uses the saved writer** and replaces the old card, so no paid model
+  is called by accident.
+- **Knowledge Cards page.** Projects column lists every project ("not
+  started" when it has no cards), status filters, select all, rebuild /
+  delete / export selected, compare writers, ask preview. The page shows the
+  saved writer and checker instead of a writer picker.
+
+### Search
+- **IVF_HNSW_SQ vector index** (recall@10 1.00, was 0.71) with a 4 GB index
+  cache; English stemming and stop words in the keyword index; version copies
+  of one symbol grouped in all-project searches; query-vector, rerank-score and
+  whole-result caches; graph fetch batched per project.
+- **Memory:** 24 GB container, guard 21.6 GB, `MALLOC_ARENA_MAX=2`; the
+  dashboard Memory Usage card shows RSS against the guard.
+- **Dashboard:** Graph settings tab, LadybugDB on the Storage tab, OpenRouter
+  worker labels for embedding rows.
+
+### Fantom calls OpenRouter itself
+- **No sidecar hop.** Embeddings, rerank, answers, the RLM loop and the Test
+  buttons go straight to OpenRouter with the key in Fantom's secrets store.
+  The key never leaves the server, except to the ss-rlm-sandbox slot.
+- **Worker pool.** One worker is one bulk request in flight (default 6, max
+  8). Searches and asks have their own lane and never wait behind a re-embed.
+  On a 429 the pool halves and ramps back. If the event loop lags over 100 ms
+  it uses fewer workers. Big replies are parsed off the main thread.
+- **Write buffer.** Vector writes hold at most 2000 rows per table and commit
+  1000 at a time; the graph lookup runs outside the write slot.
+- **Stored vectors stay valid.** Same model and provider pin. A new check
+  re-embeds 10 stored rows and needs cosine 0.99 or more.
+- **Decision model.** The OpenRouter page can pick Jev or Clef (via
+  OpenRouter) for the routing gates. Default stays Jev.
+- **OpenRouter page.** Shows workers, lag, write buffer, sandbox slots and
+  Verify. The Re-push button, slot health box and budget box are gone.
+- Sidecars only get Fantom's ss-rlm-sandbox slot (key, model, domain).
+
 ## 1.1.8 — 2026-11-19
 
 ### Installers for Haxall and SkySpark

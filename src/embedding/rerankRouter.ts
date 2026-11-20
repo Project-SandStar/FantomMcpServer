@@ -40,17 +40,13 @@
 
 import { sidecarServiceUrl } from '../sidecars/registry.js';
 import { rerankerSidecarUsable, resetRerankerCache } from './hybridSearch.js';
-import {
-  listVirtualContainers,
-  getVirtualContainersConfig,
-  DEFAULT_OR_RERANK_MODEL,
-  type VirtualContainer,
-} from '../sidecars/virtualContainers.js';
-import { withCloudPermit } from './providers/cloudBudget.js';
-import { noteCallStarted, noteCallFinished, isRoleCapped } from '../sidecars/openRouterActivity.js';
+import { cloudRoleModel, type CloudRoleModel } from '../openrouter/roles.js';
+import { hasOpenRouterKey } from '../openrouter/key.js';
+import { rerank as orRerank } from '../openrouter/client.js';
+import { openRouterPool } from '../openrouter/workerPool.js';
+import { isRoleCapped } from '../sidecars/openRouterActivity.js';
 import { getOpenRouterSettings } from '../sidecars/openRouterConfig.js';
 import { effectiveBehaviour, sanitizePolicies, cloudMayServe } from '../sidecars/routingPolicy.js';
-import { virtualRerank } from '../sidecars/virtualInferenceClient.js';
 
 export type RerankPath = 'local' | 'openrouter';
 
@@ -184,17 +180,12 @@ async function tryLocal(
   return { scores, model, path: 'local', servedBy: sc.name, ms: Date.now() - started };
 }
 
-/** Pick the OR reranker to use. Prefers one whose model matches the
- *  configured (cheap) default, then anything cloud-routable. */
-export function selectVirtualReranker(): VirtualContainer | null {
-  // "SideCar only" means no rerank ever leaves the building, even if a
-  // cloud-routable container is still registered from a previous policy.
+/** The OpenRouter reranker Fantom calls itself, or null (policy, no key, no model). */
+export function selectVirtualReranker(): CloudRoleModel | null {
+  // "SideCar only" means no rerank ever leaves the building.
   if (!rerankMayUseCloud()) return null;
-  const rows = listVirtualContainers('reranker');
-  if (rows.length === 0) return null;
-  const cfg = getVirtualContainersConfig();
-  const want = (cfg.rerankModel ?? DEFAULT_OR_RERANK_MODEL).toLowerCase();
-  return rows.find(r => r.model.toLowerCase() === want) ?? rows[0];
+  if (!hasOpenRouterKey()) return null;
+  return cloudRoleModel('reranker');
 }
 
 /**
@@ -269,11 +260,6 @@ export function __resetRerankPolicyCacheForTest(): void {
   policyCache = null;
 }
 
-/** Note once per (provider, model) which model a slot actually allow-lists,
- *  when it differs from the one Fantom asked for. Informational only — the
- *  sidecar's allow-list is authoritative. */
-const warnedModels = new Set<string>();
-
 async function tryCloud(
   query: string,
   documents: string[],
@@ -282,22 +268,6 @@ async function tryCloud(
 ): Promise<RerankOutcome | null> {
   const vc = selectVirtualReranker();
   if (!vc) return null;
-  const cfg = getVirtualContainersConfig();
-  const preferred = cfg.rerankModel ?? DEFAULT_OR_RERANK_MODEL;
-
-  if (vc.model.toLowerCase() !== preferred.toLowerCase()) {
-    const key = `${vc.providerName}:${vc.model}`;
-    if (!warnedModels.has(key)) {
-      warnedModels.add(key);
-      // Purely informational: the sidecar's per-master allow-list is
-      // authoritative, so this says which model actually served the request,
-      // not that the choice is wrong.
-      console.log(
-        `[rerank] ${vc.providerName} allow-lists '${vc.model}' but Fantom asked for '${preferred}'. `
-        + 'The sidecar\'s allow-list wins — change it there, or in the OpenRouter section of the config page.',
-      );
-    }
-  }
 
   if (isRoleCapped('reranker')) {
     console.warn('[rerank] OpenRouter reranking has hit its daily spend cap — falling back to input order. '
@@ -306,22 +276,16 @@ async function tryCloud(
   }
 
   const started = Date.now();
-  noteCallStarted('reranker');
   try {
-    // Reranks spend the same OpenRouter key as the embedding fan-out, so
-    // they draw from the same global permit pool. A rebuild saturating the
-    // budget must not silently make search reranks fail; it makes them queue.
-    const res = await withCloudPermit(() => virtualRerank(vc, query, documents, {
-      topN: documents.length,
-      requestedModel: cfg.strictRerankModel ? preferred : undefined,
-      timeoutMs: options.timeoutMs ?? 60_000,
-    }));
-    noteCallFinished('reranker', {
-      servedBy: vc.providerName,
-      model: res.model ?? vc.model,
-      tokens: res.totalTokens,
-      durationMs: Date.now() - started,
-      success: true,
+    // Interactive lane: a rerank is on the search path and must not wait
+    // behind a re-embed's bulk requests. Spend and activity are recorded
+    // by the client.
+    const res = await openRouterPool().submit({
+      role: 'reranker',
+      lane: 'interactive',
+      run: () => orRerank(query, documents, {
+        model: vc.model, pin: vc.pin, topN: documents.length, timeoutMs: options.timeoutMs ?? 60_000,
+      }),
     });
     const scores = parseRerankScores({ results: res.results ?? [] }, documents.length);
     if (!scores) {
@@ -337,13 +301,6 @@ async function tryCloud(
       localSkipReason,
     };
   } catch (err) {
-    noteCallFinished('reranker', {
-      servedBy: vc.providerName,
-      model: vc.model,
-      durationMs: Date.now() - started,
-      success: false,
-      error: (err as Error).message,
-    });
     console.warn(`[rerank] ${vc.providerName} failed: ${(err as Error).message}`);
     return null;
   }
@@ -426,7 +383,7 @@ export async function rerankLocalFirst(
 
   console.warn(
     `[rerank] path=none — no backend served this rerank. local: ${reason.why ?? 'unavailable'}; `
-    + `openrouter: ${listVirtualContainers('reranker').length === 0 ? "no cloud-routable reranker for Fantom's master slot" : 'request failed'}`,
+    + `openrouter: ${selectVirtualReranker() === null ? 'not allowed by policy, or no key/model' : 'request failed'}`,
   );
   return null;
 }

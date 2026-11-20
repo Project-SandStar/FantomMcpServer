@@ -10,11 +10,14 @@
 import type { PrismaClient } from '@prisma/client';
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
+import { LRUCache } from 'lru-cache';
 import { createLogger } from '../utils/index.js';
 import { selectEmbeddingProvider, isSidecarUsable, embedBatchFanout, type EmbeddingProvider } from './providers/embeddingProvider.js';
 import { getEmbedCache } from './embedCache.js';
 import { getHeavyJob } from './embedGate.js';
 import { getSidecar } from '../sidecars/registry.js';
+import { workerSplitOf } from '../openrouter/workerAttribution.js';
 import { VectorStore, getVectorStore, type VectorSearchResult } from './vectorStore.js';
 import { LadybugQueryManager, getLadybugQueryManager } from '../graph/ladybugQueryManager.js';
 import type { GraphMetrics } from '../graph/types.js';
@@ -22,7 +25,7 @@ import { ladybugQuery } from '../graph/ladybugConnection.js';
 import { applyQueryInstruction } from './queryInstruction.js';
 import { embedRunStarted, embedRunProgress, embedRunFinished } from './autoPipelineBus.js';
 import {
-  rrfFuse, countChangedPositions, readHybridSettings, readRerankMode, rerankerSidecarUsable,
+  rrfFuse, countChangedPositions, readHybridSettings, readRerankMode, readRerankCodeChars, rerankerSidecarUsable,
   keywordQueryVariants, HYBRID_CANDIDATES, type RerankMode, type ResultSources,
 } from './hybridSearch.js';
 import { buildEmbeddingItems, EMBED_TEXT_V3, type EmbeddingItem, type EmbeddingTextNode } from './embeddingText.js';
@@ -49,6 +52,7 @@ export async function withLlmContext(
 }
 import { buildEmbeddingContext } from './embeddingContext.js';
 import { buildSyntheticItems } from './embedSynthetic.js';
+import { graphSetting, projectFanout } from '../graph/graphSettings.js';
 
 const logger = createLogger('semantic-search');
 
@@ -142,11 +146,161 @@ export interface SemanticSearchResult {
   usedByCount?: number;      // Nodes that reference this type
   extendsCount?: number;     // Subtypes that extend this
   implementsCount?: number;  // Types that implement this
+  /** Project the hit lives in (cross-project searches). */
+  projectId?: number;
+  /** Same symbol (qualified name + file name) in other versions of the pod,
+   *  folded under this best-ranked hit in all-projects searches. */
+  alsoIn?: Array<{ projectId: number; label: string; nodeId: string; filePath: string; lineStart: number }>;
+  /** Start of the matched chunk text; only set for the reranker, removed before results are returned. */
+  chunkText?: string;
   relatedNodes?: Array<{
     id: string;
     name: string;
     relationship: string;
   }>;
+}
+
+/** Whole-search result cache: 64 MB cap (size = JSON length), 10 min TTL. */
+const resultCache = new LRUCache<string, SemanticSearchResult[]>({
+  maxSize: 64 * 1024 * 1024,
+  sizeCalculation: v => Math.max(1, JSON.stringify(v).length),
+  ttl: 10 * 60_000,
+});
+/** Drop every cached search result (index changed). */
+export function clearSearchResultCache(): void { resultCache.clear(); }
+export function searchResultCacheStats(): { entries: number; bytes: number } {
+  return { entries: resultCache.size, bytes: resultCache.calculatedSize };
+}
+
+/**
+ * Fold version copies: hits with the same qualified name and the same file
+ * name in DIFFERENT projects collapse into the first (best-ranked) one, which
+ * lists the others in `alsoIn`. Order of the remaining hits is kept. Hits
+ * without a project, or from the same project as the leader, never fold.
+ */
+export function groupVersionCopies<T extends { nodeId: string; qualifiedName: string; filePath: string; lineStart: number; projectId?: number; alsoIn?: SemanticSearchResult['alsoIn'] }>(
+  hits: T[], labelOf: (projectId: number) => string,
+): T[] {
+  const leaders = new Map<string, T>();
+  const out: T[] = [];
+  for (const h of hits) {
+    if (h.projectId === undefined || !h.qualifiedName) { out.push(h); continue; }
+    const key = `${h.qualifiedName}\u001f${(h.filePath || '').split('/').pop()}`;
+    const lead = leaders.get(key);
+    const seen = lead && (lead.projectId === h.projectId || lead.alsoIn?.some(a => a.projectId === h.projectId));
+    if (!lead || seen) {
+      if (!lead) leaders.set(key, h);
+      out.push(h);
+      continue;
+    }
+    (lead.alsoIn ??= []).push({ projectId: h.projectId, label: labelOf(h.projectId), nodeId: h.nodeId, filePath: h.filePath, lineStart: h.lineStart });
+  }
+  return out;
+}
+
+/** Embed-cache text version for QUERY vectors (documents use 1..N). */
+export const QUERY_VECTOR_TEXT_VERSION = -1;
+
+/** Saved query vectors in memory: model → (sha256 of query text → vector). */
+const SAVED_QUERY_VECTORS_MAX = 5_000;
+const savedQueryVectors = new Map<string, Map<string, Float32Array>>();
+let savedQueryCount = 0;
+function rememberQueryVector(model: string, hash: string, vec: Float32Array): void {
+  if (savedQueryCount >= SAVED_QUERY_VECTORS_MAX) return;
+  const m = savedQueryVectors.get(model) ?? new Map<string, Float32Array>();
+  if (!m.has(hash)) savedQueryCount++;
+  m.set(hash, vec);
+  savedQueryVectors.set(model, m);
+}
+
+/**
+ * Boot warm-up for the query path: choose the query encoder once (1.9 s on a
+ * cold process, 10 ms after) and load the saved query vectors into memory, so
+ * the first search neither waits for provider discovery nor reads the embed
+ * cache table. Best effort; never throws.
+ */
+export async function warmSearchAtBoot(): Promise<{ encoderMs: number; vectors: number; loadMs: number; encoderOk: boolean; vectorsOk: boolean }> {
+  const t0 = Date.now();
+  let encoderOk = true;
+  try {
+    const { selectQueryEmbeddingProvider } = await import('./providers/embeddingProvider.js');
+    await selectQueryEmbeddingProvider('code');
+  } catch (e) { encoderOk = false; logger.debug(`[search] boot encoder choice failed: ${(e as Error).message}`); }
+  const encoderMs = Date.now() - t0;
+  const t1 = Date.now();
+  let vectorsOk = true;
+  try {
+    const loaded = await getEmbedCache().loadVersion(QUERY_VECTOR_TEXT_VERSION, SAVED_QUERY_VECTORS_MAX);
+    for (const [model, m] of loaded) for (const [h, v] of m) rememberQueryVector(model, h, v);
+  } catch (e) { vectorsOk = false; logger.debug(`[search] loading saved query vectors failed: ${(e as Error).message}`); }
+  return { encoderMs, vectors: savedQueryCount, loadMs: Date.now() - t1, encoderOk, vectorsOk };
+}
+
+let warmupRun: Promise<void> | null = null;
+/** The warm-up attempt running right now (not the retry wait between attempts). */
+let warmupAttempt: Promise<unknown> | null = null;
+/** Longest a query waits for an in-flight boot warm-up before embedding. */
+const WARMUP_WAIT_MS = 1_500;
+let warmupDone = false;
+/**
+ * Run warmSearchAtBoot as soon as the HTTP server is up, retrying while the
+ * encoder or the embed cache is not ready yet (cloud keys, sidecars and the
+ * vector db come up during init). Single-flight: a second call (e.g. after
+ * init) joins the run in flight or does nothing once done. Never throws.
+ */
+export function startSearchWarmup(
+  log: (msg: string) => void,
+  opts: { attempts?: number; delayMs?: number; warm?: typeof warmSearchAtBoot } = {},
+): Promise<void> {
+  if (warmupDone) return Promise.resolve();
+  if (warmupRun) return warmupRun;
+  const attempts = opts.attempts ?? 12;
+  const delayMs = opts.delayMs ?? 15_000;
+  const warm = opts.warm ?? warmSearchAtBoot;
+  warmupRun = (async () => {
+    for (let i = 1; i <= attempts; i++) {
+      try {
+        const attempt = warm();
+        warmupAttempt = attempt;
+        const r = await attempt.finally(() => { if (warmupAttempt === attempt) warmupAttempt = null; });
+        if (r.encoderOk && r.vectorsOk) {
+          warmupDone = true;
+          log(`Search warm-up: encoder ${r.encoderMs}ms, ${r.vectors} saved query vectors in ${r.loadMs}ms (attempt ${i})`);
+          return;
+        }
+        if (i === attempts) log(`Search warm-up incomplete after ${i} attempts (encoder ${r.encoderOk ? 'ok' : 'not ready'}, saved vectors ${r.vectorsOk ? 'ok' : 'not ready'}); searches resolve them on first use`);
+      } catch { /* warm never throws; belt and braces */ }
+      if (i < attempts) await new Promise(res => setTimeout(res, delayMs).unref?.());
+    }
+  })().finally(() => { warmupRun = null; });
+  return warmupRun;
+}
+/** Test seam. */
+export function __resetSearchWarmup(): void { warmupRun = null; warmupDone = false; warmupAttempt = null; }
+
+/** Test seam. */
+export function __resetSavedQueryVectors(): void { savedQueryVectors.clear(); savedQueryCount = 0; }
+
+/**
+ * Stale-id rescue: the graph node for a vector row whose id no longer exists.
+ * Same qualified name AND file; among overloads/duplicates, the one whose
+ * declaration line is nearest the row's line. Undefined when none match.
+ */
+export function matchStaleRow<N extends { qualifiedName: string; filePath: string; lineStart: number }>(
+  row: { qualifiedName?: string; filePath?: string; lineStart?: number },
+  nodes: N[],
+): N | undefined {
+  const cands = nodes.filter(n => n.qualifiedName === row.qualifiedName && n.filePath === row.filePath);
+  if (cands.length === 0) return undefined;
+  const line = row.lineStart ?? 0;
+  return cands.reduce((a, b) => Math.abs(b.lineStart - line) < Math.abs(a.lineStart - line) ? b : a);
+}
+
+/** Run `fn` over `items`, at most `limit` at once. */
+export async function forEachBounded<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const i = next++; await fn(items[i]); } };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
 export interface SemanticSearchOptions {
@@ -159,6 +313,16 @@ export interface SemanticSearchOptions {
   limit?: number;
   minScore?: number;
   includeGraphContext?: boolean;  // Include callers/callees in results
+  /**
+   * Wall-clock time (ms since epoch) after which the graph step (metrics +
+   * related nodes) stops: hits still come back, without graph data. The
+   * graph step was measured at 103 s of one ask while indexing ran. A
+   * LadybugDB read cannot be cancelled, so an abandoned one finishes in the
+   * background; no NEW graph read starts after the deadline.
+   */
+  graphDeadlineAt?: number;
+  /** Told once when `graphDeadlineAt` cut the graph step short. */
+  onGraphCapped?: (info: { afterMs: number; skippedRelated: number; metricsCut: boolean }) => void;
   /**
    * Pull per-hit caller/callee COUNTS from the graph (default true). They feed
    * the graph score and the result's metrics; the RLM loop never reads them
@@ -175,6 +339,15 @@ export interface SemanticSearchOptions {
   hybrid?: boolean;
   /** Per-request override of semanticSearch.rerank ('auto' | 'on' | 'off'). */
   rerank?: RerankMode;
+  /** Per-request override of semanticSearch.rerankCodeChars (0 = off). */
+  rerankCodeChars?: number;
+  /** Per-request (A/B only): which part of the chunk text the reranker reads. */
+  rerankCodeMode?: 'all' | 'body' | 'missing-doc';
+  /** Per-request (A/B only): cross-encoder weight in the final score (default 0.7). */
+  rerankXeWeight?: number;
+  /** Cross-project searches: fold version copies of one symbol under the
+   *  best hit (default true). Ignored for single-project searches. */
+  groupVersions?: boolean;
 }
 
 // ============================================
@@ -276,6 +449,43 @@ export class SemanticSearchService {
     query: string,
     options: SemanticSearchOptions = {}
   ): Promise<SemanticSearchResult[]> {
+    // Whole-result cache. Keyed by query, every option that changes the
+    // answer, the code table version and the rerank/hybrid settings. A capped
+    // (partial) search is never stored. Cleared on any table swap/reset.
+    // Resolve the query encoder first: a policy refusal (cloud-only, none
+    // available) must surface even for a cached query, and the model is part
+    // of the key.
+    const encoder = await this.queryEncoder();
+    const key = await this.resultCacheKey(query, options, encoder.getModelName());
+    if (key) {
+      const hit = resultCache.get(key);
+      if (hit) { logger.info(`[search] "${query.slice(0, 40)}" project=${options.projectId ?? 'all'} result cache hit`); return structuredClone(hit); }
+    }
+    let capped = false;
+    const out = await this.searchUncached(query, {
+      ...options,
+      onGraphCapped: info => { capped = true; options.onGraphCapped?.(info); },
+    });
+    if (key && !capped) resultCache.set(key, structuredClone(out));
+    return out;
+  }
+
+  /** Cache key for `search`, or undefined (no caching) if the table is unreadable. */
+  private async resultCacheKey(query: string, options: SemanticSearchOptions, model = ''): Promise<string | undefined> {
+    // Unit tests must not open the real vector table; cache tests stub this.
+    if (process.env.JEST_WORKER_ID) return undefined;
+    try {
+      const { getLanceTable, getActiveCodeTableName, codeTableGeneration } = await import('./lanceConnection.js');
+      const version = await (await getLanceTable()).version();
+      const { graphDeadlineAt: _d, onGraphCapped: _c, ...rest } = options;
+      return JSON.stringify([query, rest, model, getActiveCodeTableName(), version, codeTableGeneration(), readRerankMode(), readHybridSettings(), readRerankCodeChars()]);
+    } catch { return undefined; }
+  }
+
+  private async searchUncached(
+    query: string,
+    options: SemanticSearchOptions = {}
+  ): Promise<SemanticSearchResult[]> {
     const {
       projectId,
       nodeType,
@@ -294,6 +504,7 @@ export class SemanticSearchService {
 
     // Hybrid (vector ⊕ keyword, RRF) — per-request override > runtime setting.
     const hybridCfg = readHybridSettings();
+    const codeChars = options.rerankCodeChars ?? readRerankCodeChars();
     const hybridOn = options.hybrid ?? hybridCfg.enabled;
 
     // 1. Generate query embedding. Instruction-tuned models (Qwen3-Embedding)
@@ -325,7 +536,9 @@ export class SemanticSearchService {
       projectIds,
       nodeType,
       limit: hybridOn ? Math.max(HYBRID_CANDIDATES, limit) : limit * 2,
-      minScore
+      minScore,
+      // Chunk text only when the reranker reads it (extra column I/O otherwise).
+      ...(codeChars > 0 ? { includeText: true } : {}),
     });
 
     const annMs = Date.now() - tAnn0;
@@ -347,7 +560,7 @@ export class SemanticSearchService {
     let bm25Results: VectorSearchResult[] = [];
     if (hybridOn) {
       try {
-        bm25Results = await this.vectorStore.textSearch(query, { projectId, projectIds, nodeType, limit: HYBRID_CANDIDATES });
+        bm25Results = await this.vectorStore.textSearch(query, { projectId, projectIds, nodeType, limit: HYBRID_CANDIDATES, ...(codeChars > 0 ? { includeText: true } : {}) });
       } catch (err) {
         logger.warn(`[hybrid] bm25 search failed, continuing without it: ${(err as Error).message}`);
       }
@@ -374,11 +587,20 @@ export class SemanticSearchService {
     //    hit from the per-project db it actually lives in, keyed by the
     //    project_id LanceDB stored on the vector row.
     vectorResults = joinedVector;
+    const tFetch0 = Date.now();
     const nodeIds = vectorResults.map(r => r.nodeId);
     let nodes: Awaited<ReturnType<typeof this.fetchNodesByIds>>;
     // Projects whose graph store failed the node fetch. Their hits fall back
     // to the vector row's own columns instead of being dropped.
     const graphFailed = new Set<number | undefined>();
+    // Metrics read during the cross-project fetch, per project.
+    const earlyMetrics = new Map<number, Map<string, GraphMetrics>>();
+    // Stale-id rescue state (see 3b). Cross-project searches fill it during
+    // the fetch; projects already handled there are skipped in 3b.
+    const rekeyed = new Map<string, string>(); // vector id → graph id
+    const rescuedPids = new Set<number | undefined>();
+    const isStaleCandidate = (vr: (typeof vectorResults)[number]) => !!vr.qualifiedName && !!vr.filePath
+      && vr.nodeType !== 'file' && vr.nodeType !== 'project';
     const fetchOrDegrade = async (ids: string[], pid?: number) => {
       try {
         return await this.fetchNodesByIds(ids, pid);
@@ -403,15 +625,78 @@ export class SemanticSearchService {
         }
       }
       nodes = [];
-      for (const [pid, ids] of byProject) {
-        nodes.push(...await fetchOrDegrade(ids, pid));
-      }
+      // A few projects at a time (projectFanout, <= half the pool cap), not one after another:
+      // an all-project search spans dozens of per-project stores.
+      // Metrics are read in the same visit, while the store is open: a second
+      // pass over dozens of stores re-opens each one (pool cap 8 → evicted).
+      // The stale-id rescue runs in this visit too, so each store opens once.
+      await forEachBounded([...byProject], projectFanout(), async ([pid, ids]) => {
+        const found = await fetchOrDegrade(ids, pid);
+        nodes.push(...found);
+        if (graphFailed.has(pid)) return;
+        const have = new Set(found.map(n => n.id));
+        const stale = vectorResults.filter(vr => vr.projectId === pid && isStaleCandidate(vr) && !have.has(vr.nodeId));
+        if (stale.length > 0) {
+          const byQn = await this.fetchNodesByQn(stale.map(r => r.qualifiedName as string), pid).catch(() => []);
+          for (const vr of stale) {
+            const best = matchStaleRow(vr, byQn);
+            if (!best) continue;
+            rekeyed.set(vr.nodeId, best.id);
+            if (!have.has(best.id)) { have.add(best.id); found.push(best); nodes.push(best); }
+          }
+        }
+        rescuedPids.add(pid);
+        const dl = options.graphDeadlineAt;
+        if (includeGraphMetrics && found.length > 0 && (dl === undefined || Date.now() < dl)) {
+          try { earlyMetrics.set(pid, await this.graph(pid).getMetricsBatch(found.map(n => n.id))); }
+          catch { /* the metrics pass below retries this project */ }
+        }
+      });
       if (noPid.length > 0) {
         nodes.push(...await fetchOrDegrade(noPid));
       }
     }
 
     const nodeMap = new Map(nodes.map(n => [n.id, n]));
+
+    // 3b. Stale-id rescue. Vector rows embedded before .fan moved to the
+    //     tree-sitter parser (e6627ce) carry md5(file:qn) ids; the rebuilt graph
+    //     uses md5(file:qn:line). Re-join those rows on (qualified_name,
+    //     file_path), picking the node nearest the row's line, and re-key the
+    //     hit to the graph id so metrics/related work.
+    {
+      const stale = vectorResults.filter(vr => !nodeMap.has(vr.nodeId) && isStaleCandidate(vr)
+        && !rekeyed.has(vr.nodeId)
+        && !rescuedPids.has(projectId ?? vr.projectId)
+        && !graphFailed.has(projectId ?? vr.projectId));
+      const byPid = new Map<number | undefined, typeof stale>();
+      for (const vr of stale) {
+        const pid = projectId ?? vr.projectId;
+        const arr = byPid.get(pid) ?? [];
+        arr.push(vr);
+        byPid.set(pid, arr);
+      }
+      await forEachBounded([...byPid], projectFanout(), async ([pid, rows]) => {
+        const found = await this.fetchNodesByQn(rows.map(r => r.qualifiedName as string), pid).catch(() => []);
+        for (const vr of rows) {
+          const best = matchStaleRow(vr, found);
+          if (!best) continue;
+          rekeyed.set(vr.nodeId, best.id);
+          nodeMap.set(best.id, best);
+        }
+      });
+      if (rekeyed.size > 0) {
+        vectorResults = vectorResults.map(vr => rekeyed.has(vr.nodeId) ? { ...vr, nodeId: rekeyed.get(vr.nodeId)! } : vr);
+        // Two chunks of one stale symbol can now share an id: keep the best.
+        const seen = new Set<string>();
+        vectorResults = vectorResults.filter(vr => {
+          const k = `${vr.projectId ?? ''}:${vr.nodeId}:${vr.chunkIndex ?? 0}`;
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+      }
+    }
     // Per-node project for cross-project metrics/related-node enrichment.
     const pidByNode = new Map(vectorResults.map(r => [r.nodeId, r.projectId]));
 
@@ -422,10 +707,31 @@ export class SemanticSearchService {
     // sees "no results" for a query the index answered — so say so, with
     // what was dropped, instead of returning [] silently.
     const dropped: Array<{ id: string; type?: string; qn?: string }> = [];
+    const noGraph: Array<{ id: string; type?: string; qn?: string }> = [];
     // Metrics for every joined node in ONE batch per project (2 queries),
     // not getMetrics() per hit (9 queries each, in a loop).
     const metricsMaps = new Map<number, Map<string, GraphMetrics>>();
+    const fetchMs = Date.now() - tFetch0;
     const tJoin0 = Date.now();
+    const graphDeadlineAt = options.graphDeadlineAt;
+    let metricsCut = false;
+    let skippedRelated = 0;
+    const syntheticIds = new Set<string>();
+    // Wait for `work` until the graph deadline; past it, give up and return
+    // `fallback`. The abandoned read keeps running, so its rejection is caught.
+    const untilGraphDeadline = async <T,>(work: Promise<T>, fallback: T): Promise<{ v: T; cut: boolean }> => {
+      if (graphDeadlineAt === undefined) return { v: await work, cut: false };
+      const ms = graphDeadlineAt - Date.now();
+      if (ms <= 0) { work.catch(() => undefined); return { v: fallback, cut: true }; }
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<{ v: T; cut: boolean }>(res => { timer = setTimeout(() => res({ v: fallback, cut: true }), ms); });
+      try {
+        return await Promise.race([work.then(v => ({ v, cut: false })), timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        work.catch(() => undefined);
+      }
+    };
     if (includeGraphMetrics) {
       const idsByPid = new Map<number, string[]>();
       for (const vr of vectorResults) {
@@ -440,15 +746,32 @@ export class SemanticSearchService {
       // per-project graph dbs) fired one open per project at once; with the
       // pool capped at FANTOM_GRAPH_MAX_OPEN=8 that is open → evict → reopen
       // for the whole batch. Four at a time keeps every open inside the cap.
-      const pids = [...idsByPid];
-      const METRICS_CONCURRENCY = 4;
-      for (let i = 0; i < pids.length; i += METRICS_CONCURRENCY) {
-        await Promise.all(pids.slice(i, i + METRICS_CONCURRENCY).map(async ([pid, ids]) => {
-          try { metricsMaps.set(pid, await this.graph(pid === -1 ? undefined : pid).getMetricsBatch(ids)); }
-          catch { metricsMaps.set(pid, new Map()); }
-        }));
+      // Projects whose metrics the fetch already read: keep those, and query
+      // only the ids it did not cover (nodes found by the stale-id rescue).
+      for (const [pid, ids] of [...idsByPid]) {
+        const early = earlyMetrics.get(pid);
+        if (!early) continue;
+        metricsMaps.set(pid, early);
+        const rest = ids.filter(id => !early.has(id));
+        if (rest.length === 0) idsByPid.delete(pid); else idsByPid.set(pid, rest);
       }
+      const pids = [...idsByPid];
+      const METRICS_CONCURRENCY = projectFanout();
+      const allMetrics = (async () => {
+        for (let i = 0; i < pids.length; i += METRICS_CONCURRENCY) {
+          if (graphDeadlineAt !== undefined && Date.now() > graphDeadlineAt) { metricsCut = true; return; }
+          await Promise.all(pids.slice(i, i + METRICS_CONCURRENCY).map(async ([pid, ids]) => {
+            try {
+              const m = await this.graph(pid === -1 ? undefined : pid).getMetricsBatch(ids);
+              const prev = metricsMaps.get(pid);
+              if (prev) for (const [k, v] of m) prev.set(k, v); else metricsMaps.set(pid, m);
+            } catch { if (!metricsMaps.has(pid)) metricsMaps.set(pid, new Map()); }
+          }));
+        }
+      })();
+      if ((await untilGraphDeadline(allMetrics, undefined)).cut) metricsCut = true;
     }
+    const metricsMs = Date.now() - tJoin0;
     const zeroMetrics = (id: string): GraphMetrics => ({
       nodeId: id, incomingEdgeCount: 0, outgoingEdgeCount: 0, callerCount: 0, calleeCount: 0,
       containsCount: 0, usedByCount: 0, extendsCount: 0, implementsCount: 0, depth: 0,
@@ -459,12 +782,15 @@ export class SemanticSearchService {
       // v3 file:/project: rows have no CodeNode — build the hit from the row's
       // denormalised columns (qualified_name / file_path) instead of dropping it.
       // Same when the hit's graph store failed: keep the vector hit.
-      const synthetic = !node && !!vr.qualifiedName && (
-        vr.nodeType === 'file' || vr.nodeType === 'project'
-        || graphFailed.has(projectId ?? vr.projectId)
-      );
+      // A symbol row whose node is gone from the graph (stale id that the
+      // rescue above could not re-join) is also kept, without graph data: the
+      // row still names the file and the matched chunk.
+      const synthetic = !node && !!vr.qualifiedName;
       if (!node) {
         if (!synthetic) { dropped.push({ id: vr.nodeId, type: vr.nodeType, qn: vr.qualifiedName }); continue; }
+        if (vr.nodeType !== 'file' && vr.nodeType !== 'project' && !graphFailed.has(projectId ?? vr.projectId)) {
+          noGraph.push({ id: vr.nodeId, type: vr.nodeType, qn: vr.qualifiedName });
+        }
         const qn = vr.qualifiedName as string;
         node = {
           id: vr.nodeId,
@@ -506,6 +832,7 @@ export class SemanticSearchService {
         lineEnd: vr.lineEnd,
         chunkIndex: vr.chunkIndex,
         chunkCount: vr.chunkCount,
+        chunkText: codeChars > 0 ? vr.text?.slice(0, codeChars) : undefined,
         signature: node.signature ?? undefined,
         documentation: node.documentation ?? undefined,
         semanticScore: vr.score,
@@ -519,18 +846,18 @@ export class SemanticSearchService {
         implementsCount: metrics.implementsCount,
       };
 
-      // Add graph context if requested (from the hit's own project db).
-      if (includeGraphContext && !synthetic) {
-        result.relatedNodes = await this.getRelatedNodes(node.id, 3, enrichPid);
-      }
+      // Graph context (related nodes) is fetched after rerank, for the final
+      // hits only, in one batch per project — see `attachRelated` below.
+      if (synthetic) syntheticIds.add(node.id);
 
       results.push(result);
     }
-    if (dropped.length > 0) {
-      const sample = dropped.slice(0, 4).map(d => `${d.type ?? '?'}:${d.qn ?? d.id}`).join(', ');
+    if (dropped.length > 0 || noGraph.length > 0 || rekeyed.size > 0) {
+      const sample = [...dropped, ...noGraph].slice(0, 4).map(d => `${d.type ?? '?'}:${d.qn ?? d.id}`).join(', ');
       logger.info(
         `[search] "${query.slice(0, 60)}" project=${projectId ?? 'all'}: vector=${vectorResults.length} joined=${results.length} `
-        + `dropped=${dropped.length} (node_id not in graph db) e.g. ${sample}`,
+        + `rekeyed=${rekeyed.size} (stale id, re-joined on name+file) kept-without-graph=${noGraph.length} `
+        + `dropped=${dropped.length} (node_id not in graph db)${sample ? ` e.g. ${sample}` : ''}`,
       );
     }
 
@@ -582,15 +909,109 @@ export class SemanticSearchService {
     const tRerank0 = Date.now();
     ordered = await this.maybeRerank(query, ordered, options, limit);
     const rerankMs = Date.now() - tRerank0;
+    // Cross-project: fold version copies AFTER rerank (scores unchanged), so
+    // freed top-N slots go to other answers.
+    let folded = 0;
+    if (projectId === undefined && options.groupVersions !== false) {
+      for (const r of ordered) if (r.projectId === undefined) r.projectId = pidByNode.get(r.nodeId);
+      const labels = await import('../projects/versionGroup.js').then(m => m.getProjectVersionGroups()).catch(() => new Map());
+      const before = ordered.length;
+      ordered = groupVersionCopies(ordered, pid => labels.get(pid)?.label ?? `project ${pid}`);
+      folded = before - ordered.length;
+    }
     ordered = ordered.slice(0, limit);
-    logger.info(`[search] "${query.slice(0, 40)}" project=${projectId ?? 'all'} phases: join+related ${joinMs}ms rerank ${rerankMs}ms total ${Date.now() - tEmbed0}ms`);
+    for (const r of ordered) delete r.chunkText;
 
     // 7. Optional LLM re-ranking
     if (options.llmReranker?.enabled) {
       const { llmRerank } = await import('./llmReranker.js');
       ordered = await llmRerank(query, ordered, options.llmReranker);
     }
+
+    // 8. Related nodes (callers/callees) for the FINAL hits only, two queries
+    //    per project. Neither reranker reads them. Before, this ran per
+    //    candidate (~100) before fusion as two serialized recursive queries
+    //    each: 47-52 s of a 55-61 s search on project 11.
+    const tRel0 = Date.now();
+    let relatedQueries = 0;
+    if (includeGraphContext) {
+      const r = await this.attachRelated(ordered, {
+        pidOf: (id) => projectId ?? pidByNode.get(id),
+        skip: syntheticIds,
+        graphDeadlineAt,
+        untilGraphDeadline,
+      });
+      skippedRelated += r.skipped;
+      relatedQueries = r.queries;
+    }
+    const relatedMs = Date.now() - tRel0;
+    if (metricsCut || skippedRelated > 0) {
+      const afterMs = graphDeadlineAt !== undefined ? Math.max(0, graphDeadlineAt - tJoin0) : joinMs;
+      logger.warn(`[search] "${query.slice(0, 40)}" project=${projectId ?? 'all'}: graph step capped after ${afterMs}ms (metrics ${metricsCut ? 'cut' : 'done'}, related skipped for ${skippedRelated} hit(s))`);
+      try { options.onGraphCapped?.({ afterMs, skippedRelated, metricsCut }); } catch { /* listener */ }
+    }
+    logger.info(`[search] "${query.slice(0, 40)}" project=${projectId ?? 'all'} phases: fetch ${fetchMs}ms (${rekeyed.size} rekeyed, ${folded} version copies folded) join ${joinMs}ms (metrics ${metricsMs}ms) rerank ${rerankMs}ms related ${relatedMs}ms (${ordered.length} hits, ${relatedQueries} queries) total ${Date.now() - tEmbed0}ms`);
     return ordered;
+  }
+
+  /** Wait for `work` until `deadlineAt`; past it, return `fallback` (cut). */
+  private async untilDeadline<T>(deadlineAt: number | undefined, work: Promise<T>, fallback: T): Promise<{ v: T; cut: boolean }> {
+    if (deadlineAt === undefined) return { v: await work, cut: false };
+    const ms = deadlineAt - Date.now();
+    if (ms <= 0) { work.catch(() => undefined); return { v: fallback, cut: true }; }
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<{ v: T; cut: boolean }>(res => { timer = setTimeout(() => res({ v: fallback, cut: true }), ms); });
+    try {
+      return await Promise.race([work.then(v => ({ v, cut: false })), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      work.catch(() => undefined);
+    }
+  }
+
+  /**
+   * Attach `relatedNodes` to `hits` in place: one getRelatedBatch (2 queries)
+   * per project, four projects at a time (the graph pool cap is 8). Hits in
+   * `skip` (synthetic file/project rows) and hits with no known project in a
+   * cross-project search get none. A project whose lookup fails or misses the
+   * graph deadline counts its hits as skipped; the search still returns.
+   */
+  private async attachRelated(
+    hits: SemanticSearchResult[],
+    opts: {
+      pidOf: (nodeId: string) => number | undefined;
+      skip: Set<string>;
+      graphDeadlineAt?: number;
+      untilGraphDeadline: <T>(work: Promise<T>, fallback: T) => Promise<{ v: T; cut: boolean }>;
+    },
+  ): Promise<{ skipped: number; queries: number }> {
+    const byPid = new Map<number, SemanticSearchResult[]>();
+    for (const h of hits) {
+      if (!h.nodeId || opts.skip.has(h.nodeId)) continue;
+      const pid = opts.pidOf(h.nodeId);
+      if (pid === undefined) continue;
+      const arr = byPid.get(pid) ?? [];
+      arr.push(h);
+      byPid.set(pid, arr);
+    }
+    let skipped = 0;
+    let queries = 0;
+    const groups = [...byPid];
+    const CONCURRENCY = projectFanout();
+    for (let i = 0; i < groups.length; i += CONCURRENCY) {
+      await Promise.all(groups.slice(i, i + CONCURRENCY).map(async ([pid, group]) => {
+        if (opts.graphDeadlineAt !== undefined && Date.now() > opts.graphDeadlineAt) { skipped += group.length; return; }
+        queries += 2;
+        const work = this.graph(pid === -1 ? undefined : pid).getRelatedBatch(group.map(h => h.nodeId), graphSetting('relatedLimit')).catch((err: Error) => {
+          logger.warn(`[search] related nodes skipped for project ${pid}: ${err.message}`);
+          return undefined;
+        });
+        const r = await opts.untilGraphDeadline(work, undefined);
+        if (r.cut || !r.v) { skipped += group.length; return; }
+        for (const h of group) h.relatedNodes = r.v.get(h.nodeId) ?? [];
+      }));
+    }
+    return { skipped, queries };
   }
 
   private static readonly QUERY_EMBED_TTL_MS = 10 * 60_000;
@@ -612,8 +1033,22 @@ export class SemanticSearchService {
     if (pending) return pending;
     const p = (async () => {
       try {
+        // Persistent tier: the embed cache table (LanceDB) under a query-only
+        // text version, so query vectors survive restarts. Best effort, capped.
+        // Read from memory only: warmSearchAtBoot loads the saved set once.
+        const qHash = createHash('sha256').update(queryText).digest('hex');
+        // A search right after boot can beat the warm-up: wait for it briefly
+        // (the saved-vector load is ~0.6 s) rather than pay a full embed.
+        if (warmupAttempt) await Promise.race([warmupAttempt, new Promise(r => setTimeout(r, WARMUP_WAIT_MS))]);
+        const persisted = savedQueryVectors.get(provider.getModelName())?.get(qHash);
+        if (persisted && persisted.length > 0) {
+          this.queryEmbedCache.set(key, { vec: persisted, at: Date.now() });
+          return persisted;
+        }
         const vec = await provider.embed(queryText);
         if (vec && vec.length > 0) {
+          rememberQueryVector(provider.getModelName(), qHash, vec);
+          void getEmbedCache().store(provider.getModelName(), QUERY_VECTOR_TEXT_VERSION, [{ hash: qHash, vector: vec }]).catch(() => 0);
           this.queryEmbedCache.set(key, { vec, at: Date.now() });
           while (this.queryEmbedCache.size > SemanticSearchService.QUERY_EMBED_MAX) {
             const oldest = this.queryEmbedCache.keys().next().value as string;
@@ -668,6 +1103,9 @@ export class SemanticSearchService {
         topK,
         timeoutMs: xe?.timeoutMs ?? 8_000,
         sidecar: sidecar ?? undefined,
+        codeChars: options.rerankCodeChars ?? readRerankCodeChars(),
+        ...(options.rerankCodeMode ? { codeMode: options.rerankCodeMode } : {}),
+        ...(typeof options.rerankXeWeight === 'number' ? { xeWeight: options.rerankXeWeight } : {}),
       });
       const keyOf = (r: SemanticSearchResult) => r.nodeId || `${r.filePath}:${r.lineStart}`;
       const n = Math.min(limit, reranked.length);
@@ -1107,8 +1545,18 @@ export class SemanticSearchService {
     // can serve none of the chunks — the Macs refusing embeddings had the
     // dashboard crediting them for projects BASWS35 embedded entirely.
     const servedBy = new Map<string, { name: string; host?: string; texts: number }>();
-    const credit = (p: unknown, n: number): void => {
+    const credit = (p: unknown, n: number, vecs?: Float32Array[]): void => {
       const prov = p as { getSidecarName?: () => string; getSidecarId?: () => string };
+      // Direct OpenRouter: credit each pool worker (worker1 … workerN).
+      const split = workerSplitOf(vecs);
+      if (split) {
+        for (const [name, k] of Object.entries(split)) {
+          const w = servedBy.get(name) ?? { name, host: undefined, texts: 0 };
+          w.texts += k;
+          servedBy.set(name, w);
+        }
+        return;
+      }
       const name = typeof prov.getSidecarName === 'function' ? prov.getSidecarName() : 'in-process';
       const cur = servedBy.get(name) ?? { name, host: undefined, texts: 0 };
       if (!cur.host && typeof prov.getSidecarId === 'function') {
@@ -1156,7 +1604,7 @@ export class SemanticSearchService {
           // GPU host takes proportionally more of each batch than a Mac).
           // embed_cache (3.5): only texts the cache does not hold reach a provider.
           embeddings = (await getEmbedCache().embedThrough(desiredModel, texts,
-            miss => embedBatchFanout(fanout, miss, (p, n) => credit(p, n)))).vectors;
+            miss => embedBatchFanout(fanout, miss, (p, n, v) => credit(p, n, v)))).vectors;
         } else {
           // Unreachable under "OpenRouter only": `useFanout` is
           // `fanout.length >= 1` there and the selector throws rather than
@@ -1173,7 +1621,7 @@ export class SemanticSearchService {
           const single = projectProvider;
           embeddings = (await getEmbedCache().embedThrough(desiredModel, texts, async miss => {
             const v = await single.embedBatch(miss);
-            credit(single, miss.length);
+            credit(single, miss.length, v);
             return v;
           })).vectors;
         }
@@ -1287,54 +1735,6 @@ export class SemanticSearchService {
   }
 
   /**
-   * Get related nodes for context
-   */
-  private async getRelatedNodes(
-    nodeId: string,
-    limit: number,
-    projectId?: number,
-  ): Promise<Array<{ id: string; name: string; relationship: string }>> {
-    // Related nodes are context only: a graph failure (full buffer pool, a
-    // degraded store) must not fail the search that asked for them.
-    try {
-      return await this.getRelatedNodesUnsafe(nodeId, limit, projectId);
-    } catch (err) {
-      logger.warn(`[search] related nodes skipped for ${nodeId} (project ${projectId ?? 'shared'}): ${(err as Error).message}`);
-      return [];
-    }
-  }
-
-  private async getRelatedNodesUnsafe(
-    nodeId: string,
-    limit: number,
-    projectId?: number,
-  ): Promise<Array<{ id: string; name: string; relationship: string }>> {
-    const related: Array<{ id: string; name: string; relationship: string }> = [];
-
-    // Get top callers
-    const callers = await this.graph(projectId).getCallers(nodeId, 1);
-    for (const caller of callers.slice(0, limit)) {
-      related.push({
-        id: caller.id,
-        name: caller.name,
-        relationship: 'caller'
-      });
-    }
-
-    // Get top callees
-    const callees = await this.graph(projectId).getCallees(nodeId, 1);
-    for (const callee of callees.slice(0, limit)) {
-      related.push({
-        id: callee.id,
-        name: callee.name,
-        relationship: 'callee'
-      });
-    }
-
-    return related.slice(0, limit * 2);
-  }
-
-  /**
    * Enrich vector search results with full node data
    */
   private async enrichResults(
@@ -1351,13 +1751,21 @@ export class SemanticSearchService {
     const nodeMap = new Map(nodes.map(n => [n.id, n]));
     const results: SemanticSearchResult[] = [];
 
+    // Metrics for all hits in one batch (2 queries), not getMetrics() per
+    // hit (9 queries each). Graph counts only adjust the score; a failed or
+    // capped lookup scores 0.
+    const graphDeadlineAt = options.graphDeadlineAt;
+    const joinedIds = vectorResults.map(r => r.nodeId).filter(id => nodeMap.has(id));
+    const metricsWork = this.graph(options.projectId).getMetricsBatch(joinedIds)
+      .catch(() => new Map<string, GraphMetrics>());
+    const metricsRes = await this.untilDeadline(graphDeadlineAt, metricsWork, new Map<string, GraphMetrics>());
+    const metricsMap = metricsRes.v;
+
     for (const vr of vectorResults) {
       const node = nodeMap.get(vr.nodeId);
       if (!node) continue;
 
-      // Graph counts only adjust the score; a failed graph query scores 0.
-      const metrics = await this.graph(options.projectId).getMetrics(node.id)
-        .catch(() => ({ callerCount: 0, calleeCount: 0 }));
+      const metrics = metricsMap.get(node.id) ?? { callerCount: 0, calleeCount: 0 };
       const graphScore = this.calculateGraphScore(metrics.callerCount);
       const combinedScore = (1 - graphWeight) * vr.score + graphWeight * graphScore;
 
@@ -1377,11 +1785,21 @@ export class SemanticSearchService {
         calleeCount: metrics.calleeCount
       };
 
-      if (includeGraphContext) {
-        result.relatedNodes = await this.getRelatedNodes(node.id, 3, options.projectId);
-      }
-
       results.push(result);
+    }
+
+    // Related nodes in one batch (2 queries), not two recursive queries per hit.
+    if (includeGraphContext) {
+      const pid = options.projectId;
+      const r = await this.attachRelated(results, {
+        pidOf: () => pid ?? -1,
+        skip: new Set(),
+        graphDeadlineAt,
+        untilGraphDeadline: (work, fallback) => this.untilDeadline(graphDeadlineAt, work, fallback),
+      });
+      if (metricsRes.cut || r.skipped > 0) {
+        logger.warn(`[findSimilar] graph step capped (metrics ${metricsRes.cut ? 'cut' : 'done'}, related skipped for ${r.skipped} hit(s))`);
+      }
     }
 
     return results;
@@ -1422,6 +1840,33 @@ export class SemanticSearchService {
           filePath: r.fp, lineStart: Number(r.ls),
           signature: r.sig || null, documentation: r.doc || null
         });
+      }
+    }
+    return out;
+  }
+
+  /** Graph nodes by qualified name (stale-id rescue), chunked like fetchNodesByIds. */
+  private async fetchNodesByQn(
+    qns: string[],
+    projectId?: number,
+  ): Promise<Array<{
+    id: string; name: string; qualifiedName: string; nodeType: string;
+    filePath: string; lineStart: number; signature: string | null; documentation: string | null;
+  }>> {
+    const uniq = [...new Set(qns.filter(Boolean))];
+    const out: Awaited<ReturnType<SemanticSearchService['fetchNodesByIds']>> = [];
+    const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    for (let i = 0; i < uniq.length; i += 300) {
+      const list = uniq.slice(i, i + 300).map(q => `'${esc(q)}'`).join(', ');
+      const cypher =
+        `MATCH (n:CodeNode) WHERE n.qualified_name IN [${list}]
+         RETURN n.id AS id, n.name AS name, n.qualified_name AS qn, n.node_type AS nt,
+                n.file_path AS fp, n.line_start AS ls, n.signature AS sig, n.documentation AS doc`;
+      type Row = { id: string; name: string; qn: string; nt: string; fp: string; ls: number; sig: string; doc: string };
+      const rows = projectId !== undefined ? await ladybugQuery<Row>(projectId, cypher) : await ladybugQuery<Row>(cypher);
+      for (const r of rows) {
+        out.push({ id: r.id, name: r.name, qualifiedName: r.qn, nodeType: r.nt, filePath: r.fp,
+          lineStart: Number(r.ls), signature: r.sig || null, documentation: r.doc || null });
       }
     }
     return out;

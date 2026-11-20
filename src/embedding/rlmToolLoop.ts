@@ -17,7 +17,6 @@
  */
 
 import { getSidecarForCapability, sidecarServiceUrl } from '../sidecars/registry.js';
-import { rlmToolsToken } from '../admin/rlmToolRoutes.js';
 import {
   buildPlanPrompt,
   mergeEvidence,
@@ -226,6 +225,11 @@ export interface RlmGatherOptions {
   /** Set false to skip the Jev plan/evidence gates (tests, or a caller that
    *  already decided). Default on; each gate is advisory and null-safe. */
   jevGates?: boolean;
+  /** Per-check switches under `jevGates` (default both on). */
+  jevPlanCoverage?: boolean;
+  jevEvidence?: boolean;
+  /** Told why no endpoint could drive the loop (when this returns null). */
+  onUnavailable?: (reason: string) => void;
   /** Is this file name an indexed source path in the ask's scope? Lets the
    *  plan gate send a missed file name to search_files (indexed) or
    *  search_code (a generated file that exists only as a literal). */
@@ -262,9 +266,6 @@ export interface RlmEndpoint {
   sandbox?: boolean;
 }
 
-/** The sidecar's own HTTP API — a plain OpenAI-compatible chat route that
- *  pins our model and spends our key. This is what drives the loop. */
-const SIDECAR_API_PORT = 8098;
 /** The ss-rlm-sandbox container. Runs the recursive pattern itself, so it is
  *  NOT what a caller driving its own tool loop wants. Kept for callers that
  *  want to hand over a whole context and let the container recurse. */
@@ -285,7 +286,7 @@ export const SANDBOX_PORT = 8101;
  * ss-rlm — the whole point of choosing "OpenRouter only" is that the GPUs are
  * not in this path, so quietly putting them back would be the failure.
  */
-export async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoint | null> {
+export async function resolveRlmEndpoint(projectId?: number, why?: (reason: string) => void): Promise<RlmEndpoint | null> {
   let mode: 'local-only' | 'local-first' | 'cloud-only' = 'local-only';
   let sandboxModel: string | undefined;
   try {
@@ -309,7 +310,7 @@ export async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoin
       };
     }
   }
-  if (mode === 'local-only') return null;
+  if (mode === 'local-only') { why?.('no RLM host: no sidecar runs ss-rlm and the route is SideCar only'); return null; }
 
   // A provider-direct model (`direct:gemini:…`): the provider's own
   // OpenAI-compatible chat endpoint with the key from the LLM Providers page.
@@ -323,6 +324,7 @@ export async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoin
       const key = process.env[DIRECT_PROVIDER_KEY_ENV[direct.provider]];
       if (!key) {
         console.warn(`[RLM] ${sandboxModel} needs the ${direct.provider} key from the LLM Providers page — none set; skipping RLM.`);
+        why?.(`no ${direct.provider} key for ${sandboxModel}`);
         return null;
       }
       console.log(`[RLM] driving the loop on ${direct.provider}'s own API with ${direct.model}`);
@@ -346,143 +348,40 @@ export async function resolveRlmEndpoint(projectId?: number): Promise<RlmEndpoin
       `[RLM] policy is "${mode}" but no sandbox model is configured — skipping RLM. `
       + 'Set one under Model Selection on the OpenRouter config page.',
     );
-    return null;
-  }
-
-  // The host is one that RUNS the rlm-sandbox role — read from the sidecar,
-  // not assumed. `listSidecars()[0]` used to take the first enabled host; a
-  // host the operator deliberately left without the role (gpu-02) was then
-  // asked to drive the loop. Hosts without it are last resort only when no
-  // host has it, and that is logged.
-  const { hostsForRole, describeRoleHosts } = await import('../sidecars/sidecarRoles.js');
-  const ranked = await hostsForRole('rlm-sandbox');
-  const first = ranked[0];
-  if (!first) return null;
-  if (!first.hasRole) {
-    console.warn(`[RLM] no enabled sidecar reports the rlm-sandbox role (${describeRoleHosts('rlm-sandbox', ranked)}) — using ${first.sidecar.name} as last resort`);
-  }
-  const host = first.sidecar;
-
-  // Identity. One container serves BOTH masters and each has its own key and
-  // budget, so the sidecar refuses (409) rather than guess whose to spend. The
-  // URL must byte-match the `serverUrl` we pushed — a trailing slash or a
-  // different host spelling is a 404 that reads as "no config pushed" — so it
-  // comes from the same source the push is keyed by, never a rebuilt string.
-  //
-  // Per HOST, not the first slot in the list: each sidecar files this master
-  // under the address it saw our tunnel come from, and a LAN host and a
-  // NetBird host see different ones (gpu-01 held our NetBird address, BASWS35
-  // our LAN address, 2026-11-03). Sending BASWS35's spelling to gpu-01 was a
-  // 404 on every round, so the loop never ran.
-  const { canonicalMasterUrl } = await import('../sidecars/openRouterChat.js');
-  const masterUrl = await canonicalMasterUrl(host.id);
-  if (!masterUrl) {
-    console.warn('[RLM] cannot identify this master to the sandbox (no serverUrl known) — skipping RLM.');
+    why?.('no RLM model set');
     return null;
   }
 
   // ── Which cloud endpoint replaces ss-rlm ────────────────────────────────
   //
-  // NOT the sandbox on :8101, though that is the container named after this
-  // role. The sandbox runs the RLM pattern ITSELF — hand it a long context and
-  // it chunks, greps and sub-queries internally, measured at 26-28s per call.
-  //
-  // This function drives its OWN loop: plan, call search_code, read, decide,
-  // round again. Pointing it at :8101 nests one RLM inside another, and the
-  // outer loop then waits ~26s for what should be one model turn. Against the
-  // whole-request budget that is a guaranteed timeout — observed as
-  // `deadlineMs=23177` against a 26s first round, so the stage always expired
-  // with nothing gathered.
-  //
-  // What this loop actually needs from ss-rlm is what ss-rlm is: a plain
-  // tool-capable chat completion. The sidecar's own route is exactly that,
-  // measured at ~1.8s, and it passes `tools` through to OpenRouter untouched.
-  // So the cloud endpoint is the sidecar API, and :8101 stays for callers that
-  // want the container's recursion rather than their own.
-  const base = `${host.protocol}://${host.host}:${SIDECAR_API_PORT}/api`;
+  // OpenRouter itself, with Fantom's own key (2026-11-19). This loop drives
+  // its own plan/search/read rounds, so what it needs is a plain tool-capable
+  // chat completion. That used to go through a sidecar's chat proxy (~1.8 s
+  // per turn); direct it is ~0.45 s for the same model. Not the sandbox on
+  // :8101 either: the sandbox runs its own recursion, and nesting it here
+  // made the outer loop wait ~26 s per round.
+  const { openRouterKey } = await import('../openrouter/key.js');
+  const key = openRouterKey();
+  if (!key) {
+    why?.('no RLM host: no OpenRouter key stored');
+    return null;
+  }
   console.log(
-    (mode === 'cloud-only'
-      ? `[RLM] "OpenRouter only": driving the loop on ${host.name} via the sidecar's OpenRouter route with ${sandboxModel}`
-      : `[RLM] DEGRADED — no sidecar is running ss-rlm; driving the loop on ${host.name} via the sidecar's OpenRouter route with ${sandboxModel}`)
-    + ` (${describeRoleHosts('rlm-sandbox', ranked)})`,
+    mode === 'cloud-only'
+      ? `[RLM] "OpenRouter only": driving the loop directly on OpenRouter with ${sandboxModel}`
+      : `[RLM] DEGRADED — no sidecar is running ss-rlm; driving the loop directly on OpenRouter with ${sandboxModel}`,
   );
+  void projectId;
   return {
-    base,
+    base: 'https://openrouter.ai/api',
+    chatUrl: 'https://openrouter.ai/api/v1/chat/completions',
     model: sandboxModel,
-    // BOTH names, deliberately.
-    //
-    // `X-FantomMCP-Master` is the name this master should be identified by —
-    // "SoundSuite" in a header Fantom sends is a leftover from whose codebase
-    // the sandbox was built in, not a description of the caller.
-    //
-    // But the sidecar reads ONLY `x-soundsuite-master` today, in three places:
-    // chat/completions route.ts (POST and GET) and the container's server.py.
-    // Sending the new name alone would mean no identity, which with two
-    // masters holding keys on this fleet is a 409 — verified working before
-    // this change, so switching outright would break it.
-    //
-    // Unknown headers are ignored, so sending both costs nothing and this
-    // starts working under the new name the moment the sidecar accepts it,
-    // with no second Fantom deploy. Drop the old one once every sidecar in the
-    // fleet reads the new one — not before.
-    authHeader: {
-      'X-FantomMCP-Master': masterUrl,
-      'X-SoundSuite-Master': masterUrl,
-      // ── This master's RLM is for CODE ────────────────────────────────
-      //
-      // One container serves both masters, and the two want different tools
-      // injected into the session: Sound Suite retrieves over case law
-      // ('legal'), Fantom over a codebase ('code'). Getting that wrong does
-      // not error — it answers a code question with legal retrieval, which is
-      // the confidently-wrong failure the contract is written to avoid.
-      //
-      // The AUTHORITATIVE declaration is `domain: 'code'` in the config push,
-      // which the sidecar already stores per master (SandboxDomain in
-      // virtual-inference.ts). This header restates it PER REQUEST, which is
-      // the safer unit: stored config can be stale after a sidecar restart
-      // loses its in-memory state, while a header cannot be.
-      //
-      // Nothing reads it yet — like the identity rename, it is sent now so it
-      // works the moment the sidecar does, with no second Fantom deploy.
-      'X-FantomMCP-Domain': 'code',
-      // ── How the container reaches our retrieval ──────────────────────
-      //
-      // `tools_for_domain('code')` in server.py is where the code tools get
-      // injected, and it needs two things: where Fantom is, and permission.
-      // The first it already has — the identity header IS our base URL, so
-      // the tools POST to `<master>/api/rlm-tools/search_code`. The second is
-      // this, because those routes refuse an unauthenticated caller.
-      //
-      // SCOPE, deliberately: this token unlocks code SEARCH and nothing else.
-      // It is not the OpenRouter key, which the spec keeps out of the
-      // container precisely because model-written Python runs there and could
-      // read it. The same reasoning applies here and is the reason the grant
-      // is this narrow: the worst a leaked search token buys is reading an
-      // index we are already exposing to the sandbox on purpose. Rotate it by
-      // editing `semanticSearch.rlmToolsToken`; the routes re-read per
-      // request, so no restart is needed.
-      ...(rlmToolsToken() ? { 'X-FantomMCP-Tools-Token': rlmToolsToken()! } : {}),
-      // WHICH project the tools should search.
-      //
-      // The documented tool contract is `{query, limit}` with no scope, and
-      // that cannot work here: Fantom indexes 340 projects, and an unscoped
-      // search fans out across all of them — the executor's own comment says
-      // cross-project graph enrichment exhausts memory, and this box has hit
-      // the 4 GB guard twice. There is no sensible default either; a primary
-      // project is often unset, as it is now.
-      //
-      // But the caller always knows. askCodebase is project-scoped, so the id
-      // travels with the question and comes back on the tool call, and the
-      // sandbox searches the same project the question was asked about rather
-      // than one an operator happened to pin.
-      ...(projectId !== undefined ? { 'X-FantomMCP-Project': String(projectId) } : {}),
-    },
-    sandbox: true,
+    authHeader: { Authorization: `Bearer ${key}` },
   };
 }
 
 export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherResult | null> {
-  const ep = await resolveRlmEndpoint(opts.projectId);
+  const ep = await resolveRlmEndpoint(opts.projectId, opts.onUnavailable);
   if (!ep) return null;
   const { base, model, authHeader } = ep;
 
@@ -559,8 +458,10 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
     // ── Context window — read the deployed max_model_len once. ─────────────
     let contextTokens = DEFAULT_CONTEXT_TOKENS;
     try {
-      const r = await fetch(`${base}/v1/models`, { method: 'GET', headers: { ...authHeader }, signal });
-      if (r.ok) {
+      // Only a local ss-rlm reports max_model_len; OpenRouter's /v1/models is
+      // the whole catalogue (hundreds of KB), so skip it there.
+      const r = ep.chatUrl ? null : await fetch(`${base}/v1/models`, { method: 'GET', headers: { ...authHeader }, signal });
+      if (r?.ok) {
         const body: any = await r.json().catch(() => null);
         const len = body?.data?.[0]?.max_model_len;
         if (typeof len === 'number' && len > 0) contextTokens = len;
@@ -600,7 +501,7 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
     // search_symbols for a symbol (a file name through search_symbols found
     // nothing and cost a round-trip each, 2026-09-30); the model's own
     // sub-questions stay. Advisory: any failure leaves the plan as it is.
-    if (plan && opts.jevGates !== false && remaining() > MIN_ROUND_BUDGET_MS) {
+    if (plan && opts.jevGates !== false && opts.jevPlanCoverage !== false && remaining() > MIN_ROUND_BUDGET_MS) {
       try {
         const { checkPlan, toolForIdentifier, looksLikeFileName } = await import('./jevGates.js');
         const tJ = Date.now();
@@ -876,7 +777,7 @@ export async function runRlmGather(opts: RlmGatherOptions): Promise<RlmGatherRes
       // symbol absent, one side of a flow present. When it is decisive and
       // says no, nudge once (same nudge as below) instead of drafting thin.
       // Advisory: any failure or an uncertain answer falls through.
-      if (usefulHits > 0 && !nudged && round < maxRounds && opts.jevGates !== false && remaining() > MIN_ROUND_BUDGET_MS) {
+      if (usefulHits > 0 && !nudged && round < maxRounds && opts.jevGates !== false && opts.jevEvidence !== false && remaining() > MIN_ROUND_BUDGET_MS) {
         try {
           const { checkEvidence, evidenceSymbolsAndFiles } = await import('./jevGates.js');
           const { symbols, files } = evidenceSymbolsAndFiles(evidence);
@@ -1012,7 +913,12 @@ async function chatCompletion(
 ): Promise<any | null> {
   let res: Response;
   try {
-    res = await fetch(ep.chatUrl ?? `${ep.base}/v1/chat/completions`, {
+    // OpenRouter turns reuse the shared keep-alive agent (saves a TLS
+    // handshake per round); a local ss-rlm keeps the global fetch.
+    const doFetch = (ep.chatUrl?.startsWith('https://openrouter.ai/')
+      ? (await import('../openrouter/http.js')).orFetch
+      : fetch) as unknown as typeof fetch;
+    res = await doFetch(ep.chatUrl ?? `${ep.base}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...ep.authHeader },
       body: JSON.stringify({ model: ep.model, stream: false, ...shapeForProvider(ep, body) }),

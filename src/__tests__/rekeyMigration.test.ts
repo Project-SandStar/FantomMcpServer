@@ -130,7 +130,7 @@ describe('rekey', () => {
       expect(reindexCalls).toBe(before);
     } finally {
       await db.close();
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -200,7 +200,7 @@ describe('embed_cache', () => {
       expect(calls.length).toBe(5);
       expect(await (await conn.openTable('embed_cache')).countRows()).toBe(5);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 });

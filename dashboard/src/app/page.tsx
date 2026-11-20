@@ -66,17 +66,52 @@ function StatCard({
   title,
   value,
   subtitle,
+  detail,
+  valueClass = 'text-gray-900',
 }: {
   title: string;
   value: string | number;
   subtitle?: string;
+  detail?: string;
+  valueClass?: string;
 }) {
   return (
     <div className="bg-white rounded-lg shadow p-6">
       <h3 className="text-sm font-medium text-gray-500">{title}</h3>
-      <p className="mt-2 text-3xl font-semibold text-gray-900">{value}</p>
+      <p className={`mt-2 text-3xl font-semibold ${valueClass}`}>{value}</p>
       {subtitle && <p className="mt-1 text-sm text-gray-500">{subtitle}</p>}
+      {detail && <p className="mt-1 text-xs text-gray-400">{detail}</p>}
     </div>
+  );
+}
+
+const MIB = 1024 * 1024;
+const GUARD_SOURCE_LABEL: Record<string, string> = {
+  env: 'env', config: 'config', container: 'container default', default: 'default',
+};
+
+/** RSS against the RSS guard that restarts the process (src/utils/rssGuard.ts). */
+function MemoryUsageCard({ memory }: { memory: ServerStatus['memory'] }) {
+  const heapLine = `heap ${formatBytes(memory.used)} / ${formatBytes(memory.total)}`;
+  const g = memory.rssGuard;
+  if (!g || memory.rss == null) {
+    return <StatCard title="Memory Usage" value={`${memory.percentage.toFixed(1)}%`} subtitle={heapLine} />;
+  }
+  const basisLabel = g.basis === 'guard'
+    ? `guard (${GUARD_SOURCE_LABEL[g.guardSource] ?? g.guardSource})`
+    : g.basis === 'container' ? 'container limit (guard off)' : 'RAM (guard off)';
+  const valueClass = g.level === 'danger' ? 'text-red-600' : g.level === 'warn' ? 'text-amber-600' : 'text-gray-900';
+  const container = g.containerMb != null && g.containerLimitMb != null
+    ? ` · container ${formatBytes(g.containerMb * MIB)} / ${formatBytes(g.containerLimitMb * MIB)}`
+    : '';
+  return (
+    <StatCard
+      title="Memory Usage"
+      value={`${g.percentage.toFixed(1)}%`}
+      valueClass={valueClass}
+      subtitle={`RSS ${formatBytes(memory.rss)} of ${formatBytes(g.basisMb * MIB)} ${basisLabel}`}
+      detail={heapLine + container}
+    />
   );
 }
 
@@ -318,14 +353,7 @@ export default function Home() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatCard title="Uptime" value={formatUptime(status.uptime)} />
-        <StatCard
-          title="Memory Usage"
-          value={`${status.memory.percentage.toFixed(1)}%`}
-          subtitle={
-            `heap ${formatBytes(status.memory.used)} / ${formatBytes(status.memory.total)}` +
-            (status.memory.rss != null ? ` · RSS ${formatBytes(status.memory.rss)}` : '')
-          }
-        />
+        <MemoryUsageCard memory={status.memory} />
         <StatCard title="Docs Indexed" value={status.stats.docsIndexed} />
         <StatCard title="Active Sessions" value={status.stats.activeSessions} />
       </div>

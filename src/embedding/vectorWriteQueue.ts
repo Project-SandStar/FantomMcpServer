@@ -29,6 +29,8 @@
 /** table key → tail of that table's write chain. */
 const chains = new Map<string, Promise<unknown>>();
 const depths = new Map<string, number>();
+/** key → barrier epoch, bumped by every direct `enqueueWrite`. */
+const epochs = new Map<string, number>();
 
 export interface WriteQueueStats {
   table: string;
@@ -61,6 +63,25 @@ export function tableKey(table: unknown): string {
  * call order; a rejection does not poison the chain for later writers.
  */
 export function enqueueWrite<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  // A direct write is a barrier for the write buffer: rows buffered before
+  // it commit before it, rows buffered after it commit after it.
+  epochs.set(key, (epochs.get(key) ?? 0) + 1);
+  return enqueueOnChain(key, fn);
+}
+
+/**
+ * Current barrier epoch of `key`. The write buffer (vectorWriteBuffer.ts)
+ * tags each submission with it and drains one epoch per chain job.
+ */
+export function writeEpoch(key: string): number {
+  return epochs.get(key) ?? 0;
+}
+
+/**
+ * Put `fn` on `key`'s chain WITHOUT starting a new epoch. Only the write
+ * buffer's drain job uses this; everything else goes through `enqueueWrite`.
+ */
+export function enqueueOnChain<T>(key: string, fn: () => Promise<T>): Promise<T> {
   depths.set(key, (depths.get(key) ?? 0) + 1);
   const prior = chains.get(key) ?? Promise.resolve();
   // `.then(settle, settle)` so one failed write does not reject every write
@@ -82,4 +103,5 @@ export function enqueueTableWrite<T>(table: unknown, fn: () => Promise<T>): Prom
 export function __resetVectorWriteQueueForTest(): void {
   chains.clear();
   depths.clear();
+  epochs.clear();
 }

@@ -1,10 +1,10 @@
 /**
- * Validation of the OpenRouter config Fantom pushes to its own master slot.
+ * Validation of the OpenRouter config Fantom's direct client runs on.
  *
- * The point of validating before the push is that a bad config does not fail
- * loudly — the sidecar quietly falls back to local and logs a
- * misconfiguration, so the symptom is "cloud capacity never appears" days
- * later. Catching it in the form is much cheaper.
+ * A bad config does not fail loudly — a role quietly falls back to local, so
+ * the symptom is "cloud capacity never appears" days later. Catching it in
+ * the form is much cheaper. (The rlm-sandbox push payload is covered in
+ * sandboxSlots.test.ts.)
  */
 
 import { jest } from '@jest/globals';
@@ -18,13 +18,27 @@ jest.unstable_mockModule('../sidecars/soundsuiteMaster.js', () => ({
   pushConfigToSidecar: jest.fn(() => true),
   isSoundSuiteSidecarConnected: jest.fn(() => true),
 }));
+let CONFIG: any = {};
+const atomicWriteConfigFile = jest.fn((_p: string, c: any) => { CONFIG = c; });
 jest.unstable_mockModule('../config/index.js', () => ({
-  atomicWriteConfigFile: jest.fn(),
-  readConfigFileWithRecovery: jest.fn(() => ({})),
+  atomicWriteConfigFile,
+  readConfigFileWithRecovery: jest.fn(() => CONFIG),
 }));
 
-const { validateOpenRouterSettings, defaultOpenRouterSettings } =
+const { validateOpenRouterSettings, defaultOpenRouterSettings, getOpenRouterSettings, saveOpenRouterSettings } =
   await import('../sidecars/openRouterConfig.js');
+
+describe('models OpenRouter no longer serves', () => {
+  it('a stored retired code-assistant model reads as the new default, and a save does not keep it', () => {
+    CONFIG = { semanticSearch: { openRouter: { allowedModels: { 'code-assistant': { model: 'poolside/laguna-s-2.1' } } } } };
+    const s = getOpenRouterSettings();
+    expect(s.allowedModels['code-assistant']?.model).toBe('deepseek/deepseek-v4-flash');
+    saveOpenRouterSettings({ ...s, allowedModels: { 'code-assistant': { model: 'qwen/qwen3-coder-plus' } } });
+    expect(CONFIG.semanticSearch.openRouter.allowedModels['code-assistant'].model).toBe('deepseek/deepseek-v4-flash');
+    expect(validateOpenRouterSettings(getOpenRouterSettings(), { hasKey: true }).filter(i => i.role === 'code-assistant')).toEqual([]);
+    CONFIG = {};
+  });
+});
 
 describe('defaults', () => {
   const d = defaultOpenRouterSettings();
@@ -79,23 +93,23 @@ describe('defaults', () => {
 });
 
 describe('validation', () => {
-  it('requires a key on the very first push, because the sidecar ignores a keyless one', () => {
+  it('requires a key when any role may reach OpenRouter, since Fantom calls it itself', () => {
     const issues = validateOpenRouterSettings(defaultOpenRouterSettings(), { hasKey: false });
     expect(issues.some(i => /API key/i.test(i.message))).toBe(true);
   });
 
-  it('accepts a keyless re-push once a key has been pushed before', () => {
-    const s = { ...defaultOpenRouterSettings(), keyPushed: true };
-    expect(validateOpenRouterSettings(s, { hasKey: false })).toEqual([]);
+  it('needs no key when every role is local-only', () => {
+    const d = defaultOpenRouterSettings();
+    const modeByRole = Object.fromEntries(Object.keys(d.modeByRole).map(r => [r, 'local-only'])) as typeof d.modeByRole;
+    expect(validateOpenRouterSettings({ ...d, modeByRole }, { hasKey: false })).toEqual([]);
   });
 
   it('rejects an embedding role with no pinned upstream', () => {
     const s = {
       allowedModels: { 'code-embedding': { model: 'qwen/qwen3-embedding-4b', dims: 2560 } },
       modeByRole: { 'code-embedding': 'local-first' as const },
-      keyPushed: true,
     };
-    const issues = validateOpenRouterSettings(s, { hasKey: false });
+    const issues = validateOpenRouterSettings(s, { hasKey: true });
     expect(issues).toHaveLength(1);
     expect(issues[0].role).toBe('code-embedding');
     expect(issues[0].message).toMatch(/split the vector space/);
@@ -105,19 +119,18 @@ describe('validation', () => {
     const s = {
       allowedModels: { reranker: { model: 'qwen/qwen3-reranker-8b' } },
       modeByRole: { reranker: 'cloud-only' as const },
-      keyPushed: true,
     };
-    expect(validateOpenRouterSettings(s, { hasKey: false })).toEqual([]);
+    expect(validateOpenRouterSettings(s, { hasKey: true })).toEqual([]);
   });
 
   it('rejects a cloud-routable role with no model mapped', () => {
-    const s = { allowedModels: {}, modeByRole: { reranker: 'cloud-only' as const }, keyPushed: true };
-    const issues = validateOpenRouterSettings(s, { hasKey: false });
+    const s = { allowedModels: {}, modeByRole: { reranker: 'cloud-only' as const } };
+    const issues = validateOpenRouterSettings(s, { hasKey: true });
     expect(issues[0].message).toMatch(/no OpenRouter model is mapped/);
   });
 
   it('ignores a local-only role entirely — it never reaches OpenRouter', () => {
-    const s = { allowedModels: {}, modeByRole: { reranker: 'local-only' as const }, keyPushed: true };
+    const s = { allowedModels: {}, modeByRole: { reranker: 'local-only' as const } };
     expect(validateOpenRouterSettings(s, { hasKey: false })).toEqual([]);
   });
 
@@ -125,9 +138,8 @@ describe('validation', () => {
     const s = {
       allowedModels: { 'code-embedding': { model: 'm', provider: 'DeepInfra', dims: 1024 } },
       modeByRole: { 'code-embedding': 'local-first' as const },
-      keyPushed: true,
     };
-    const issues = validateOpenRouterSettings(s, { hasKey: false });
+    const issues = validateOpenRouterSettings(s, { hasKey: true });
     expect(issues.some(i => /1024d/.test(i.message) && /2560d/.test(i.message))).toBe(true);
   });
 });
@@ -140,9 +152,8 @@ describe('validation knows which roles own a vector space', () => {
     // it asked a chat model to pin an upstream so its vectors would not split,
     // for a role that produces no vectors.
     const issues = validateOpenRouterSettings({
-      allowedModels: { 'code-assistant': { model: 'poolside/laguna-s-2.1' } },
+      allowedModels: { 'code-assistant': { model: 'deepseek/deepseek-v4-flash' } },
       modeByRole: { 'code-assistant': 'cloud-only' },
-      keyPushed: true,
     } as any, { hasKey: true });
     expect(issues).toEqual([]);
   });
@@ -152,7 +163,6 @@ describe('validation knows which roles own a vector space', () => {
       const issues = validateOpenRouterSettings({
         allowedModels: { [role]: { model: 'qwen/qwen3-embedding-4b' } },
         modeByRole: { [role]: 'cloud-only' },
-        keyPushed: true,
       } as any, { hasKey: true });
       expect(issues.map(i => i.message).join(' ')).toMatch(/no pinned upstream provider/);
     }
@@ -162,7 +172,6 @@ describe('validation knows which roles own a vector space', () => {
     const issues = validateOpenRouterSettings({
       allowedModels: { reranker: { model: 'qwen/qwen3-reranker-8b' } },
       modeByRole: { reranker: 'cloud-only' },
-      keyPushed: true,
     } as any, { hasKey: true });
     expect(issues).toEqual([]);
   });
@@ -171,7 +180,6 @@ describe('validation knows which roles own a vector space', () => {
     const issues = validateOpenRouterSettings({
       allowedModels: { 'code-assistant': { model: 'qwen/qwen3-coder', dims: 999 } },
       modeByRole: { 'code-assistant': 'cloud-only' },
-      keyPushed: true,
     } as any, { hasKey: true });
     expect(issues).toEqual([]);
   });
@@ -190,18 +198,5 @@ describe('chat models stay out of the single-rate spend table', () => {
     expect(estimateSpendUsd('qwen/qwen3-coder', 10_000)).toBe(0);
     // The one-directional models are still priced exactly.
     expect(estimateSpendUsd('qwen/qwen3-embedding-4b', 1_000_000)).toBeCloseTo(0.02);
-  });
-});
-
-describe('push payload: a direct:<provider> RLM model never reaches the sidecar', () => {
-  it('pushes a real OpenRouter model as the rlm-sandbox fallback', async () => {
-    const { buildOpenRouterPushPayload } = await import('../sidecars/openRouterConfig.js');
-    const { DEFAULT_RLM_SANDBOX_MODEL } = await import('../sidecars/openRouterModels.js');
-    const s = { ...defaultOpenRouterSettings(), rlmSandboxModel: 'direct:gemini:gemini-3.8-flash' };
-    const { payload } = buildOpenRouterPushPayload(s);
-    const am = (payload.openrouter as any).allowedModels;
-    expect(am['rlm-sandbox']).toEqual({ model: DEFAULT_RLM_SANDBOX_MODEL });
-    const plain = buildOpenRouterPushPayload({ ...defaultOpenRouterSettings(), rlmSandboxModel: 'qwen/qwen3-coder' });
-    expect((plain.payload.openrouter as any).allowedModels['rlm-sandbox']).toEqual({ model: 'qwen/qwen3-coder' });
   });
 });

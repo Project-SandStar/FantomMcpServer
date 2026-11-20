@@ -38,6 +38,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { ladybugQuery } from './ladybugConnection.js';
+import { graphSetting } from './graphSettings.js';
 
 interface Entry {
   count: number;
@@ -195,7 +196,7 @@ export async function getProjectNodeCount(projectId: number): Promise<number> {
  *  are served without an open, so this is fast for unchanged projects. */
 export async function getProjectNodeCounts(
   projectIds: number[],
-  concurrency = 3,
+  concurrency = graphSetting('nodeCountConcurrency'),
 ): Promise<Map<number, number>> {
   loadSnapshot();
   const out = new Map<number, number>();

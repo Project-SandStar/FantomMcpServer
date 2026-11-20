@@ -405,8 +405,8 @@ export default function VectorViewerPage() {
     // "RLM search" off: fast retrieval-only answer (~20–40s). On: the same
     // full-budget RLM investigation the MCP tool runs (~60–120s); the ticker
     // and stage timings make the wait legible.
-    mutationFn: ({ query, projectId, versionGroup, rlm, rerank, askId }: { query: string; projectId?: number; versionGroup?: string[]; rlm: boolean; rerank: boolean; askId: string }) =>
-      api.ask({ query, projectId, versionGroup, fast: !rlm, rlm, rerank, askId }),
+    mutationFn: ({ query, projectId, versionGroup, rlm, rerank, askId, includeHits }: { query: string; projectId?: number; versionGroup?: string[]; rlm: boolean; rerank: boolean; askId: string; includeHits?: boolean }) =>
+      api.ask({ query, projectId, versionGroup, fast: !rlm, rlm, rerank, askId, includeHits }),
     onMutate: (vars) => {
       askStartedAt.current = performance.now(); setAskElapsedMs(0);
       setAskFeedId(vars.askId); setAskEvents([]); setThinkingOpen(true);
@@ -419,6 +419,14 @@ export default function VectorViewerPage() {
       }
     },
   });
+  // Answer mode runs ONE search: the ask's own retrieval, returned with
+  // includeHits. Firing /vectors/search next to it ran the same slow search
+  // twice concurrently. The list is the ask's hits (topK), so it is shorter
+  // than a plain search's 30.
+  const askHitsMode = mode === 'rlm' && source !== 'axon';
+  const searchView = askHitsMode
+    ? { data: askMutation.data?.hits ? { results: askMutation.data.hits } : undefined, isPending: askMutation.isPending }
+    : { data: searchMutation.data, isPending: searchMutation.isPending };
   // Popup for a provider problem (e.g. Gemini out of credits). Shown once per
   // ask: from the live feed if a warning arrives early, else from the result.
   const [providerAlert, setProviderAlert] = useState<ProviderWarning[]>([]);
@@ -518,20 +526,23 @@ export default function VectorViewerPage() {
       // Always run vector search so the scatter/list stay populated and
       // citations can resolve to a selectable result.
       const versionGroup = selectedProject || selectedGroups.length === 0 ? undefined : selectedGroups;
-      searchMutation.mutate({
-        query: searchQuery,
-        projectId: selectedProject ?? undefined,
-        versionGroup,
-        rerank: rerankOn,
-      });
-      // In Answer mode, also synthesize a cited answer.
-      if (mode === 'rlm') {
+      // Search mode: plain vector search. Answer mode: the ask returns its
+      // own hits for the list, so the search runs once.
+      if (mode !== 'rlm') {
+        searchMutation.mutate({
+          query: searchQuery,
+          projectId: selectedProject ?? undefined,
+          versionGroup,
+          rerank: rerankOn,
+        });
+      } else {
         askMutation.mutate({
           query: searchQuery,
           projectId: selectedProject ?? undefined,
           versionGroup,
           rlm: rlmDeep,
           rerank: rerankOn,
+          includeHits: true,
           askId: (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64),
         });
       }
@@ -607,25 +618,25 @@ export default function VectorViewerPage() {
   }, [handleProjectSelect]);
 
   const handleCitationClick = useCallback((nodeId: string) => {
-    const match = searchMutation.data?.results.find(r => r.nodeId === nodeId);
+    const match = searchView.data?.results.find(r => r.nodeId === nodeId);
     if (match) {
       setSelectedResult(match);
       if (typeof document !== 'undefined') {
         document.getElementById(`result-${nodeId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     }
-  }, [searchMutation.data?.results]);
+  }, [searchView.data?.results]);
 
   const handlePointClick = useCallback((point: VectorPoint) => {
     // Find matching result if in search mode
-    const match = searchMutation.data?.results.find(r => r.nodeId === point.id);
+    const match = searchView.data?.results.find(r => r.nodeId === point.id);
     if (match) {
       setSelectedResult(match);
     }
-  }, [searchMutation.data?.results]);
+  }, [searchView.data?.results]);
 
   // Convert search results to vector points for scatter plot
-  const searchPoints: VectorPoint[] = searchMutation.data?.results.map((r, i) => ({
+  const searchPoints: VectorPoint[] = searchView.data?.results.map((r, i) => ({
     id: r.nodeId,
     name: r.name,
     qualifiedName: r.qualifiedName,
@@ -939,10 +950,10 @@ export default function VectorViewerPage() {
                 )}
                 <button
                   onClick={handleSearch}
-                  disabled={!searchQuery.trim() || searchMutation.isPending || askMutation.isPending || axonSearchMutation.isPending}
+                  disabled={!searchQuery.trim() || searchView.isPending || askMutation.isPending || axonSearchMutation.isPending}
                   className="px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 transition-colors"
                 >
-                  {searchMutation.isPending || askMutation.isPending || axonSearchMutation.isPending ? 'Searching...' : 'Search'}
+                  {searchView.isPending || askMutation.isPending || axonSearchMutation.isPending ? 'Searching...' : 'Search'}
                 </button>
               </div>
             </div>
@@ -1028,6 +1039,39 @@ export default function VectorViewerPage() {
                   {askMutation.isPending && <span className="font-mono text-gray-400">{(askElapsedMs / 1000).toFixed(1)}s</span>}
                   <span className="text-xs text-gray-400">{askEvents.filter(e => e.kind === 'ask').length} question{askEvents.filter(e => e.kind === 'ask').length === 1 ? '' : 's'} · {thinkingOpen ? 'hide' : 'show'}</span>
                 </button>
+                {thinkingOpen && (() => {
+                  // Settings line + one row per stage: what ran, what was
+                  // skipped and why. From the live feed while running; the
+                  // final result fills in when the feed was not available.
+                  const settings = askEvents.find(e => e.kind === 'settings')?.text ?? askMutation.data?.settingsLine;
+                  const steps = askEvents.some(e => e.kind === 'step')
+                    ? askEvents.filter(e => e.kind === 'step').map(e => ({ stage: e.detail ?? '', status: e.status ?? 'ran', reason: e.text, ms: e.ms }))
+                    : (askMutation.data?.stages ?? []);
+                  if (!settings && steps.length === 0) return null;
+                  const label: Record<string, string> = { search: 'Search', jev: 'Jev route gate', 'fantom-rlm': 'Fantom RLM', sandbox: 'ss-rlm-sandbox', answer: 'Answer' };
+                  const mark = (st: string) => st === 'ran' ? { c: '✓', cls: 'text-emerald-700' } : st === 'failed' ? { c: '✗', cls: 'text-red-700' } : { c: '–', cls: 'text-gray-500' };
+                  return (
+                    <div className="mt-2 rounded border border-gray-200 bg-white p-2 text-xs break-words">
+                      {settings && <div className="text-gray-500 mb-1"><span className="font-medium text-gray-700">Settings:</span> {settings}</div>}
+                      {steps.length > 0 && (
+                        <ul className="space-y-0.5">
+                          {steps.map((st, i) => {
+                            const m = mark(st.status);
+                            return (
+                              <li key={i} className="flex gap-1.5 min-w-0">
+                                <span className={`${m.cls} w-3 shrink-0 text-center`} title={st.status}>{m.c}</span>
+                                <span className="min-w-0"><span className="font-medium text-gray-700">{label[st.stage] ?? st.stage}</span>
+                                  <span className="text-gray-600"> — {st.reason}</span>
+                                  {st.ms !== undefined && <span className="text-gray-400 font-mono"> {(st.ms / 1000).toFixed(1)}s</span>}
+                                </span>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
+                    </div>
+                  );
+                })()}
                 {thinkingOpen && (
                   <ol className="mt-2 max-h-72 overflow-y-auto rounded border border-gray-100 bg-gray-50 p-2 space-y-1 text-xs font-mono">
                     {askEvents.length === 0 && <li className="text-gray-400">waiting for the first step…</li>}
@@ -1047,7 +1091,7 @@ export default function VectorViewerPage() {
                           </li>
                         );
                       }
-                      if (e.kind === 'answer') return null;
+                      if (e.kind === 'answer' || e.kind === 'step' || e.kind === 'settings') return null;
                       if (e.kind === 'plan') return (
                         <li key={e.seq} className="text-gray-700"><span className="text-gray-400">{t}</span> <span className="text-blue-700">plan</span> {e.text}
                           {e.items && e.items.length > 0 && <ul className="pl-10 list-disc text-gray-500">{e.items.map((it, i) => <li key={i}>{it}</li>)}</ul>}
@@ -1076,7 +1120,7 @@ export default function VectorViewerPage() {
                     <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Sources</h4>
                     <ol className="space-y-1">
                       {askMutation.data.citations.map((c, i) => {
-                        const inResults = !!searchMutation.data?.results.find(r => r.nodeId === c.nodeId);
+                        const inResults = !!searchView.data?.results.find(r => r.nodeId === c.nodeId);
                         return (
                           <li key={`${c.nodeId}-${i}`}>
                             <button
@@ -1110,7 +1154,7 @@ export default function VectorViewerPage() {
         {/* Scatter Plot */}
         <div className="lg:col-span-2 bg-white rounded-lg shadow overflow-hidden">
           {viewMode === 'search' ? (
-            searchMutation.isPending ? (
+            searchView.isPending ? (
               <ScatterLoading />
             ) : (
               <VectorScatter
@@ -1144,13 +1188,13 @@ export default function VectorViewerPage() {
             </h3>
             <p className="text-xs text-gray-500 mt-1">
               {viewMode === 'search'
-                ? `${searchMutation.data?.results.length || 0} results`
+                ? `${searchView.data?.results.length || 0} results`
                 : `${projectVectors?.nodes.length || 0} nodes with embeddings${projectVectors?.loadMs !== undefined ? ` · loaded in ${projectVectors.loadMs} ms` : ''}`}
             </p>
           </div>
 
           <div className="max-h-96 overflow-y-auto">
-            {viewMode === 'search' && searchMutation.data?.results.map((result) => (
+            {viewMode === 'search' && searchView.data?.results.map((result) => (
               <button
                 key={result.nodeId}
                 id={`result-${result.nodeId}`}
@@ -1208,7 +1252,7 @@ export default function VectorViewerPage() {
               </div>
             ))}
 
-            {viewMode === 'search' && !searchMutation.data?.results.length && !searchMutation.isPending && (
+            {viewMode === 'search' && !searchView.data?.results.length && !searchView.isPending && (
               <div className="p-8 text-center text-gray-500">
                 <p>Enter a query to search</p>
               </div>

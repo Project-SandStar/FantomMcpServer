@@ -35,6 +35,17 @@ export interface ServerStatus {
     heapTotal?: number;  // V8's currently reserved heap
     rss?: number;        // resident set size — what the OS kills on
     external?: number;
+    /** RSS vs the RSS guard (src/utils/rssGuard.ts), for the Memory Usage card. */
+    rssGuard?: {
+      percentage: number;
+      basisMb: number;
+      basis: 'guard' | 'container' | 'ram';
+      guardMb: number;
+      guardSource: 'env' | 'config' | 'container' | 'default';
+      level: 'ok' | 'warn' | 'danger';
+      containerMb: number | null;
+      containerLimitMb: number | null;
+    };
   };
   initialized: boolean;
   version: string;
@@ -172,50 +183,20 @@ export interface FantomSettings {
      *  against another. Naming the reference makes the verdict reproducible;
      *  unset falls back to the first available local provider. */
     verificationReferenceSidecar?: string;
-    /** OpenRouter-backed "virtual containers" — cloud capacity a Sound Suite
-     *  sidecar (2.4.2+) can serve for a role instead of its local model.
-     *  Fantom sees each as a separate provider `<PCName>-OR-<Role>`. */
-    virtualContainers?: {
-      /** Master switch. Default true; discovery finds nothing when the
-       *  sidecar has no OpenRouter config for Fantom's master slot. */
-      enabled?: boolean;
-      /** Restrict to these PCNames (`.local` optional). Empty = all. */
-      allowList?: string[];
-      /** Locally declared rows, used only while the sidecar side has not
-       *  been configured. Embedding rows still face the compatibility gate. */
-      declared?: Array<{
-        sidecar: string;
-        role: 'embedding' | 'code-embedding' | 'reranker';
-        model: string;
-        provider?: string;
-        dims?: number;
-        mode?: 'local-only' | 'local-first' | 'cloud-only';
-      }>;
-      /** Fantom's serverUrl as the sidecar records it, when matching on the
-       *  master wsPort is not enough to identify our slot. */
-      masterServerUrl?: string;
-      pollIntervalMs?: number;
-      /** Rerank model Fantom prefers. Default `qwen/qwen3-reranker-8b`,
-       *  which the Sound Suite master slot already pins here and is the only
-       *  reranker size on OpenRouter with a provider serving it. The
-       *  sidecar's per-master allow-list stays authoritative; this is what we
-       *  ask for. */
-      rerankModel?: string;
-      /** Send the preferred model as a hard requirement, so a sidecar
-       *  allow-listing a different one refuses instead of substituting. */
-      strictRerankModel?: boolean;
-      /** In-flight depth per OR embedding provider (OpenRouter rate limits
-       *  are per-account, not per-host). Default 8. */
-      embedMaxInFlight?: number;
-    };
-    /** What Fantom pushes to the fleet as its own OpenRouter config. Never
-     *  contains the API key — see src/sidecars/openRouterConfig.ts. */
+    /** Removed 2026-11-19 (Fantom calls OpenRouter itself); dropped on the
+     *  next OpenRouter save. Typed only so old config files still read. */
+    virtualContainers?: Record<string, unknown>;
+    /** Fantom's own OpenRouter settings. Never contains the API key (that is
+     *  in the secrets store) — see src/sidecars/openRouterConfig.ts. */
     openRouter?: {
       allowedModels?: Record<string, { model: string; provider?: string; dims?: number; note?: string }>;
       modeByRole?: Record<string, 'local-only' | 'local-first' | 'cloud-only'>;
-      keyPushed?: boolean;
-      lastPushedAt?: string;
-      lastPushedTo?: string[];
+      workerCount?: number;
+      interactiveSlots?: number;
+      requestTimeoutMs?: number;
+      maxPendingRows?: number;
+      writeBatchRows?: number;
+      masterServerUrl?: string;
     };
     llmReranker?: {
       enabled: boolean;

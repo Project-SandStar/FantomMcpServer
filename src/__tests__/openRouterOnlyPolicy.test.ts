@@ -1,6 +1,6 @@
 /**
  * "OpenRouter only" end to end on the Fantom side: it round-trips through
- * save/push as `cloud-only` on the wire, it takes the GPUs out of the embed
+ * save as `cloud-only`, it takes the GPUs out of the embed
  * fan-out, and — the part that makes it more than a label — it moves the QUERY
  * encoder to the cloud pool and refuses to quietly fall back to a local one.
  *
@@ -36,12 +36,6 @@ jest.unstable_mockModule('fs', () => {
       (String(p).endsWith('fantomMcpServer-config.json') ? JSON.stringify(CONFIG) : real.readFileSync(p, enc)),
   };
 });
-
-const pushConfigToSidecar = jest.fn(() => true);
-jest.unstable_mockModule('../sidecars/soundsuiteMaster.js', () => ({
-  pushConfigToSidecar,
-  isSoundSuiteSidecarConnected: jest.fn(() => true),
-}));
 
 // ── the local fleet ────────────────────────────────────────────────────────
 const LOCAL_SIDECAR = {
@@ -91,32 +85,30 @@ jest.unstable_mockModule('../embedding/embeddingService.js', () => ({
   })),
 }));
 
-// ── the cloud fleet ────────────────────────────────────────────────────────
+// ── the cloud side: Fantom's own OpenRouter client ─────────────────────────
+// No sidecar is involved any more: one DirectOpenRouterEmbeddingProvider per
+// role, named Fantom-OR-<Role>, gated against rows already in the table.
 const DIMS = 2560;
-const OR_A = {
-  sidecarId: 'sc-local-1', sidecarName: 'BASWS35', providerName: 'BASWS35-OR-CodeEmbedding',
-  role: 'code-embedding' as const, model: 'qwen/qwen3-embedding-4b', upstreamProvider: 'DeepInfra',
-  dims: DIMS, mode: 'cloud-only' as const, source: 'sidecar' as const,
-};
-const OR_B = { ...OR_A, sidecarId: 'sc-local-2', sidecarName: 'BASWS40', providerName: 'BASWS40-OR-CodeEmbedding' };
-/** The docs half of the fleet — same model, the `embedding` role. */
-const OR_DOCS_A = { ...OR_A, role: 'embedding' as const, providerName: 'BASWS35-OR-Embedding' };
-const OR_DOCS_B = { ...OR_B, role: 'embedding' as const, providerName: 'BASWS40-OR-Embedding' };
+const CODE_NAME = 'Fantom-OR-CodeEmbedding';
+const DOCS_NAME = 'Fantom-OR-Embedding';
+const FAKE_KEY = 'sk-or-v1-FAKEKEY1234567890';
 
-let VIRTUAL_ROWS: any[] = [];
-let OR_ENABLED = true;
-jest.unstable_mockModule('../sidecars/virtualContainers.js', () => ({
-  // Role-aware on purpose. While this ignored its argument, a caller asking
-  // for the WRONG role still got rows back, so nothing could catch the docs
-  // path looking up 'code-embedding' containers — which is exactly what it
-  // did before the docs cloud path was wired.
-  listVirtualContainers: jest.fn((role?: string) =>
-    role ? VIRTUAL_ROWS.filter(r => r.role === role) : VIRTUAL_ROWS),
-  listAllVirtualContainers: jest.fn(() => VIRTUAL_ROWS),
-  getVirtualContainersConfig: jest.fn(() => ({ enabled: OR_ENABLED, embedMaxInFlight: 8 })),
-  DEFAULT_OR_EMBED_MAX_IN_FLIGHT: 8,
-  DEFAULT_OR_RERANK_MODEL: 'qwen/qwen3-reranker-8b',
-  VIRTUAL_ROLES: ['embedding', 'code-embedding', 'reranker', 'code-assistant'],
+// The key store must not read this machine's real secrets file.
+jest.unstable_mockModule('../config/secretsStore.js', () => ({
+  SECRET_NAMES: ['FANTOM_OPENROUTER_API_KEY'],
+  readStoredSecret: jest.fn(() => null),
+  secretSource: jest.fn(() => (process.env.FANTOM_OPENROUTER_API_KEY ? 'env' : null)),
+  storeSecret: jest.fn(),
+  deleteStoredSecret: jest.fn(() => false),
+  applyStoredSecretsToEnv: jest.fn(() => []),
+  __resetSecretsStoreForTest: jest.fn(),
+}));
+
+/** Rows "already in the table" that the stored-ref gate compares against. */
+let STORED_ROWS: Array<{ text: string; vector: Float32Array }> = [];
+jest.unstable_mockModule('../openrouter/storedSample.js', () => ({
+  sampleStoredRows: jest.fn(async () => STORED_ROWS),
+  __clearStoredSampleCache: jest.fn(),
 }));
 
 /** Deterministic unit-ish vector, stable per seed. */
@@ -126,40 +118,29 @@ function vec(seed: number, dims = DIMS): number[] {
   for (let i = 0; i < dims; i++) { s = (s * 48271) % 2147483647; out.push(s / 2147483647 - 0.5); }
   return out;
 }
-/** Every cloud provider returns the SAME vectors — they agree with each other. */
+const seedOf = (t: string) => [...t].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 100_003, 7);
+
 let cloudDims = DIMS;
-const virtualEmbed = jest.fn(async (_vc: any, texts: string[]) => ({
-  source: 'openrouter', embeddings: texts.map((_, i) => vec(i + 1, cloudDims)), dims: cloudDims,
-}));
-jest.unstable_mockModule('../sidecars/virtualInferenceClient.js', () => ({
-  virtualEmbed,
-  virtualRerank: jest.fn(),
-  VirtualInferenceUnavailable: class extends Error {},
-}));
+const orCalls: Array<{ url: string; body: any }> = [];
 
-jest.unstable_mockModule('../embedding/providers/cloudBudget.js', () => ({
-  withCloudPermit: jest.fn((fn: any) => fn()),
-}));
-jest.unstable_mockModule('../sidecars/openRouterActivity.js', () => ({
-  noteCallStarted: jest.fn(), noteCallFinished: jest.fn(), isRoleCapped: jest.fn(() => false),
-}));
-
-const { pushOpenRouterConfig, getOpenRouterSettings } = await import('../sidecars/openRouterConfig.js');
+const { __setOpenRouterFetchForTest } = await import('../openrouter/http.js');
+const { __resetOpenRouterPoolForTest } = await import('../openrouter/workerPool.js');
+const { getOpenRouterSettings } = await import('../sidecars/openRouterConfig.js');
 const {
   selectAllEmbeddingProvidersWithCloud, selectQueryEmbeddingProvider,
   embeddingRoutingPolicy, CloudOnlyUnavailableError,
 } = await import('../embedding/providers/embeddingProvider.js');
 const { __resetVectorCompatibilityForTest } = await import('../embedding/providers/vectorCompatibility.js');
-const { __resetVirtualEmbeddingGatesForTest } = await import('../embedding/providers/virtualEmbeddingProvider.js');
 
 const nameOf = (p: any): string => p.getSidecarName?.() ?? 'in-process';
 
 function setPolicy(policy: string): void {
+  const m = { model: 'qwen/qwen3-embedding-4b', provider: 'DeepInfra', dims: DIMS };
   CONFIG = {
     semanticSearch: {
       codeDimensions: DIMS,
       openRouter: {
-        allowedModels: { 'code-embedding': { model: 'qwen/qwen3-embedding-4b', provider: 'DeepInfra', dims: DIMS } },
+        allowedModels: { 'code-embedding': m, embedding: m },
         policyByRole: { 'code-embedding': policy, embedding: policy, reranker: 'backup', 'code-assistant': 'backup' },
       },
     },
@@ -169,37 +150,49 @@ function setPolicy(policy: string): void {
 beforeEach(() => {
   CONFIG = {};
   LOCAL_SIDECARS = [LOCAL_SIDECAR];
-  VIRTUAL_ROWS = [];
-  OR_ENABLED = true;
+  STORED_ROWS = [];
   cloudDims = DIMS;
-  virtualEmbed.mockClear();
-  pushConfigToSidecar.mockClear();
+  orCalls.length = 0;
+  process.env.FANTOM_OPENROUTER_API_KEY = FAKE_KEY;
+  __setOpenRouterFetchForTest(async (url, init) => {
+    const body = JSON.parse(init.body ?? '{}');
+    orCalls.push({ url, body });
+    const data = (body.input as string[]).map((t, index) => ({ index, embedding: vec(seedOf(t), cloudDims) }));
+    const text = JSON.stringify({ data, model: body.model, usage: { total_tokens: 10 } });
+    return {
+      ok: true, status: 200, headers: { get: () => null },
+      text: async () => text,
+      arrayBuffer: async () => new TextEncoder().encode(text).buffer as ArrayBuffer,
+    };
+  });
+  __resetOpenRouterPoolForTest();
   __resetVectorCompatibilityForTest();
-  __resetVirtualEmbeddingGatesForTest();
   jest.spyOn(console, 'log').mockImplementation(() => {});
   jest.spyOn(console, 'error').mockImplementation(() => {});
+  jest.spyOn(console, 'warn').mockImplementation(() => {});
 });
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => {
+  jest.restoreAllMocks();
+  __setOpenRouterFetchForTest(null);
+  delete process.env.FANTOM_OPENROUTER_API_KEY;
+});
 
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('the policy round-trips through save/push', () => {
-  it('stores "cloud" and puts cloud-only on the wire', () => {
-    pushOpenRouterConfig({
+describe('the policy round-trips through save', () => {
+  it('stores "cloud" and derives cloud-only for the role', async () => {
+    const { saveOpenRouterSettings } = await import('../sidecars/openRouterConfig.js');
+    saveOpenRouterSettings({
       allowedModels: { 'code-embedding': { model: 'qwen/qwen3-embedding-4b', provider: 'DeepInfra', dims: DIMS } },
       policyByRole: { 'code-embedding': 'cloud' },
       modeByRole: {},
-    } as any, 'sk-or-v1-test498a');
-
+    } as any);
     const stored = getOpenRouterSettings();
     expect(stored.policyByRole!['code-embedding']).toBe('cloud');
-    // modeByRole is DERIVED on every read and push, so the two cannot drift.
+    // modeByRole is DERIVED on every read, so the two cannot drift.
     expect(stored.modeByRole['code-embedding']).toBe('cloud-only');
-
-    const payload = (pushConfigToSidecar.mock.calls[0] as any[])[1];
-    expect(payload.openrouter.modeByRole['code-embedding']).toBe('cloud-only');
-    // The operator vocabulary never reaches the sidecar.
-    expect(JSON.stringify(payload)).not.toContain('"cloud"');
+    // The key never lands in the config file.
+    expect(JSON.stringify(CONFIG)).not.toContain('sk-or-');
   });
 
   it('survives a reload, and the other roles keep their own policies', () => {
@@ -208,74 +201,91 @@ describe('the policy round-trips through save/push', () => {
     const s = getOpenRouterSettings();
     expect(s.policyByRole!['code-embedding']).toBe('cloud');
     expect(s.policyByRole!.reranker).toBe('backup');
-    expect(s.modeByRole.reranker).toBe('cloud-only');
   });
 });
 
 describe('the fan-out under "OpenRouter only"', () => {
   it('contains NO local provider', async () => {
     setPolicy('cloud');
-    VIRTUAL_ROWS = [OR_A, OR_B];
-
     const pool = await selectAllEmbeddingProvidersWithCloud('code', 'qwen3-embedding:4b');
-    expect(pool.length).toBe(2);
-    expect(pool.map(nameOf).sort()).toEqual([OR_A.providerName, OR_B.providerName]);
+    expect(pool.map(nameOf)).toEqual([CODE_NAME]);
     // The local sidecar is registered, healthy, and serving the right model —
     // it is excluded by POLICY, not by being unavailable.
     expect(pool.map(nameOf)).not.toContain('BASWS35');
     expect((await embeddingRoutingPolicy('code')).localServes).toBe(false);
   });
 
-  it('throws a NAMED reason rather than handing back the GPUs when no cloud provider is cleared', async () => {
+  it('throws a NAMED reason rather than handing back the GPUs when no model is set', async () => {
     setPolicy('cloud');
-    VIRTUAL_ROWS = [];
+    CONFIG.semanticSearch.openRouter.allowedModels = {};
     await expect(selectAllEmbeddingProvidersWithCloud('code')).rejects.toThrow(CloudOnlyUnavailableError);
     await expect(selectAllEmbeddingProvidersWithCloud('code'))
       .rejects.toMatchObject({ reason: 'no-cloud-provider-discovered' });
   });
 
-  it('names OpenRouter being switched off separately from nothing being discovered', async () => {
+  it('names a missing key separately from a missing model', async () => {
     setPolicy('cloud');
-    OR_ENABLED = false;
-    VIRTUAL_ROWS = [OR_A];
+    delete process.env.FANTOM_OPENROUTER_API_KEY;
     await expect(selectAllEmbeddingProvidersWithCloud('code'))
       .rejects.toMatchObject({ reason: 'openrouter-disabled' });
+    expect(orCalls).toHaveLength(0);
   });
 
-  it('excludes a cloud provider that fails the gate, and says the pool is unverified', async () => {
+  it('refuses a provider that returns the wrong width, and says the pool is unverified', async () => {
     setPolicy('cloud');
-    VIRTUAL_ROWS = [OR_A];
     cloudDims = 1024; // wrong width for the 2560d table — mandatory under every regime
     await expect(selectAllEmbeddingProvidersWithCloud('code'))
       .rejects.toMatchObject({ reason: 'no-cloud-provider-verified' });
+  });
+
+  it('refuses a provider that does not reproduce the rows already stored', async () => {
+    setPolicy('cloud');
+    STORED_ROWS = [
+      { text: 'alpha', vector: Float32Array.from(vec(999)) },
+      { text: 'beta', vector: Float32Array.from(vec(998)) },
+    ];
+    await expect(selectAllEmbeddingProvidersWithCloud('code'))
+      .rejects.toMatchObject({ reason: 'no-cloud-provider-verified' });
+    // The probe used the stored rows' own texts.
+    expect(orCalls[0].body.input).toEqual(['alpha', 'beta']);
+  });
+
+  it('clears a provider that reproduces the stored rows', async () => {
+    setPolicy('cloud');
+    STORED_ROWS = ['alpha', 'beta'].map(t => ({ text: t, vector: Float32Array.from(vec(seedOf(t))) }));
+    const pool = await selectAllEmbeddingProvidersWithCloud('code');
+    expect(pool.map(nameOf)).toEqual([CODE_NAME]);
+  });
+
+  it('pins the upstream on every embed call', async () => {
+    setPolicy('cloud');
+    const [p] = await selectAllEmbeddingProvidersWithCloud('code');
+    await p.embedBatch(['x', 'y']);
+    for (const c of orCalls) expect(c.body.provider).toEqual({ order: ['DeepInfra'], allow_fallbacks: false });
   });
 });
 
 describe('the other three policies are unchanged', () => {
   it('keeps the local providers in the pool under aggregate', async () => {
     setPolicy('aggregate');
-    VIRTUAL_ROWS = [];
     const pool = await selectAllEmbeddingProvidersWithCloud('code', 'qwen3-embedding:4b');
     expect(pool.map(nameOf)).toContain('BASWS35');
   });
 
   it('keeps them under backup, and leaves cloud out of the fan-out', async () => {
     setPolicy('backup');
-    VIRTUAL_ROWS = [OR_A, OR_B];
     const pool = await selectAllEmbeddingProvidersWithCloud('code', 'qwen3-embedding:4b');
     expect(pool.map(nameOf)).toEqual(['BASWS35']);
   });
 
   it('keeps them under local, with cloud excluded outright', async () => {
     setPolicy('local');
-    VIRTUAL_ROWS = [OR_A, OR_B];
     const pool = await selectAllEmbeddingProvidersWithCloud('code', 'qwen3-embedding:4b');
     expect(pool.map(nameOf)).toEqual(['BASWS35']);
   });
 
-  it('never throws CloudOnlyUnavailableError for them, however empty the cloud pool is', async () => {
-    VIRTUAL_ROWS = [];
-    OR_ENABLED = false;
+  it('never throws CloudOnlyUnavailableError for them, however empty the cloud side is', async () => {
+    delete process.env.FANTOM_OPENROUTER_API_KEY;
     for (const p of ['aggregate', 'backup', 'local']) {
       setPolicy(p);
       await expect(selectAllEmbeddingProvidersWithCloud('code', 'qwen3-embedding:4b')).resolves.toBeDefined();
@@ -286,23 +296,20 @@ describe('the other three policies are unchanged', () => {
 describe('the query encoder follows the corpus', () => {
   it('is a CLOUD provider under "OpenRouter only"', async () => {
     setPolicy('cloud');
-    VIRTUAL_ROWS = [OR_B, OR_A];
     const enc = await selectQueryEmbeddingProvider('code');
-    // Anchor first: the provider the others were measured against, so it is
-    // the closest thing to "the one the corpus agrees with".
-    expect(nameOf(enc)).toBe(OR_A.providerName);
+    expect(nameOf(enc)).toBe(CODE_NAME);
     expect((enc as any).isVirtual).toBe(true);
   });
 
   it('actually embeds the query through the cloud route', async () => {
     setPolicy('cloud');
-    VIRTUAL_ROWS = [OR_A];
     const enc = await selectQueryEmbeddingProvider('code');
-    virtualEmbed.mockClear();
+    orCalls.length = 0;
     const v = await enc.embed('load a trio file from sax');
     expect(v).toHaveLength(DIMS);
-    expect(virtualEmbed).toHaveBeenCalledTimes(1);
-    expect((virtualEmbed.mock.calls[0] as any[])[0].providerName).toBe(OR_A.providerName);
+    expect(orCalls).toHaveLength(1);
+    expect(orCalls[0].url).toBe('https://openrouter.ai/api/v1/embeddings');
+    expect(orCalls[0].body.input).toEqual(['load a trio file from sax']);
   });
 
   it('FAILS with a named reason rather than silently encoding locally', async () => {
@@ -310,7 +317,7 @@ describe('the query encoder follows the corpus', () => {
     // wrong — it returns a 0.976-cosine query vector against a cloud-built
     // index and ranks the results subtly, permanently wrong.
     setPolicy('cloud');
-    VIRTUAL_ROWS = [];
+    CONFIG.semanticSearch.openRouter.allowedModels = {};
     let thrown: any;
     try { await selectQueryEmbeddingProvider('code'); } catch (e) { thrown = e; }
     expect(thrown).toBeInstanceOf(CloudOnlyUnavailableError);
@@ -322,63 +329,45 @@ describe('the query encoder follows the corpus', () => {
     expect(thrown.message).toMatch(/0\.976/);
   });
 
-  it('fails when the cloud providers exist but none passed the gate', async () => {
+  it('fails when the provider exists but did not pass the gate', async () => {
     setPolicy('cloud');
-    VIRTUAL_ROWS = [OR_A];
     cloudDims = 1024;
     await expect(selectQueryEmbeddingProvider('code'))
       .rejects.toMatchObject({ reason: 'no-cloud-provider-verified' });
   });
 
   it('refuses DOCS on cloud while the table width does not match the model', async () => {
-    // The live shape: docs_vectors is 1024d (qwen3-embedding:0.6b) and every
-    // hosted model is 1536d or wider. LanceDB locks the vector column at
-    // creation, so no cloud provider can write into that table at all.
-    //
-    // This must be its OWN reason, not "nothing passed the gate". The two need
-    // opposite actions — rebuild the table, versus investigate a provider —
-    // and reporting a width mismatch as a verification failure sends the
-    // operator looking for a fault in a provider that is working correctly.
+    // docs_vectors at 1024d against a 2560d hosted model. This must be its OWN
+    // reason, not "nothing passed the gate": the two need opposite actions —
+    // rebuild the table, versus investigate a provider.
     setPolicy('cloud');
     CONFIG.semanticSearch.docsDimensions = 1024;
-    VIRTUAL_ROWS = [OR_A, OR_B, OR_DOCS_A, OR_DOCS_B];
     await expect(selectQueryEmbeddingProvider('docs'))
       .rejects.toMatchObject({ reason: 'cloud-width-mismatch' });
-    // And it must NOT quietly hand back a local encoder, which is the whole
-    // point of the policy's failure mode.
+    expect(orCalls).toHaveLength(0);
+    // And it must NOT quietly hand back a local encoder.
     expect((await embeddingRoutingPolicy('docs')).localServes).toBe(false);
   });
 
   it('serves DOCS from cloud once the docs table matches the model width', async () => {
-    // The same policy on a table rebuilt at the model's width. This is what
-    // the option exists to enable, so it has to be reachable — a policy that
-    // can only ever throw is the inert setting under a different name.
     setPolicy('cloud');
     CONFIG.semanticSearch.docsDimensions = DIMS;
-    VIRTUAL_ROWS = [OR_A, OR_B, OR_DOCS_A, OR_DOCS_B];
     const enc = await selectQueryEmbeddingProvider('docs');
     expect((enc as any).isVirtual).toBe(true);
-    // The DOCS containers, not the code ones that share the fleet and the
-    // model slug. The provider NAME is what distinguishes them — both roles
-    // run `qwen/qwen3-embedding-4b` on the same hosts, so the model and the
-    // sidecar prove nothing here and the suffix is the only witness that the
-    // right role was looked up.
-    expect(nameOf(enc)).toBe('BASWS35-OR-Embedding');
+    // The DOCS role, not the code one that shares the model slug.
+    expect(nameOf(enc)).toBe(DOCS_NAME);
   });
 
   it('leaves DOCS local under the other three policies', async () => {
-    CONFIG = {};
     for (const p of ['aggregate', 'backup', 'local']) {
       setPolicy(p);
       CONFIG.semanticSearch.docsDimensions = DIMS;
-      VIRTUAL_ROWS = [OR_DOCS_A, OR_DOCS_B];
       const enc = await selectQueryEmbeddingProvider('docs');
       expect((enc as any).isVirtual).toBeUndefined();
     }
   });
 
   it('stays LOCAL under the other three policies — nothing about them changes', async () => {
-    VIRTUAL_ROWS = [OR_A, OR_B];
     for (const p of ['aggregate', 'backup', 'local']) {
       setPolicy(p);
       const enc = await selectQueryEmbeddingProvider('code');

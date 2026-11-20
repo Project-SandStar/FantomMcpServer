@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type ShadowStateResponse, type VectorStatsResponse } from '@/lib/api';
+import { groupFleetSplit, groupServedBy, isCloudProvider, isFailover, providerLabel } from '@/lib/embeddingProviderLabels';
 import { formatRelative, formatRunAnchor } from '@/lib/time';
 
 /**
@@ -95,9 +96,9 @@ function PendingShadowBanner({
       {split.length > 0 && (
         <div className="px-6 py-2 border-b border-gray-200 text-xs text-gray-600 flex flex-wrap gap-x-4 gap-y-1">
           <span className="font-medium text-gray-700">Fan-out:</span>
-          {split.map(f => (
-            <span key={f.provider} className={f.cloud ? 'text-violet-700' : ''}>
-              {f.provider} {f.texts.toLocaleString()}
+          {groupFleetSplit(split).map(f => (
+            <span key={f.label} className={f.cloud ? 'text-violet-700' : ''}>
+              {f.label} {f.texts.toLocaleString()}
               <span className="text-gray-400"> ({f.projects} proj)</span>
             </span>
           ))}
@@ -105,35 +106,6 @@ function PendingShadowBanner({
       )}
     </>
   );
-}
-
-/**
- * Is this provider an OpenRouter-backed (cloud) one rather than a local GPU?
- *
- * Virtual providers are named `<PCName>-OR-<Role>` by `virtualProviderName()`
- * on the server, and `getFleetEmbeddingSplit()` uses the same `-OR-` test to
- * set the `cloud` flag on the fleet strip above. The per-project column has no
- * flag to read — `servedBy` carries bare names — so it applies the same rule.
- */
-function isCloudProvider(name: string): boolean {
-  return name.includes('-OR-');
-}
-
-/**
- * How a provider is labelled in the narrow per-project column.
- *
- * Local hosts drop the mDNS `.local` suffix. Cloud providers keep the `-OR`
- * marker (so `BASWS35` the GPU and `BASWS35-OR` the cloud route are never
- * confused for one another) but drop the role suffix, which is the same for
- * every row in this column.
- *
- * The UPSTREAM provider (DeepInfra and friends) is deliberately never
- * rendered: the operator's unit of attribution is the machine whose key and
- * policy served the texts, not whichever backend OpenRouter happened to pick.
- */
-function providerLabel(name: string): string {
-  if (isCloudProvider(name)) return name.replace(/-OR-.*$/, '-OR');
-  return name.replace(/\.local$/, '');
 }
 
 export function ProjectVectorTable() {
@@ -485,9 +457,9 @@ export function ProjectVectorTable() {
                           p.embeddingSidecarModel,
                           p.embeddedAt,
                           p.embeddingServedBy?.length
-                            ? `served by: ${p.embeddingServedBy.map((s) => `${s.name} (${s.texts})`).join(', ')}`
+                            ? `served by: ${groupServedBy(p.embeddingServedBy).map((s) => `${s.label} (${s.texts})`).join(', ')}`
                             : null,
-                          p.embeddingSelectedSidecarName && p.embeddingSelectedSidecarName !== p.embeddingSidecarName
+                          isFailover(p.embeddingSelectedSidecarName, p.embeddingSidecarName, p.embeddingServedBy)
                             ? `selected ${p.embeddingSelectedSidecarName}, failed over`
                             : null,
                         ]
@@ -513,24 +485,20 @@ export function ProjectVectorTable() {
                             table. An all-cloud row, an all-local row and a
                             mixed row are then each unambiguous. */}
                         {(p.embeddingServedBy?.length ?? 0) > 0 ? (
-                          (() => {
-                            const by = [...(p.embeddingServedBy ?? [])].sort((a, b) => b.texts - a.texts);
-                            const total = by.reduce((n, x) => n + x.texts, 0) || 1;
-                            return by.map((x, i) => {
-                              const cloud = isCloudProvider(x.name);
-                              return (
-                                <span key={x.name}>
-                                  {i > 0 && <span className="text-gray-300"> · </span>}
-                                  <span className={cloud ? 'text-violet-700' : i === 0 ? 'text-gray-700' : 'text-gray-500'}>
-                                    {cloud ? '☁' : '🛰'} {providerLabel(x.name)}
-                                  </span>
-                                  <span className={`ml-0.5 text-[10px] ${cloud ? 'text-violet-400' : 'text-gray-400'}`}>
-                                    {Math.round((x.texts / total) * 100)}%
-                                  </span>
-                                </span>
-                              );
-                            });
-                          })()
+                          /* Direct OpenRouter rows show per pool worker; all old
+                             sidecar-proxied rows fold into one legacy entry
+                             (rules in lib/embeddingProviderLabels.ts). */
+                          groupServedBy(p.embeddingServedBy ?? []).map((x, i) => (
+                            <span key={x.label}>
+                              {i > 0 && <span className="text-gray-300"> · </span>}
+                              <span className={x.cloud ? 'text-violet-700' : i === 0 ? 'text-gray-700' : 'text-gray-500'}>
+                                {x.cloud ? '☁' : '🛰'} {x.label}
+                              </span>
+                              <span className={`ml-0.5 text-[10px] ${x.cloud ? 'text-violet-400' : 'text-gray-400'}`}>
+                                {x.pct}%
+                              </span>
+                            </span>
+                          ))
                         ) : (
                           /* Rows embedded before `servedBy` existed carry only
                              a single sidecar name. Keep rendering them. */
@@ -547,10 +515,7 @@ export function ProjectVectorTable() {
                             selected sidecar can be second on a perfectly healthy
                             run. Show it only when the selected provider is absent
                             from servedBy entirely. */}
-                        {p.embeddingSelectedSidecarName
-                          && (p.embeddingServedBy?.length
-                            ? !p.embeddingServedBy.some((s) => s.name === p.embeddingSelectedSidecarName)
-                            : p.embeddingSelectedSidecarName !== p.embeddingSidecarName) && (
+                        {isFailover(p.embeddingSelectedSidecarName, p.embeddingSidecarName, p.embeddingServedBy) && (
                           <span
                             className="ml-1 rounded bg-amber-50 px-1 text-[10px] text-amber-700"
                             title={`selected ${p.embeddingSelectedSidecarName}, which served no texts`}

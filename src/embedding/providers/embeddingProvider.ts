@@ -8,7 +8,6 @@
  * 'embedding' if one is registered + enabled, else falls back to in-process.
  */
 
-import type { VirtualContainer } from '../../sidecars/virtualContainers.js';
 import { classifyEmbedError, markEmbedFault, getEmbedFault } from './embedFaults.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -439,7 +438,7 @@ export type CloudPoolFailure =
  * counterpart, and it is small on purpose.
  */
 export class FailoverQueryEncoder implements EmbeddingProvider {
-  /** Every member is a VirtualEmbeddingProvider, so the facade IS virtual.
+  /** Every member is an OpenRouter-backed provider, so the facade IS virtual.
    *  This is the contract callers and tests use to mean "cloud-backed
    *  encoder — never a local Q4 model"; the wrapper must not hide it. */
   readonly isVirtual = true;
@@ -554,72 +553,19 @@ async function selectVerifiedCloudProviders(
   role: 'code-embedding' | 'embedding',
   expectedDims: number,
 ): Promise<{ providers: EmbeddingProvider[]; failure?: CloudPoolFailure }> {
-  const { listVirtualContainers, getVirtualContainersConfig } =
-    await import('../../sidecars/virtualContainers.js');
-  const { VirtualEmbeddingProvider } = await import('./virtualEmbeddingProvider.js');
-  const { ensureVerified, cloudReference, selectCloudReferences } = await import('./vectorCompatibility.js');
-
-  if (getVirtualContainersConfig().enabled !== true) {
-    return { providers: [], failure: 'openrouter-disabled' };
-  }
-  const rows = listVirtualContainers(role);
-  if (rows.length === 0) return { providers: [], failure: 'no-cloud-provider-discovered' };
-
-  // Separate the width mismatch from a failed verification BEFORE running the
-  // gate, because the two need completely different actions and the gate
-  // reports both as "not verified". Every configured model being the wrong
-  // width is a table rebuild; a verified-but-disagreeing provider is a routing
-  // problem. This is the live case for docs: the table is 1024d and every
-  // hosted model is 1536d or wider, so without this the operator would get
-  // "no provider passed the gate" and no hint that no provider ever could.
-  const { findModel } = await import('../../sidecars/openRouterModels.js');
-  const widths = rows.map(vc => findModel(vc.model ?? '')?.dims).filter((d): d is number => d !== undefined);
-  if (widths.length > 0 && !widths.includes(expectedDims)) {
-    sidecarLogger.warn(
-      `[embed] every OpenRouter provider for '${role}' produces ${[...new Set(widths)].join('/')}d, but the `
-      + `table is ${expectedDims}d — no provider can serve it until the table is rebuilt at that width.`,
-    );
-    return { providers: [], failure: 'cloud-width-mismatch' };
-  }
-
-  // Anchor order, so the provider the others are measured against is the same
-  // one across restarts and the query encoder below picks it first.
-  const ordered = [...rows].sort((a, b) => a.providerName.localeCompare(b.providerName));
-  const { isClearedToEmbed, verdictKey } = await import('./vectorCompatibility.js');
-  const keyOf = (vc: VirtualContainer) => verdictKey({
-    providerName: vc.providerName, model: vc.model, upstreamProvider: vc.upstreamProvider, reference: 'cloud-ref',
-  });
-  // Never wait on a PROBE when something is already verified. The old form
-  // awaited ensureVerified() for every provider in one Promise.all, so one
-  // unverified host with a dead tunnel (a 15s probe timeout) held the whole
-  // selection — and this runs on the query path every 60s. Measured: a
-  // retrieval stage of 21.6s where the search itself took 3.3s. Verified
-  // providers serve now; the rest are probed in the background (single-flight
-  // inside ensureVerified) and join on the next refresh. Only when NOTHING is
-  // verified yet — first boot — do we wait, or there would be no encoder.
-  const anyCleared = ordered.some(vc => isClearedToEmbed(keyOf(vc)));
-  const verify = (vc: VirtualContainer): Promise<boolean> => {
-    const [peer, ...rest] = selectCloudReferences(vc, ordered);
-    return ensureVerified(vc, peer ? cloudReference(peer) : null, expectedDims, 'cloud-ref', rest.map(cloudReference));
+  // Fantom's own OpenRouter client (2026-11-19): one provider per role,
+  // gated against rows already in the table (`stored-ref`).
+  const { hasOpenRouterKey } = await import('../../openrouter/key.js');
+  if (!hasOpenRouterKey()) return { providers: [], failure: 'openrouter-disabled' };
+  const { directEmbeddingProvider } = await import('../../openrouter/embeddingProvider.js');
+  const r = await directEmbeddingProvider(role, expectedDims);
+  if (r.provider) return { providers: [r.provider] };
+  if (r.reason) sidecarLogger.warn(`[embed] ${role}: ${r.reason}`);
+  return {
+    providers: [],
+    failure: r.failure === 'no-model' ? 'no-cloud-provider-discovered'
+      : r.failure === 'width' ? 'cloud-width-mismatch' : 'no-cloud-provider-verified',
   };
-  const checked = await Promise.all(ordered.map(async vc => {
-    try {
-      if (isClearedToEmbed(keyOf(vc))) return new VirtualEmbeddingProvider(vc, expectedDims, 'cloud-ref');
-      if (anyCleared) {
-        void verify(vc).catch(err => sidecarLogger.warn(`[embed] background verification of ${vc.providerName} threw: ${(err as Error).message}`));
-        return null;
-      }
-      const ok = await verify(vc);
-      return ok ? new VirtualEmbeddingProvider(vc, expectedDims, 'cloud-ref') : null;
-    } catch (err) {
-      sidecarLogger.warn(`[embed] cloud-reference verification of ${vc.providerName} threw: ${(err as Error).message}`);
-      return null;
-    }
-  }));
-  const providers = checked.filter((p): p is InstanceType<typeof VirtualEmbeddingProvider> => p !== null);
-  return providers.length > 0
-    ? { providers }
-    : { providers: [], failure: 'no-cloud-provider-verified' };
 }
 
 /**
@@ -684,15 +630,14 @@ export async function selectAllEmbeddingProvidersWithCloud(
 
   let cloud: EmbeddingProvider[] = [];
   try {
-    const { listVirtualContainers } = await import('../../sidecars/virtualContainers.js');
-    const { VirtualEmbeddingProvider } = await import('./virtualEmbeddingProvider.js');
-    const { ensureVerified, localReference } = await import('./vectorCompatibility.js');
+    const { ensureVerified, localReference, isClearedToEmbed } = await import('./vectorCompatibility.js');
+    const { hasOpenRouterKey } = await import('../../openrouter/key.js');
+    const { cloudRoleModel } = await import('../../openrouter/roles.js');
+    const { DirectOpenRouterEmbeddingProvider } = await import('../../openrouter/embeddingProvider.js');
 
     // AGGREGATE ("SideCar + OpenRouter") is the only remaining policy that
     // puts a cloud provider in the fan-out beside the GPUs. Under BACKUP the
-    // container stays registered and cloud-routable, but it is held in reserve
-    // rather than pulling chunks alongside them; under LOCAL it is excluded
-    // outright so a stale discovery row cannot quietly duplicate local work.
+    // cloud provider is held in reserve; under LOCAL it is excluded.
     if (!routing.joinsFanOut) {
       sidecarLogger.info(
         `[embed] ${role} is on "${routing.label}" — cloud providers are not joining the `
@@ -701,8 +646,8 @@ export async function selectAllEmbeddingProvidersWithCloud(
       return local;
     }
 
-    const rows = listVirtualContainers(role);
-    if (rows.length === 0) return local;
+    const rm = hasOpenRouterKey() ? cloudRoleModel(role) : null;
+    if (!rm) return local;
 
     const referenceName = readRuntimeSemantic().verificationReferenceSidecar;
     const referenceProvider = (referenceName
@@ -710,24 +655,22 @@ export async function selectAllEmbeddingProvidersWithCloud(
       : undefined) ?? local[0];
     if (!referenceProvider) {
       sidecarLogger.warn(
-        `[embed] ${rows.length} OpenRouter provider(s) discovered but no local embedder is available to verify `
-        + 'them against — refusing cloud capacity rather than trusting it unverified.',
+        '[embed] an OpenRouter provider is configured but no local embedder is available to verify '
+        + 'it against — refusing cloud capacity rather than trusting it unverified.',
       );
       return local;
     }
-    const reference = localReference(referenceProvider);
-
-    const checked = await Promise.all(rows.map(async vc => {
+    // Under a mixed fan-out the reference is a LOCAL host ('local-ref').
+    const candidate = new DirectOpenRouterEmbeddingProvider({ ...rm, role }, expectedDims, 'bulk', 'local-ref');
+    let ok = isClearedToEmbed(candidate.verdictKey());
+    if (!ok) {
       try {
-        return (await ensureVerified(vc, reference, expectedDims, 'local-ref'))
-          ? new VirtualEmbeddingProvider(vc, expectedDims, 'local-ref')
-          : null;
+        ok = await ensureVerified(candidate, localReference(referenceProvider), expectedDims, 'local-ref');
       } catch (err) {
-        sidecarLogger.warn(`[embed] verification of ${vc.providerName} threw: ${(err as Error).message}`);
-        return null;
+        sidecarLogger.warn(`[embed] verification of ${rm.providerName} threw: ${(err as Error).message}`);
       }
-    }));
-    cloud = checked.filter((p): p is InstanceType<typeof VirtualEmbeddingProvider> => p !== null);
+    }
+    cloud = ok ? [candidate] : [];
   } catch (err) {
     sidecarLogger.warn(`[embed] cloud provider discovery failed: ${(err as Error).message}`);
     return local;
@@ -796,7 +739,10 @@ export async function selectQueryEmbeddingProvider(
       // The corpus was built by all of them, verified to agree at 0.9999, so
       // any of them encodes a query the corpus will match. Anchor still goes
       // first; the rest are the failover.
-      return new FailoverQueryEncoder(providers);
+      // Queries take the pool's interactive lane: a search never waits
+      // behind a re-embed's bulk requests.
+      return new FailoverQueryEncoder(providers.map(p =>
+        (p as { forQueries?: () => EmbeddingProvider }).forQueries?.() ?? p));
     }
   }
   return selectEmbeddingProvider(target, desiredModelOrOpts);
@@ -829,7 +775,7 @@ export function getProviderRates(): Record<string, number> {
 export async function embedBatchFanout(
   providers: EmbeddingProvider[],
   texts: string[],
-  onServed?: (provider: EmbeddingProvider, count: number) => void,
+  onServed?: (provider: EmbeddingProvider, count: number, vectors?: Float32Array[]) => void,
 ): Promise<Float32Array[]> {
   if (texts.length === 0) return [];
   if (providers.length === 0) throw new Error('embedBatchFanout: no providers');
@@ -837,7 +783,7 @@ export async function embedBatchFanout(
     const t0 = Date.now();
     const out = await providers[0].embedBatch(texts);
     noteRate(providers[0], texts.length, Date.now() - t0);
-    onServed?.(providers[0], texts.length);
+    onServed?.(providers[0], texts.length, out);
     return out;
   }
   const N = providers.length;
@@ -862,7 +808,7 @@ export async function embedBatchFanout(
         const t0 = Date.now();
         const out = await p.embedBatch(chunk);
         noteRate(p, chunk.length, Date.now() - t0);
-        onServed?.(p, chunk.length);
+        onServed?.(p, chunk.length, out);
         return out;
       } catch (err) {
         lastErr = err;

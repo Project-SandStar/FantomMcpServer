@@ -35,6 +35,7 @@ import {
   resolveGraphQueryThreads,
   runWithPoolFullRetry,
 } from './graphPoolSizing.js';
+import { graphSetting, onGraphSettingsChanged } from './graphSettings.js';
 
 const logger = createLogger('project-graph-conn');
 
@@ -91,12 +92,9 @@ const opening = new Map<number, Promise<InstanceType<typeof Connection>>>();
  *  64 MiB pools are lazily resident (enrichment count-queries barely fill them;
  *  only a full rebuild does, and that's one project at a time), so the real RSS
  *  cost is far below 16×64 MiB. Tunable via FANTOM_GRAPH_MAX_OPEN. */
-const DEFAULT_MAX_OPEN = 16;
+// Dashboard value > FANTOM_GRAPH_MAX_OPEN > 16 (src/graph/graphSettings.ts).
 function getMaxOpen(): number {
-  const raw = process.env.FANTOM_GRAPH_MAX_OPEN;
-  if (!raw) return DEFAULT_MAX_OPEN;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_OPEN;
+  return graphSetting('maxOpen');
 }
 
 function isIoError(err: unknown): boolean {
@@ -347,29 +345,78 @@ function checkProjectPidfile(projectId: number, dbPath: string): string {
 const closeFailures = { connection: 0, database: 0 };
 let closesSinceGc = 0;
 
-async function evictLruIfNeeded(): Promise<void> {
-  const max = getMaxOpen();
-  // Reap ALL idle connections above the cap, not just one. Previously we closed
-  // a single victim per call, so a burst of opens (boot hydration over 241
-  // projects, or getProjectNodeCounts over 243) accumulated idle connections
-  // far past the cap — each pins a 64 MiB Kuzu buffer pool, so ~140 open →
-  // "Buffer manager exception: the buffer pool is full and no memory could be
-  // freed". Looping keeps the live set near the cap.
-  while (entries.size >= max) {
-    let victim: Entry | null = null;
-    for (const e of entries.values()) {
+/** Since boot: stores closed by the LRU evictor / opened again after an eviction. */
+const poolCounters = { evictions: 0, reopens: 0, opens: 0 };
+const evictedOnce = new Set<number>();
+
+/** Minimal entry view for `trimPoolEntries` (tests drive it with fakes). */
+export interface TrimmableEntry { projectId: number; inFlight: number; lastUsed: number }
+
+/**
+ * Close idle entries, oldest first, until `size(map) < limit` (or `<= limit`
+ * when `inclusive`). Busy entries (inFlight > 0) are never closed; if only
+ * busy ones remain the loop stops above the limit. Returns the closed ids.
+ */
+export async function trimPoolEntries(
+  map: Map<number, TrimmableEntry>,
+  limit: number,
+  close: (projectId: number) => Promise<void>,
+  inclusive = false,
+): Promise<number[]> {
+  const closed: number[] = [];
+  const over = () => (inclusive ? map.size > limit : map.size >= limit);
+  while (over()) {
+    let victim: TrimmableEntry | null = null;
+    for (const e of map.values()) {
       if (e.inFlight > 0) continue;
       if (!victim || e.lastUsed < victim.lastUsed) victim = e;
     }
-    if (!victim) {
-      logger.debug(
-        `LRU eviction: all ${entries.size} project connections busy ` +
-          `(cap ${max}); proceeding above cap until traffic settles.`,
-      );
-      return;
-    }
-    await closeProjectConnection(victim.projectId);
+    if (!victim) break;
+    const before = map.size;
+    await close(victim.projectId);
+    closed.push(victim.projectId);
+    // A close that did not remove the entry would loop forever.
+    if (map.size >= before) break;
   }
+  return closed;
+}
+
+function countEvictions(ids: number[]): void {
+  poolCounters.evictions += ids.length;
+  for (const id of ids) evictedOnce.add(id);
+}
+
+/**
+ * Apply a new cap now: close idle stores above it (busy ones stay until
+ * their query ends; the next open trims again). Used by the dashboard save.
+ */
+export async function shrinkProjectPoolToCap(cap = getMaxOpen()): Promise<number[]> {
+  const ids = await trimPoolEntries(entries, cap, closeProjectConnection, true);
+  countEvictions(ids);
+  if (ids.length) logger.info(`graph pool cap ${cap}: closed ${ids.length} idle store(s), open=${entries.size}`);
+  return ids;
+}
+
+onGraphSettingsChanged((eff) => {
+  shrinkProjectPoolToCap(eff.maxOpen.value).catch((err) => logger.warn(`graph pool shrink failed: ${(err as Error).message}`));
+});
+
+async function evictLruIfNeeded(): Promise<void> {
+  const max = getMaxOpen();
+  const before = entries.size;
+  const ids = await trimPoolEntries(entries, max, closeProjectConnection);
+  countEvictions(ids);
+  if (entries.size >= max && before >= max) {
+    logger.debug(
+      `LRU eviction: all ${entries.size} project connections busy ` +
+        `(cap ${max}); proceeding above cap until traffic settles.`,
+    );
+  }
+  // Reaps ALL idle connections above the cap, not just one: a burst of opens
+  // (boot hydration over 241 projects, getProjectNodeCounts over 243) used to
+  // pile idle connections far past the cap, each with its own buffer pool, until
+  // "Buffer manager exception: the buffer pool is full and no memory could be
+  // freed". If every entry is busy we proceed above cap (better than throwing).
 }
 
 /**
@@ -507,8 +554,8 @@ async function openProjectConnection(
     // (~50 MB for 2.5k-node fantom.compiler) and drops total reserved
     // virtual address space from ~800 GiB across 200 DBs to ~50 GiB.
     // Override via FANTOM_GRAPH_DB_MAX_MIB env if a project ever exceeds.
-    const maxMiBEnv = Number(process.env.FANTOM_GRAPH_DB_MAX_MIB);
-    const PROJECT_DB_MAX_SIZE = (Number.isFinite(maxMiBEnv) && maxMiBEnv > 0 ? maxMiBEnv : 256) * 1024 * 1024;
+    // Dashboard value > env > 256 (src/graph/graphSettings.ts).
+    const PROJECT_DB_MAX_SIZE = graphSetting('dbMaxMiB') * 1024 * 1024;
     // Buffer pool sizing is a tug-of-war: too small → "Buffer manager: buffer
     // pool is full" on heavier queries; too large × the open-connection cap
     // (16) → ~1 GB of native buffers and macOS Jetsam SIGKILLs the process
@@ -598,6 +645,8 @@ async function openProjectConnection(
     dbPath,
   };
   entries.set(projectId, entry);
+  poolCounters.opens++;
+  if (evictedOnce.has(projectId)) poolCounters.reopens++;
   const mem = process.memoryUsage();
   const rssMb = Math.round(mem.rss / 1024 / 1024);
   const heapMb = Math.round(mem.heapUsed / 1024 / 1024);
@@ -938,12 +987,16 @@ export function getProjectConnectionPoolStats(): {
   open: number;
   closeFailures: { connection: number; database: number };
   cap: number;
+  evictions: number;
+  reopens: number;
+  opens: number;
   entries: Array<{
     projectId: number;
     lastUsedAgoMs: number;
     inFlight: number;
     degraded: boolean;
     dbPath: string;
+    poolMiB: number | null;
   }>;
 } {
   const now = Date.now();
@@ -951,12 +1004,14 @@ export function getProjectConnectionPoolStats(): {
     open: entries.size,
     cap: getMaxOpen(),
     closeFailures: { ...closeFailures },
+    ...poolCounters,
     entries: [...entries.values()].map((e) => ({
       projectId: e.projectId,
       lastUsedAgoMs: now - e.lastUsed,
       inFlight: e.inFlight,
       degraded: e.degraded,
       dbPath: e.dbPath,
+      poolMiB: lastPoolMiB.get(e.projectId) ?? null,
     })),
   };
 }

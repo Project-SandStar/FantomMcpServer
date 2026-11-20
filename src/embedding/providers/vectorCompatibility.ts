@@ -87,10 +87,19 @@
  * poisoning this module exists to prevent, reintroduced by a dropdown.
  */
 
-import { isSoundSuiteSidecarConnected } from '../../sidecars/soundsuiteMaster.js';
 import type { EmbeddingProvider } from './embeddingProvider.js';
-import { virtualEmbed } from '../../sidecars/virtualInferenceClient.js';
-import type { VirtualContainer } from '../../sidecars/virtualContainers.js';
+
+/**
+ * What the gate measures: one OpenRouter-backed provider. Since 2026-11-19
+ * Fantom calls OpenRouter itself, so this is `Fantom-OR-<Role>`, not a
+ * sidecar row; `embedProbe` makes the call directly.
+ */
+export interface CompatCandidate {
+  providerName: string;
+  model: string;
+  upstreamProvider?: string;
+  embedProbe(texts: string[]): Promise<{ vectors: ArrayLike<number>[]; dims: number }>;
+}
 
 /** Minimum pairwise cosine for two stacks to count as one vector space. */
 export const MIN_COMPATIBLE_COSINE = 0.99;
@@ -118,7 +127,7 @@ export type VectorVerdictKind =
  * These are not interchangeable claims, which is why the regime is part of the
  * verdict key rather than a note beside it.
  */
-export type VerificationRegime = 'local-ref' | 'cloud-ref';
+export type VerificationRegime = 'local-ref' | 'cloud-ref' | 'stored-ref';
 
 export interface VectorRefusal {
   key: string;
@@ -402,88 +411,18 @@ export function localReference(p: EmbeddingProvider, name?: string): Compatibili
 }
 
 /**
- * The reference under "OpenRouter only": a PEER cloud provider.
- *
- * OpenRouter can route one model slug to different upstreams, so two
- * `<PCName>-OR-*` providers disagreeing with each other is the drift that
- * would poison a cloud-built index. That is what this measures — and it is
- * the only thing left to measure once no local vector is ever written.
+ * The reference under "OpenRouter only" (2026-11-19): rows already in the
+ * table. `rows[i].vector` is what the model wrote for `rows[i].text`; the
+ * candidate must reproduce it (cos >= 0.99). The probe texts are the row
+ * texts, so `embedBatch` ignores its argument and returns the stored vectors.
  */
-export function cloudReference(peer: VirtualContainer): CompatibilityReference {
+export function storedReference(rows: Array<{ text: string; vector: ArrayLike<number> }>, name = 'stored rows'): CompatibilityReference & { texts: string[] } {
   return {
-    regime: 'cloud-ref',
-    name: peer.providerName,
-    embedBatch: async texts => {
-      // A PROBE, not a batch: ~10 short texts. The 120s default is sized for
-      // a rebuild batch, and using it here meant one unreachable provider made
-      // the whole verify pass take 134s — a health check that takes over two
-      // minutes to say "unhealthy" is not a health check. 15s is generous for
-      // ten texts and fails fast on a host that is not answering.
-      const PROBE_TIMEOUT_MS = 15_000;
-      const res = await virtualEmbed(peer, texts, PROBE_TIMEOUT_MS);
-      return res.embeddings ?? [];
-    },
+    regime: 'stored-ref',
+    name,
+    texts: rows.map(r => r.text),
+    embedBatch: async () => rows.map(r => r.vector),
   };
-}
-
-/**
- * Which cloud provider holds the reference position for `vc`, under
- * "OpenRouter only".
- *
- * Only a provider resolving the SAME model slug is a meaningful peer — two
- * different embedding models are supposed to disagree, and comparing them
- * would refuse a correct configuration for the wrong reason.
- *
- * The anchor rule breaks the circularity. Sort the same-model providers by
- * name; the FIRST is the anchor and is verified with no reference at all
- * (dimension + pin), and every other one is verified against the anchor. So
- * the chain is a star, not a cycle, and it is deterministic across restarts —
- * re-verification lands on the same anchor and the same verdict rather than
- * whichever provider happened to probe first.
- *
- * Returns null when `vc` IS the anchor, or when no same-model peer exists.
- * Both mean "there is nothing to hold this one to"; the caller then runs the
- * dimension-and-pin check, and the verdict records that it did.
- */
-export function selectCloudReference(
-  vc: VirtualContainer,
-  rows: VirtualContainer[],
-  isLive: (r: VirtualContainer) => boolean = defaultIsLive,
-): VirtualContainer | null {
-  // Anchor on a peer whose sidecar tunnel is OPEN. On 2026-09-18 three of
-  // five hosts were down and the alphabetically-first one (the Mac mini) was
-  // among them: every other provider was paired against it, every probe
-  // failed with "no WS tunnel", and the two live hosts were refused for a
-  // fault that was not theirs. Liveness is a hint, not a filter — when
-  // nothing is live (tests, cold boot) fall back to the plain ordering so the
-  // verdict is still "probe-failed" (transient) rather than silently absent.
-  return selectCloudReferences(vc, rows, isLive)[0] ?? null;
-}
-
-/**
- * Every same-model peer that could hold the reference position for `vc`,
- * anchor first, then the rest in name order. The anchor stays the
- * deterministic reference; the others are what the gate falls back to when
- * the anchor cannot answer a probe (a Mac over NetBird timing out, a 429
- * on the shared upstream). Empty when `vc` IS the anchor or has no peer.
- */
-export function selectCloudReferences(
-  vc: VirtualContainer,
-  rows: VirtualContainer[],
-  isLive: (r: VirtualContainer) => boolean = defaultIsLive,
-): VirtualContainer[] {
-  const sameModel = rows
-    .filter(r => r.model === vc.model)
-    .sort((a, b) => a.providerName.localeCompare(b.providerName));
-  const live = sameModel.filter(isLive);
-  const pool = live.length > 0 ? live : sameModel;
-  const anchor = pool[0];
-  if (!anchor || anchor.providerName === vc.providerName) return [];
-  return pool.filter(r => r.providerName !== vc.providerName);
-}
-
-function defaultIsLive(r: VirtualContainer): boolean {
-  try { return isSoundSuiteSidecarConnected(r.sidecarId); } catch { return false; }
 }
 
 /**
@@ -500,7 +439,7 @@ function defaultIsLive(r: VirtualContainer): boolean {
  * nothing.
  */
 export async function verifyVectorCompatibility(
-  vc: VirtualContainer,
+  vc: CompatCandidate,
   reference: CompatibilityReference | null,
   expectedDims: number,
   opts: {
@@ -511,7 +450,7 @@ export async function verifyVectorCompatibility(
     fallbackReferences?: CompatibilityReference[];
   } = {},
 ): Promise<CompatibilityReport> {
-  const texts = opts.texts ?? PROBE_TEXTS;
+  const texts = opts.texts ?? (reference as { texts?: string[] } | null)?.texts ?? PROBE_TEXTS;
   const threshold = opts.minCosine ?? MIN_COMPATIBLE_COSINE;
   const regime: VerificationRegime = reference?.regime ?? opts.regime ?? 'local-ref';
   const key = verdictKey({
@@ -576,9 +515,9 @@ export async function verifyVectorCompatibility(
   let dims: number;
   try {
     // Same reasoning as the peer probe above: fail fast, this is ten texts.
-    const res = await virtualEmbed(vc, texts, 15_000);
-    cloudVectors = res.embeddings ?? [];
-    dims = res.dims ?? cloudVectors[0]?.length ?? 0;
+    const res = await vc.embedProbe(texts);
+    cloudVectors = res.vectors.map(v => Array.from(v));
+    dims = res.dims || cloudVectors[0]?.length || 0;
   } catch (err) {
     recordRefusal({
       key, providerName: vc.providerName, kind: 'probe-failed', reference: regime,
@@ -613,7 +552,7 @@ export async function verifyVectorCompatibility(
     recordVerified({
       key, providerName: vc.providerName, dims, samples: texts.length, reference: regime,
     });
-    return { ...base, ok: true, dims, reason: 'sole cloud provider: dimension and upstream pin only' };
+    return { ...base, ok: true, dims, reason: 'no reference rows yet: dimension and upstream pin only' };
   }
 
   const cosines = texts.map((_, i) => cosine(referenceVectors![i], cloudVectors[i]));
@@ -623,7 +562,11 @@ export async function verifyVectorCompatibility(
   if (minCosine < threshold) {
     recordRefusal({
       key, providerName: vc.providerName, kind: 'vector-incompatible', reference: regime, referenceName: reference!.name,
-      reason: regime === 'cloud-ref'
+      reason: regime === 'stored-ref'
+        ? `cosine against vectors already stored in the table fell to ${minCosine.toFixed(6)}, below the `
+          + `${threshold} floor — the model behind this route no longer reproduces the stored rows, so new rows `
+          + 'would not share their vector space'
+        : regime === 'cloud-ref'
         ? `pairwise cosine against the cloud peer ${reference!.name} fell to ${minCosine.toFixed(6)}, below the `
           + `${threshold} floor — two OpenRouter providers resolving the same model must agree with each other, `
           + 'or the index they build together is not one vector space'
@@ -650,7 +593,7 @@ export async function verifyVectorCompatibility(
 const inFlight = new Map<string, Promise<CompatibilityReport>>();
 
 export async function ensureVerified(
-  vc: VirtualContainer,
+  vc: CompatCandidate,
   reference: CompatibilityReference | null,
   expectedDims: number,
   regime: VerificationRegime = reference?.regime ?? 'local-ref',

@@ -353,8 +353,56 @@ export class LadybugQueryManager {
   }
 
   /**
-   * Get graph metrics for a specific node.
+   * Direct (depth-1) callers and callees for MANY nodes in two queries,
+   * instead of getCallers(id,1) + getCallees(id,1) per node. Same rows as
+   * those: callers over `calls`/`uses` edges, callees over `calls`, deduped
+   * by id and sorted by name; each list cut to `limit`.
+   *
+   * Search called the per-node pair for every candidate (~100) before
+   * fusion: ~200 serialized recursive queries, measured at 47-52 s of a
+   * 55-61 s search on a large project.
    */
+  async getRelatedBatch(
+    nodeIds: string[],
+    limit = 3,
+  ): Promise<Map<string, Array<{ id: string; name: string; relationship: 'caller' | 'callee' }>>> {
+    const out = new Map<string, Array<{ id: string; name: string; relationship: 'caller' | 'callee' }>>();
+    const ids = [...new Set(nodeIds.filter(Boolean))];
+    if (ids.length === 0) return out;
+    const callers = new Map<string, Map<string, string>>();
+    const callees = new Map<string, Map<string, string>>();
+    const add = (m: Map<string, Map<string, string>>, key: string, id: string, name: string) => {
+      let inner = m.get(key);
+      if (!inner) { inner = new Map(); m.set(key, inner); }
+      if (!inner.has(id)) inner.set(id, name ?? '');
+    };
+    const CHUNK = 300;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const list = ids.slice(i, i + CHUNK).map(id => `'${esc(id)}'`).join(', ');
+      const [inRows, outRows] = await Promise.all([
+        this.q<{ tid: string; id: string; name: string }>(
+          `MATCH (c:CodeNode)-[e:CodeEdge]->(t:CodeNode) WHERE t.id IN [${list}] AND e.edge_type IN ['calls', 'uses']
+           RETURN DISTINCT t.id AS tid, c.id AS id, c.name AS name`,
+        ),
+        this.q<{ sid: string; id: string; name: string }>(
+          `MATCH (s:CodeNode)-[e:CodeEdge]->(c:CodeNode) WHERE s.id IN [${list}] AND e.edge_type = 'calls'
+           RETURN DISTINCT s.id AS sid, c.id AS id, c.name AS name`,
+        ),
+      ]);
+      for (const r of inRows) add(callers, r.tid, r.id, r.name);
+      for (const r of outRows) add(callees, r.sid, r.id, r.name);
+    }
+    const top = (m: Map<string, string> | undefined, relationship: 'caller' | 'callee') =>
+      [...(m ?? new Map<string, string>())]
+        .map(([id, name]) => ({ id, name, relationship }))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .slice(0, limit);
+    for (const id of ids) {
+      out.set(id, [...top(callers.get(id), 'caller'), ...top(callees.get(id), 'callee')]);
+    }
+    return out;
+  }
+
   /**
    * Degree metrics for MANY nodes in two grouped queries (incoming and
    * outgoing edges by type), instead of getMetrics()'s nine queries per node.

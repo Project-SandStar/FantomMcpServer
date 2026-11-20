@@ -1,55 +1,50 @@
 /**
  * Cloud attribution, end to end, without a cloud run.
  *
- * `code-embedding` now runs on the SideCar + OpenRouter policy, so a project
+ * `code-embedding` can run on Fantom's direct OpenRouter client, so a project
  * can be embedded partly or wholly by an OpenRouter-backed provider. The
  * operator needs to see that in the per-project column — a cloud contribution
  * that renders as a local GPU is worse than no attribution at all.
  *
  * The chain under test:
  *
- *   VirtualEmbeddingProvider.getSidecarName()  →  container.providerName
- *                                              =  virtualProviderName(host, role)
- *                                              =  `<PCName>-OR-<Role>`
+ *   DirectOpenRouterEmbeddingProvider.getSidecarName()  →  providerNameFor(role)
+ *                                                       =  `Fantom-OR-<Role>`
  *   credit(provider, n)                        →  served.set(name, …)
  *   recordProjectEmbedding({ servedBy })       →  projectEmbeddingMeta.json
  *   /admin/vectors/stats                       →  embeddingServedBy / fanout
  *
  * The two attribution writers (`semanticSearchService.buildProjectEmbeddings`
  * for the auto pipeline and the re-embed job in `admin/routes.ts`) both key
- * their map by `getSidecarName()`, so both carry the virtual name unchanged.
+ * their map by `getSidecarName()`, so both carry the cloud name unchanged.
  * What this file pins is the naming contract at both ends of that chain: the
- * name a virtual provider reports, and the `-OR-` test every consumer uses to
+ * name a cloud provider reports, and the `-OR-` test every consumer uses to
  * call it cloud.
  */
 
-import { virtualProviderName, pcName } from '../sidecars/virtualContainers.js';
+import { providerNameFor } from '../openrouter/roles.js';
 import { getFleetEmbeddingSplit, __setMetaPathForTest } from '../embedding/projectEmbeddingMeta.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
+const ROLES = ['embedding', 'code-embedding', 'reranker', 'code-assistant', 'rlm'] as const;
+
 describe('the name a cloud provider is attributed under', () => {
-  it('is <PCName>-OR-<Role>, with the mDNS suffix stripped', () => {
-    expect(virtualProviderName('BASWS35', 'code-embedding')).toBe('BASWS35-OR-CodeEmbedding');
-    expect(virtualProviderName('Alpers-Mac-mini.local', 'code-embedding'))
-      .toBe('Alpers-Mac-mini-OR-CodeEmbedding');
-    expect(pcName('mcpserver.local')).toBe('mcpserver');
+  it('is Fantom-OR-<Role>: Fantom itself calls OpenRouter now, no sidecar host', () => {
+    expect(providerNameFor('code-embedding')).toBe('Fantom-OR-CodeEmbedding');
+    expect(providerNameFor('embedding')).toBe('Fantom-OR-Embedding');
+    expect(providerNameFor('reranker')).toBe('Fantom-OR-Reranker');
   });
 
   it('never carries the upstream provider — that convention is deliberate', () => {
-    // DeepInfra is the pinned upstream for qwen3-embedding-4b. The operator's
-    // unit of attribution is the machine whose key and policy served the
-    // texts, not whichever backend OpenRouter routed to.
-    for (const role of ['embedding', 'code-embedding', 'reranker', 'code-assistant'] as const) {
-      expect(virtualProviderName('BASWS35', role)).not.toMatch(/deepinfra|fireworks/i);
+    for (const role of ROLES) {
+      expect(providerNameFor(role)).not.toMatch(/deepinfra|fireworks|nebius/i);
     }
   });
 
-  it('is distinguishable from the local GPU on the same machine', () => {
-    // Both exist at once: BASWS35's local Ollama and BASWS35's cloud route.
-    // If these collided, the column could not tell them apart at all.
-    expect(virtualProviderName('BASWS35', 'code-embedding')).not.toBe('BASWS35');
+  it('is distinct per role', () => {
+    expect(new Set(ROLES.map(providerNameFor)).size).toBe(ROLES.length);
   });
 });
 
@@ -58,9 +53,9 @@ describe('the -OR- test every consumer uses to call a provider cloud', () => {
   // isCloudProvider() in dashboard/src/components/ProjectVectorTable.tsx.
   const isCloud = (n: string) => n.includes('-OR-');
 
-  it('flags every virtual provider name', () => {
-    for (const role of ['embedding', 'code-embedding', 'reranker', 'code-assistant'] as const) {
-      expect(isCloud(virtualProviderName('BASWS35', role))).toBe(true);
+  it('flags every cloud provider name', () => {
+    for (const role of ROLES) {
+      expect(isCloud(providerNameFor(role))).toBe(true);
     }
   });
 

@@ -1,44 +1,21 @@
 /**
- * Chat completions through the sidecar's OpenRouter route.
+ * One chat completion on OpenRouter, called by Fantom itself (2026-11-19).
  *
- * Fantom has no direct OpenRouter client and deliberately never gets one: the
- * key lives on the sidecar, per master, and is never sent here. A chat request
- * goes out over HTTP to any sidecar's `/api/v1/chat/completions`, which
- * resolves OUR model from OUR config and spends OUR budget.
+ * Before, this went through a sidecar's `/api/v1/chat/completions` proxy
+ * (~1.8 s per call; 0.45 s direct for the same model). The signature is
+ * unchanged for the callers: answer synthesis, the contextualiser, the
+ * workflow optimiser and the Test button.
  *
- * ── Why HTTP and not a WS action ──────────────────────────────────────────
+ * Model: the same one the sidecar used to pick for us, the RLM sandbox model
+ * (an OpenRouter id; a `direct:` model maps to the default sandbox model).
+ * A caller may pass `model` to override it.
  *
- * The sidecar has `virtual-embed`, `virtual-rerank` and `virtual-key-info` as
- * WS actions and no chat equivalent. The HTTP route exists because the RLM
- * sandbox needs it, and it works for us for the same reason — the identity
- * problem it solves is ours too.
- *
- * ── Identity ──────────────────────────────────────────────────────────────
- *
- * Every sidecar in this fleet holds keys from BOTH masters, so an HTTP caller
- * that does not identify itself gets a 409 rather than a guess. The headers
- * come from `masterIdentityHeaders()`, which is shared with the RLM path so
- * the two cannot drift — and the URL is read from the same source the config
- * push is keyed by, because a mismatch there is a 404 that reads as "no config
- * pushed" rather than "wrong spelling".
- *
- * ── Which model answers ───────────────────────────────────────────────────
- *
- * Not ours to choose. The route pins the model from the caller's own
- * `allowedModels['rlm-sandbox']` and strips `model` from the body
- * (`CALLER_MAY_NOT_SET`), so a request cannot talk its way onto a model the
- * operator did not authorise. Pick the model on the config page; this module
- * reports back which one answered.
+ * Lane: `bulk` work (contextualiser) waits for a worker; everything else is
+ * interactive and never waits behind a re-embed.
  */
-
-import { listSidecars } from './registry.js';
-import { getSidecarHeartbeatAgeMs } from './soundsuiteMaster.js';
-
-/** The sidecar's OpenRouter-facing HTTP port. */
-const SIDECAR_API_PORT = 8098;
-const DEFAULT_TIMEOUT_MS = 90_000;
-/** A heartbeat older than this (client sends every 5 s) marks the host's WS path as unreliable. */
-const STALE_HEARTBEAT_MS = 60_000;
+import { chat } from '../openrouter/client.js';
+import { openRouterPool, type Lane } from '../openrouter/workerPool.js';
+import { sandboxModelForPush, DEFAULT_SANDBOX_MODEL } from './sandboxSlots.js';
 
 export class OpenRouterChatUnavailable extends Error {
   readonly code = 'openrouter-chat-unavailable';
@@ -48,80 +25,17 @@ export class OpenRouterChatUnavailable extends Error {
   }
 }
 
-/**
- * This master's canonical URL — the string the sidecar files our config under.
- *
- * Read from the same place the push is keyed by, never rebuilt from parts. A
- * trailing slash or `localhost` where the push said an IP resolves to a
- * different map key and returns 404, which reads as "you pushed no config".
- */
-export async function canonicalMasterUrl(sidecarId?: string): Promise<string | undefined> {
-  try {
-    const { getVirtualContainersConfig, getSlotStatus } = await import('./virtualContainers.js');
-    const slots = getSlotStatus();
-    // Per host when a host is named: a LAN host and a NetBird host file the
-    // same master under different addresses (gpu-01 held our NetBird address,
-    // BASWS35 our LAN address, 2026-11-03). The first slot is only a fallback
-    // for a host whose slot we have not seen yet.
-    const own = sidecarId ? slots.find(s => s.sidecarId === sidecarId && s.serverUrl)?.serverUrl : undefined;
-    return own
-      ?? getVirtualContainersConfig().masterServerUrl
-      ?? slots.find(s => s.serverUrl)?.serverUrl;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Identity (and domain) headers for any HTTP call into the sidecar fleet.
- *
- * Both spellings of each: the sidecar and the sandbox accept
- * `X-SoundSuite-*` and `X-FantomMCP-*` and take the first present, so sending
- * both means neither side has to redeploy in step with the other. `domain` is
- * hardcoded `code` for the same reason the config push hardcodes it — it is a
- * fact about this software, not a setting.
- */
-export function masterIdentityHeaders(masterUrl: string): Record<string, string> {
-  return {
-    'X-FantomMCP-Master': masterUrl,
-    'X-SoundSuite-Master': masterUrl,
-    'X-FantomMCP-Domain': 'code',
-  };
-}
-
-/**
- * Minimum a single attempt is allowed before the deadline can cut it.
- *
- * There used to be a hard 10s per-host CAP here, and it produced a failover
- * loop that could not succeed: a generation that needed 12s was killed at 10s
- * and restarted on the next host, which was killed at whatever was left. Both
- * hosts were WORKING. Failover is for a host that is down — refused, 5xx,
- * 409, unreachable — and those fail in milliseconds. A host that is still
- * generating is not a failure, and cutting it off cannot be made to help.
- *
- * So an attempt now gets the whole remaining window, and the deadline is the
- * caller's budget, not a per-host guess.
- */
-const HARD_FAILURE_RETRY = true;
-/** The host that answered last time goes first next time. */
-let lastGoodHost: string | null = null;
-
 export interface OpenRouterChatResult {
   text: string;
-  /** The model the sidecar actually used — it chooses, we do not. */
+  /** The model that answered. */
   model: string;
   /** USD for this call, as OpenRouter reported it. Null when not returned. */
   costUsd: number | null;
   servedBy: string;
 }
 
-/**
- * One non-streaming completion.
- *
- * `stream` is never sent: the route rejects it with a 400 rather than hang a
- * caller waiting for SSE that never arrives, and nothing here wants tokens
- * as they arrive.
- */
+const DEFAULT_TIMEOUT_MS = 90_000;
+
 export async function openRouterChat(
   system: string,
   user: string,
@@ -130,169 +44,50 @@ export async function openRouterChat(
     timeoutMs?: number;
     temperature?: number;
     reasoning?: boolean;
-    /**
-     * Only hosts that run this role are asked (while at least one does). The
-     * route itself needs no container — it is a proxy — but which host carries
-     * LLM traffic is the operator's call, made by assigning the role.
-     */
+    /** Kept for callers; hosts no longer matter (no sidecar hop). */
     role?: string;
+    model?: string;
+    lane?: Lane;
+    projectId?: number;
   } = {},
 ): Promise<OpenRouterChatResult> {
-  // Fleet-wide fallback only; each host gets its own spelling in the loop below.
-  const anyMasterUrl = await canonicalMasterUrl();
-  if (!anyMasterUrl) {
-    throw new OpenRouterChatUnavailable(
-      'this master has no canonical URL known to the fleet, so the sidecar cannot tell whose key to '
-      + 'spend — check that a config push has reached at least one sidecar.',
-    );
-  }
-  // Any enabled sidecar will do: the route is a thin proxy and the key it uses
-  // is ours regardless of which host answers. Trying them in turn means one
-  // unreachable host does not fail the request.
-  // Which hosts, in which order:
-  //   1. With `opts.role`: only hosts that RUN the role (from their own status),
-  //      while any does. A host the operator left without the role is not asked
-  //      — that is what assigning roles per host means.
-  //   2. The host that answered last time first, if it still qualifies.
-  //   3. Hosts with a fresh WS heartbeat before hosts without one. A host whose
-  //      register frame arrives but whose heartbeat frames do not (gpu-02,
-  //      2026-09-29: PMTU drops large frames) is reachable over HTTP yet cannot
-  //      return a multi-KB completion in time; it was `lastGoodHost` once and
-  //      then ate the whole 39s window on every ask.
-  let all = listSidecars({ enabled: true });
-  if (all.length === 0) throw new OpenRouterChatUnavailable('no enabled sidecar is registered.');
-  if (opts.role) {
-    const { hostsForRole, describeRoleHosts } = await import('./sidecarRoles.js');
-    const ranked = await hostsForRole(opts.role, { strict: true });
-    if (ranked.length && !ranked.some(h => h.hasRole)) {
-      console.warn(`[openrouter-chat] no enabled sidecar reports the ${opts.role} role — trying every host (${describeRoleHosts(opts.role, ranked)})`);
-    } else {
-      const skipped = all.filter(s => !ranked.some(h => h.sidecar.id === s.id)).map(s => s.name);
-      if (skipped.length) console.log(`[openrouter-chat] ${opts.role}: not asking ${skipped.join(', ')} (role not assigned there)`);
-    }
-    all = ranked.map(h => h.sidecar);
-  }
-  const heartbeatAge = (id: string): number | null => {
-    try { return getSidecarHeartbeatAgeMs(id); } catch { return null; }
-  };
-  const fresh = (id: string): boolean => {
-    const age = heartbeatAge(id);
-    return age !== null && age < STALE_HEARTBEAT_MS;
-  };
-  const ranked = [...all].sort((a, b) => {
-    const fa = fresh(a.id) ? 0 : 1;
-    const fb = fresh(b.id) ? 0 : 1;
-    if (fa !== fb) return fa - fb;
-    return 0;
-  });
-  const hosts = lastGoodHost && fresh(ranked.find(h => h.name === lastGoodHost)?.id ?? '')
-    ? [...ranked.filter(h => h.name === lastGoodHost), ...ranked.filter(h => h.name !== lastGoodHost)]
-    : ranked;
-  const stale = hosts.filter(h => !fresh(h.id)).map(h => h.name);
-  if (stale.length) console.log(`[openrouter-chat] hosts without a recent heartbeat go last: ${stale.join(', ')}`);
-
-  // Thinking models (deepseek-v4-flash, 2026-09-29) spend the whole
-  // max_tokens on reasoning and return content:null, finish_reason:"length".
-  // That surfaced as "empty completion" on every host, and failing over could
-  // not help — every host reaches the same upstream. The cited write-up needs
-  // no chain of thought (the RLM did the investigating), so reasoning is off
-  // unless the caller asks for it; OpenRouter ignores the field for models
-  // without a reasoning mode. Measured on gpu-01: reasoning on → 154 tokens of
-  // which 138 reasoning, 126 chars of answer; off → 159 tokens, 412 chars.
-  const buildBody = (maxTokens: number): string => JSON.stringify({
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: user },
-    ],
-    max_tokens: maxTokens,
-    ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
-    reasoning: { enabled: opts.reasoning === true },
-  });
-  const baseMaxTokens = opts.maxTokens ?? 1024;
-
-  const errors: string[] = [];
-  // ONE deadline for the whole call, not one per host.
-  //
-  // `timeoutMs` was applied per attempt, so a caller asking for 8s against a
-  // five-host fleet could wait 40s — and did: a synthesis given 8.6s of a 45s
-  // budget took 29s and pushed the whole answer to 65s, past the MCP client
-  // it was budgeted for. A timeout that the caller cannot reason about is
-  // worse than none, because it reads as a guarantee.
-  const deadline = Date.now() + (opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  for (const host of hosts) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 250) {
-      errors.push(`${host.name}: skipped, deadline reached`);
-      continue;
-    }
-    const url = `${host.protocol}://${host.host}:${SIDECAR_API_PORT}/api/v1/chat/completions`;
-    const masterUrl = (await canonicalMasterUrl(host.id)) ?? anyMasterUrl;
-    const ac = new AbortController();
-    // The attempt gets the whole remaining window. See HARD_FAILURE_RETRY.
-    const attemptMs = remaining;
-    const timer = setTimeout(() => ac.abort(new Error(`deadline (${attemptMs}ms)`)), attemptMs);
-    try {
-      let maxTokens = baseMaxTokens;
-      let res: Response | null = null;
-      let json: any = null;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...masterIdentityHeaders(masterUrl) },
-          body: buildBody(maxTokens),
-          signal: ac.signal,
-        });
-        json = await res.json().catch(() => null);
-        if (!res.ok) break;
-        const content = json?.choices?.[0]?.message?.content;
-        const finish = json?.choices?.[0]?.finish_reason;
-        // Cut off before any content came back: the same host gets twice the
-        // room once. A different host would only repeat the cut.
-        if ((typeof content !== 'string' || !content.trim()) && finish === 'length' && attempt === 0) {
-          console.warn(
-            `[openrouter-chat] ${host.name}: hit max_tokens=${maxTokens} with no content `
-            + `(reasoning_tokens=${json?.usage?.completion_tokens_details?.reasoning_tokens ?? '?'}); retrying with ${maxTokens * 2}`,
-          );
-          maxTokens *= 2;
-          continue;
-        }
-        break;
-      }
-      if (!res || !res.ok) {
-        // The route returns an OpenAI error envelope, and its messages are
-        // written to be actionable (409 names both masters, 503 says which
-        // model is missing). Surface it rather than the status alone.
-        const msg = json?.error?.message ?? `HTTP ${res?.status ?? '?'}`;
-        errors.push(`${host.name}: ${String(msg).slice(0, 200)}`);
+  const model = opts.model ?? sandboxModelForPush() ?? DEFAULT_SANDBOX_MODEL;
+  const messages = [
+    { role: 'system', content: system },
+    { role: 'user', content: user },
+  ];
+  let maxTokens = opts.maxTokens ?? 1024;
+  const run = async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const out = await chat(messages, {
+        role: 'code-assistant',
+        model,
+        maxTokens,
+        temperature: opts.temperature,
+        reasoning: opts.reasoning,
+        timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      });
+      // A thinking model can spend max_tokens on reasoning and return no
+      // content (finish_reason "length"): retry once with twice the room.
+      if (!out.text.trim() && out.finishReason === 'length' && attempt === 0) {
+        console.warn(`[openrouter-chat] ${model}: hit max_tokens=${maxTokens} with no content; retrying with ${maxTokens * 2}`);
+        maxTokens *= 2;
         continue;
       }
-      const text = json?.choices?.[0]?.message?.content;
-      if (typeof text !== 'string' || !text.trim()) {
-        errors.push(`${host.name}: empty completion (finish_reason=${json?.choices?.[0]?.finish_reason ?? '?'})`);
-        continue;
-      }
-      lastGoodHost = host.name;
-      return {
-        text,
-        model: json?.model ?? 'openrouter',
-        costUsd: typeof json?.usage?.cost === 'number' ? json.usage.cost : null,
-        servedBy: host.name,
-      };
-    } catch (err) {
-      const msg = (err as Error).message;
-      errors.push(`${host.name}: ${msg.slice(0, 120)}`);
-      // A timeout means the window is spent; there is no second host to give
-      // it to. Say that plainly instead of listing four hosts as "skipped".
-      if (/deadline|abort/i.test(msg)) {
-        throw new OpenRouterChatUnavailable(
-          `${host.name} did not finish within the ${Math.round(attemptMs / 1000)}s window (it was answering, not refusing) — `
-          + `raise semanticSearch.answerSynthesis.synthesisMaxMs (the upstream-hang safety net)${errors.length > 1 ? `; earlier: ${errors.slice(0, -1).join('; ')}` : ''}`,
-        );
-      }
-      if (!HARD_FAILURE_RETRY) break;
-    } finally {
-      clearTimeout(timer);
+      return out;
     }
+    throw new OpenRouterChatUnavailable(`${model} returned no content`);
+  };
+  try {
+    const out = await openRouterPool().submit({
+      role: 'code-assistant', lane: opts.lane ?? 'interactive', projectId: opts.projectId, run,
+    });
+    if (!out.text.trim()) {
+      throw new OpenRouterChatUnavailable(`empty completion from ${out.model} (finish_reason=${out.finishReason ?? '?'})`);
+    }
+    return { text: out.text, model: out.model, costUsd: out.costUsd, servedBy: 'fantom' };
+  } catch (err) {
+    if (err instanceof OpenRouterChatUnavailable) throw err;
+    throw new OpenRouterChatUnavailable((err as Error).message);
   }
-  throw new OpenRouterChatUnavailable(`every sidecar refused the chat call — ${errors.join('; ')}`);
 }

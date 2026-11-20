@@ -280,13 +280,14 @@ function handleFrame(ws: WebSocket, agentUrlRef: { url: string | null }, raw: st
       capabilitiesSource: 'ws-register',
     });
     send(ws, { type: 'registered', ok: true });
-    // A sidecar coming back is exactly the event that should re-open the
-    // cloud gate. Dynamic import: this module sits under virtualContainers,
-    // which the reverify module imports, and a static import here would be a
-    // cycle. Fire-and-forget — registration must never wait on a probe.
-    void import('../embedding/providers/cloudReverify.js')
-      .then(m => m.onSidecarReconnected(sc.name))
-      .catch(err => console.warn(`[soundsuite-master] reverify hook failed: ${(err as Error).message}`));
+    // A sidecar that comes back (restart) has lost our ss-rlm-sandbox slot:
+    // give it the key, sandbox model and domain again. Dynamic import to
+    // avoid a cycle (sandboxSlots imports this module). Never blocks register.
+    setTimeout(() => {
+      void import('./sandboxSlots.js')
+        .then(m => { if (m.sandboxModelForPush()) m.pushSandboxSlot(sc.id); })
+        .catch(err => console.warn(`[soundsuite-master] sandbox slot push failed: ${(err as Error).message}`));
+    }, 500).unref?.();
     return;
   }
 

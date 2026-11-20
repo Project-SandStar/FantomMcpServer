@@ -15,6 +15,10 @@
 import type { RerankMode } from './hybridSearch.js';
 import { emitAskEvent } from './askEvents.js';
 import {
+  defaultRlmPipeline, sanitizeRlmPipeline, decideSandbox, describeSettings, noTimeReason,
+  type AskStageReport, type FantomRlmOutcome, type RlmPipelineSettings,
+} from './rlmPipeline.js';
+import {
   ProviderHttpError, classifyError, warningFor, finalizeWarnings, markProviderExhausted, providerExhaustedState, providerLabel,
   isHardKind, shortFailureReason,
   type ProviderWarning,
@@ -176,6 +180,7 @@ function formatHitForRlm(r: SemanticSearchResult): string {
   const snippet = readSourceSnippet(r.filePath, r.lineStart);
   return (
     `${r.qualifiedName} (${r.nodeType}) ${r.filePath}:${r.lineStart}\n` +
+    (r.alsoIn?.length ? `  also in: ${r.alsoIn.map(a => a.label).join(', ')}\n` : '') +
     `  sig: ${r.signature ?? '(none)'}\n` +
     (snippet ? `  source:\n${snippet.split('\n').map((l) => '    ' + l).join('\n')}` : '  source: (unavailable)')
   );
@@ -663,6 +668,9 @@ export interface AnswerCodeQuestionOptions {
    * dashboard polls it; without an id nothing is recorded.
    */
   askId?: string;
+  /** Return the retrieval hits in the result (`hits`), so a caller showing
+   *  them need not run the same search again. */
+  includeHits?: boolean;
 }
 
 /** Budget for an interactive ask — a person is watching this one. */
@@ -729,6 +737,14 @@ export interface AnswerCodeQuestionResult {
   jev?: { route: 'direct' | 'rlm'; confidence: number; identifier: boolean; applied: boolean; model: string; ms: number };
   /** Provider problems the caller should see, e.g. Gemini out of credits while OpenRouter answered. */
   warnings?: ProviderWarning[];
+  /** The retrieval hits, when `includeHits` was set. */
+  hits?: SemanticSearchResult[];
+  /** Why each stage ran or was skipped, in order. Same as the ask feed's 'step' events. */
+  stages?: AskStageReport[];
+  /** The RLM settings this ask ran with, one line. */
+  settingsLine?: string;
+  /** ss-rlm-sandbox: whether it answered, where, and how long it took. */
+  sandbox?: { used: boolean; host?: string; ms?: number; reason: string };
 }
 
 /**
@@ -934,6 +950,10 @@ export async function answerCodeQuestion(
   query: string,
   opts: AnswerCodeQuestionOptions = {},
 ): Promise<AnswerCodeQuestionResult> {
+  // Knowledge-card fast path (config tab "Knowledge Graph Cards", default
+  // off). Falls through to the normal path on any miss or error.
+  const viaCards = await (await import('../knowledge/cardAskHook.js')).tryCardAnswer(query, opts).catch(() => null);
+  if (viaCards) return viaCards;
   // a. Defaults from settings.semanticSearch.answerSynthesis merged with opts.
   let semanticSearch: any = {};
   try {
@@ -957,8 +977,24 @@ export async function answerCodeQuestion(
   const useRerank = opts.rerank !== false;
   // 'off' disables the cross-encoder pass; undefined lets config/policy decide.
   const rerankMode: RerankMode | undefined = useRerank ? undefined : 'off';
+  // RLM pipeline settings (OpenRouter page → RLM card). Unreadable = defaults.
+  let pipeline: RlmPipelineSettings = defaultRlmPipeline();
+  let sandboxModel: string | undefined;
+  let rlmRoute = 'local';
+  try {
+    const { getOpenRouterSettings } = await import('../sidecars/openRouterConfig.js');
+    const { sanitizePolicies } = await import('../sidecars/routingPolicy.js');
+    const st = getOpenRouterSettings();
+    pipeline = sanitizeRlmPipeline(st.rlmPipeline);
+    sandboxModel = st.rlmSandboxModel;
+    rlmRoute = String(sanitizePolicies(st.policyByRole).rlm ?? 'local');
+  } catch { /* defaults */ }
+  // Precedence: the caller's budget, then the fast-mode budget, then the RLM
+  // card's time limit, then `answerSynthesis.budgetMs`, then 120 s.
   const budgetMs = opts.budgetMs
-    ?? (fast && !useRlm ? FAST_ANSWER_BUDGET_MS : (synth.budgetMs ?? DEFAULT_ANSWER_BUDGET_MS));
+    ?? (fast && !useRlm
+      ? FAST_ANSWER_BUDGET_MS
+      : (pipeline.budgetSec ? pipeline.budgetSec * 1000 : (synth.budgetMs ?? DEFAULT_ANSWER_BUDGET_MS)));
   const startedAt = Date.now();
   const msLeft = (): number => budgetMs - (Date.now() - startedAt);
   // Stage marks, reported back to the caller as `timings`. "Why was that slow"
@@ -968,6 +1004,32 @@ export async function answerCodeQuestion(
     try { opts.onProgress?.({ stage, message, progress: n, total: 4 }); } catch { /* a bad listener must not fail the ask */ }
     if (opts.askId) emitAskEvent(opts.askId, { kind: 'stage', text: message, detail: stage });
   };
+  // Every stage decision is reported here: on the ask feed ('step' events),
+  // in the log, and in the result. A skipped stage must say why.
+  const stages: AskStageReport[] = [];
+  const stage = (r: AskStageReport): void => {
+    stages.push(r);
+    console.log(`[answerCodeQuestion] stage ${r.stage}: ${r.status} — ${r.reason}${r.ms !== undefined ? ` (${r.ms}ms)` : ''}`);
+    if (opts.askId) emitAskEvent(opts.askId, { kind: 'step', detail: r.stage, status: r.status, text: r.reason, ms: r.ms });
+  };
+  const retrievalCapMs = pipeline.retrievalCapSec * 1000;
+  // Jev or Clef, whichever semanticSearch.decisionModel selects.
+  const { getDecisionSettings } = await import('./providers/decisionModel.js');
+  const jevS = getDecisionSettings();
+  const settingsLine = describeSettings({
+    p: pipeline,
+    rlmRoute,
+    rlmModel: rlmRoute === 'local' ? undefined : sandboxModel,
+    jevAvailable: jevS.enabled && jevS.hasKey,
+    jevWhyNot: jevS.whyNot,
+    minConfidence: jevS.minConfidence,
+    sandboxModel,
+    budgetMs,
+    retrievalCapMs: Math.min(retrievalCapMs, budgetMs),
+    answerReserveMs: SYNTHESIS_RESERVE_MS,
+  });
+  console.log(`[answerCodeQuestion] settings: ${settingsLine}`);
+  if (opts.askId) emitAskEvent(opts.askId, { kind: 'settings', text: settingsLine });
   progress('retrieving', `searching project${opts.projectId !== undefined ? ` ${opts.projectId}` : ''}…`, 1);
 
   // ── Retrieval gets a SLICE of the budget, not all of it ─────────────────
@@ -1000,13 +1062,23 @@ export async function answerCodeQuestion(
     const v = Number(readRuntimeSemantic().embedQueryTimeoutMs);
     return Number.isFinite(v) && v >= 1_000 ? v : 20_000;
   })();
-  const retrievalDeadlineAt = startedAt + Math.max(embedFloorMs, Math.round(budgetMs * retrievalShare));
+  // The retrieval cap (RLM card, default 30 s) bounds the OPTIONAL work — the
+  // graph step and the related-project fan-out — so time is left for the RLM
+  // stage. The primary vector search itself is still never raced.
+  const retrievalDeadlineAt = startedAt + Math.max(embedFloorMs, Math.min(retrievalCapMs, Math.round(budgetMs * retrievalShare)));
+  const graphDeadlineAt = startedAt + retrievalCapMs;
+  let graphCapped: { afterMs: number; skippedRelated: number } | null = null;
+  const onGraphCapped = (i: { afterMs: number; skippedRelated: number }): void => {
+    graphCapped = { afterMs: Math.max(graphCapped?.afterMs ?? 0, i.afterMs), skippedRelated: (graphCapped?.skippedRelated ?? 0) + i.skippedRelated };
+  };
+  const raceSkipped: string[] = [];
   const raceDeadline = async <T,>(work: Promise<T>, fallback: T, label: string): Promise<T> => {
     const ms = retrievalDeadlineAt - Date.now();
-    if (ms <= 0) { console.warn(`[answerCodeQuestion] ${label}: retrieval deadline already passed — skipped`); return fallback; }
+    if (ms <= 0) { console.warn(`[answerCodeQuestion] ${label}: retrieval deadline already passed — skipped`); raceSkipped.push(label); work.catch(() => undefined); return fallback; }
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<T>(res => { timer = setTimeout(() => {
       console.warn(`[answerCodeQuestion] ${label}: exceeded the retrieval slice (${ms}ms) — continuing with what we have`);
+      raceSkipped.push(label);
       res(fallback);
     }, ms); });
     try { return await Promise.race([work, timeout]); } finally { if (timer) clearTimeout(timer); }
@@ -1055,6 +1127,8 @@ export async function answerCodeQuestion(
     includeGraphContext: true,
     crossEncoderReranker: semanticSearch.crossEncoderReranker,
     rerank: rerankMode,
+    graphDeadlineAt,
+    onGraphCapped,
   });
   const primaryMs = Date.now() - tPrimary0;
   let siblingsMs = 0;
@@ -1095,6 +1169,8 @@ export async function answerCodeQuestion(
           // Sibling context is supplementary; the primary project's results
           // are reranked. Three concurrent 50-doc cloud reranks cost up to 6s.
           rerank: 'off',
+          graphDeadlineAt,
+          onGraphCapped,
         }).catch(() => [] as typeof results), [] as typeof results, `sibling ${sib.name}`)),
     );
     for (const more of searched) results = results.concat(more);
@@ -1104,6 +1180,15 @@ export async function answerCodeQuestion(
   }
 
   marks.retrievalDone = Date.now();
+  {
+    const notes: string[] = [`${results.length} hits`];
+    const gc = graphCapped as { afterMs: number; skippedRelated: number } | null;
+    if (gc) notes.push(`graph step capped at ${Math.round(gc.afterMs / 1000)}s (${gc.skippedRelated} hit(s) without callers/callees)`);
+    if (siblings.length && fast && !useRlm) notes.push(`${siblings.length} related project(s) not searched (fast mode)`);
+    else if (raceSkipped.length) notes.push(`${raceSkipped.length} related project(s) skipped (retrieval deadline)`);
+    else if (siblings.length) notes.push(`+${Math.min(siblings.length, 6)} related project(s)`);
+    stage({ stage: 'search', status: 'ran', reason: notes.join('; '), ms: marks.retrievalDone - startedAt });
+  }
   // Where retrieval spent its time. Measured 5.8s in one warm run and 21.9s in
   // the next for the same question; the split says which step wandered.
   console.log(`[answerCodeQuestion] retrieval ${marks.retrievalDone - startedAt}ms = scope ${scopeMs}ms + primary ${primaryMs}ms + siblings(${siblings.length}) ${siblingsMs}ms → ${results.length} results`);
@@ -1129,8 +1214,8 @@ export async function answerCodeQuestion(
   // we moved to OpenRouter" fix.
   if (configuredProvider === 'auto') {
     try {
-      const { getVirtualContainersConfig } = await import('../sidecars/virtualContainers.js');
-      if (getVirtualContainersConfig().enabled === true) {
+      const { hasOpenRouterKey } = await import('../openrouter/key.js');
+      if (hasOpenRouterKey()) {
         provider = 'openrouter';
         requestedModel = opts.model ?? DEFAULT_MODELS.openrouter;
       }
@@ -1194,35 +1279,35 @@ export async function answerCodeQuestion(
   // numbered items so the final answer can cite RLM-found code as [n] instead
   // of describing it uncited (or inventing a number).
   const rlmFound = new Map<string, RlmFoundHit>();
+  let fantomOutcome: FantomRlmOutcome = 'not-needed';
+  let fantomStageMs: number | undefined;
+  const sandboxAlways = pipeline.sandboxMode === 'always';
   try {
     const { getSidecarForCapability } = await import('../sidecars/registry.js');
     const rlmSc = getSidecarForCapability('rlm');
-    // Do NOT gate on a local ss-rlm sidecar.
-    //
-    // This used to read `if (rlmSc)`, which meant the whole stage was skipped
-    // whenever no host ran ss-rlm — the permanent state once the RLM role
-    // moved to "OpenRouter only", where the GPUs are excluded by design. The
-    // sandbox was reachable and configured and never got asked, which is the
-    // other half of "the RLM stopped working when we moved to OpenRouter".
-    //
-    // `resolveRlmEndpoint()` inside runRlmGather already answers this
-    // properly: local ss-rlm, hosted sandbox, or null per the routing policy.
-    // Asking the registry here only duplicated the question and got it wrong.
-    //
-    // The budget check is the real gate now. Starting a multi-round tool loop
-    // with a few seconds left produces nothing and spends the reserve that the
-    // final cited pass needs.
+    // Do NOT gate on a local ss-rlm sidecar: `resolveRlmEndpoint()` inside
+    // runRlmGather picks local ss-rlm, the hosted route, or null per the
+    // routing policy. The budget check is the real gate.
     const rlmBudget = msLeft() - SYNTHESIS_RESERVE_MS;
-    // ── Jev gate: is the loop needed for THIS question? ──────────────────
-    // Only when the caller did not decide (`rlm` absent) and the loop would
-    // otherwise run. One typed judgment over the question and the top hits;
-    // `direct` at or above the confidence floor skips the 35–95 s stage.
-    // Anything else — Jev off, no key, timeout, low confidence, `rlm` — keeps
-    // the default. The decision rides along in the result and the ask feed.
-    if (useRlm && !rlmExplicit && rlmBudget >= MIN_RLM_MS) {
+    const askOffReason = `RLM off for this ask (${fast ? 'fast mode' : 'rlm=false'})`;
+    const anyEngine = pipeline.fantomRlm || sandboxAlways;
+
+    // ── Jev gate: is RLM needed for THIS question? ──────────────────────
+    // Only when the caller did not decide (`rlm` absent). `direct` at or
+    // above the confidence floor skips RLM (Fantom loop AND sandbox).
+    // Anything else — Jev off, no key, timeout, low confidence — keeps the
+    // default. Every outcome is reported as a 'jev' stage.
+    if (!useRlm) stage({ stage: 'jev', status: 'skipped', reason: askOffReason });
+    else if (rlmExplicit) stage({ stage: 'jev', status: 'skipped', reason: 'the ask turned RLM on explicitly' });
+    else if (!anyEngine) stage({ stage: 'jev', status: 'skipped', reason: 'Fantom RLM off and sandbox not "always" — nothing to gate' });
+    else if (!pipeline.jevEnabled) stage({ stage: 'jev', status: 'off', reason: 'Jev off in RLM settings' });
+    else if (!jevS.enabled) stage({ stage: 'jev', status: 'skipped', reason: 'Jev not enabled on LLM Providers' });
+    else if (!jevS.hasKey) stage({ stage: 'jev', status: 'skipped', reason: 'Jev has no TYPESAFE_API_KEY' });
+    else if (rlmBudget < MIN_RLM_MS) stage({ stage: 'jev', status: 'skipped', reason: noTimeReason(rlmBudget, budgetMs, MIN_RLM_MS) });
+    else {
+      const tJev0 = Date.now();
       try {
         const { decideAskRoute } = await import('./jevGates.js');
-        const tJev0 = Date.now();
         jevDecision = await decideAskRoute({
           question: query,
           hits: results.slice(0, 8).map((r) => ({ qualifiedName: r.qualifiedName, nodeType: r.nodeType, filePath: r.filePath })),
@@ -1231,22 +1316,45 @@ export async function answerCodeQuestion(
         if (jevDecision) {
           const applied = jevDecision.decisive && jevDecision.route === 'direct';
           if (applied) useRlm = false;
-          const line = `jev: ${jevDecision.route} (${Math.round(jevDecision.confidence * 100)}%${jevDecision.identifier ? ', identifier' : ''}) ${applied ? '→ skipping the RLM loop' : jevDecision.decisive ? '→ running the RLM loop' : '→ below the confidence floor, default route'} · ${Date.now() - tJev0}ms`;
+          const pct = Math.round(jevDecision.confidence * 100);
+          const line = `jev: ${jevDecision.route} (${pct}%${jevDecision.identifier ? ', identifier' : ''}) ${applied ? '→ skipping the RLM loop' : jevDecision.decisive ? '→ RLM loop' : '(below threshold, default route)'}`;
           if (opts.askId) emitAskEvent(opts.askId, { kind: 'thought', text: line, detail: 'jev' });
           try { opts.onProgress?.({ stage: 'investigating', message: line, progress: 2, total: 4 }); } catch { /* ignore */ }
+          stage({
+            stage: 'jev', status: 'ran', ms: Date.now() - tJev0,
+            reason: applied
+              ? `Jev said direct (${pct}%) — RLM skipped`
+              : jevDecision.decisive
+                ? `Jev said ${jevDecision.route} (${pct}%) — RLM runs`
+                : `Jev said ${jevDecision.route} (${pct}%), below ${Math.round(jevS.minConfidence * 100)}% — not applied`,
+          });
+        } else {
+          stage({ stage: 'jev', status: 'failed', reason: 'Jev gave no usable answer (timeout or error) — default route', ms: Date.now() - tJev0 });
         }
       } catch (err) {
         console.warn(`[jev] gate failed, default route: ${(err as Error).message}`);
+        stage({ stage: 'jev', status: 'failed', reason: `Jev failed: ${(err as Error).message.slice(0, 120)}`, ms: Date.now() - tJev0 });
       }
     }
+
     if (!useRlm) {
-      console.log(`[answerCodeQuestion] RLM stage off (${jevDecision && jevDecision.route === 'direct' && jevDecision.decisive && !rlmExplicit ? 'jev: direct' : `rlm=false${fast ? ', fast mode' : ''}`}) — answering from retrieval.`);
+      fantomOutcome = 'not-needed';
+      const jevSkip = jevDecision && jevDecision.route === 'direct' && jevDecision.decisive && !rlmExplicit;
+      stage({ stage: 'fantom-rlm', status: 'skipped', reason: jevSkip ? `Jev said direct (${Math.round(jevDecision!.confidence * 100)}%)` : askOffReason });
+    } else if (sandboxAlways) {
+      fantomOutcome = 'replaced';
+      stage({ stage: 'fantom-rlm', status: 'skipped', reason: 'sandbox set to "always" — Fantom loop and its Jev in-loop checks do not run' });
+    } else if (!pipeline.fantomRlm) {
+      fantomOutcome = 'off';
+      stage({ stage: 'fantom-rlm', status: 'off', reason: 'Fantom RLM off in settings' });
     } else if (rlmBudget < MIN_RLM_MS) {
+      fantomOutcome = 'no-time';
       console.log(
         `[answerCodeQuestion] skipping the RLM stage — ${Math.round(msLeft() / 1000)}s left of the `
         + `${Math.round(budgetMs / 1000)}s budget, not enough for a round plus synthesis. `
         + 'Answering from the retrieved context.',
       );
+      stage({ stage: 'fantom-rlm', status: 'skipped', reason: noTimeReason(rlmBudget, budgetMs, MIN_RLM_MS) });
     } else {
       rlmModel = rlmSc?.capabilities.rlm?.loaded ?? rlmSc?.capabilities.rlm?.models?.[0] ?? null;
       const { runRlmGather } = await import('./rlmToolLoop.js');
@@ -1270,7 +1378,13 @@ export async function answerCodeQuestion(
       const workspaceNote = siblings.length
         ? `Projects in scope: primary "${primaryName}" plus related projects ${siblings.map(describeScopeProject).join(', ')}. Searches cover all of them; results from related projects are tagged [project: name]. When a sub-question mentions a library or UI concept, target the project that lists it.`
         : '';
+      let unavailableReason: string | undefined;
+      const tFantom0 = Date.now();
       const gather = await runRlmGather({
+        jevGates: pipeline.jevEnabled,
+        jevPlanCoverage: pipeline.jevPlanCoverage,
+        jevEvidence: pipeline.jevEvidence,
+        onUnavailable: (r) => { unavailableReason = r; },
         // Feed: every question/answer to the dashboard log AND to the MCP
         // client's progress stream, so both see "asking X → 8 hits" live.
         onEvent: (e) => {
@@ -1328,11 +1442,66 @@ export async function answerCodeQuestion(
         rlmRounds = gather.rounds;
         rlmToolCalls = gather.toolCalls;
       }
+      fantomStageMs = Date.now() - tFantom0;
+      if (!gather) {
+        fantomOutcome = 'no-host';
+        stage({ stage: 'fantom-rlm', status: 'skipped', reason: unavailableReason ?? 'no RLM host', ms: fantomStageMs });
+      } else if (rlmDraft || rlmEvidence) {
+        fantomOutcome = 'useful';
+        stage({ stage: 'fantom-rlm', status: 'ran', reason: `${rlmRounds} round(s), ${rlmToolCalls} tool call(s)`, ms: fantomStageMs });
+      } else {
+        fantomOutcome = 'empty';
+        stage({ stage: 'fantom-rlm', status: 'ran', reason: `found nothing useful (${rlmToolCalls} tool call(s))`, ms: fantomStageMs });
+      }
     }
   } catch (err) {
     console.warn(`[answerCodeQuestion] RLM gather stage skipped: ${(err as Error).message}`);
     rlmDraft = '';
     rlmEvidence = '';
+    fantomOutcome = 'failed';
+    stage({ stage: 'fantom-rlm', status: 'failed', reason: (err as Error).message.slice(0, 160), ms: fantomStageMs });
+  }
+
+  // ── ss-rlm-sandbox: the whole question, once ───────────────────────────
+  // 'always' replaces the Fantom loop; 'backup' runs only when the loop had
+  // no host, failed, or found nothing, AND enough time remains. On any
+  // failure the answer comes from the retrieved context, as before.
+  let sandboxInfo: { used: boolean; host?: string; ms?: number; reason: string };
+  // ss-rlm-sandbox's tools_for_domain('code') returns None today, so its
+  // REPL has no search_code/search_symbols/search_files: it sees only the
+  // context sent with the question. Say so wherever it ran.
+  const SANDBOX_NO_TOOLS_NOTE = 'no code-search tools in the sandbox yet — it saw only the context Fantom sent';
+  {
+    const room = msLeft() - SYNTHESIS_RESERVE_MS;
+    const { hasSandboxKey } = await import('../openrouter/key.js');
+    const d = decideSandbox({
+      mode: pipeline.sandboxMode, fantom: fantomOutcome, msLeft: room, budgetMs,
+      minSandboxMs: pipeline.sandboxMinSec * 1000, hasModel: !!sandboxModel,
+      hasSandboxKey: hasSandboxKey(),
+    });
+    if (!d.run) {
+      sandboxInfo = { used: false, reason: d.reason };
+      stage({ stage: 'sandbox', status: d.status, reason: d.reason });
+    } else {
+      progress('investigating', `asking ss-rlm-sandbox (${d.reason})…`, 2);
+      const { runSandboxAsk } = await import('./rlmSandbox.js');
+      const r = await runSandboxAsk({
+        question: query,
+        context,
+        deadlineMs: room,
+        askId: opts.askId,
+        projectId,
+        onHost: (h) => { if (opts.askId) emitAskEvent(opts.askId, { kind: 'thought', text: `ss-rlm-sandbox on ${h} — one session for the whole question`, detail: 'sandbox' }); },
+      });
+      if (r.ok) {
+        rlmDraft = rlmDraft ? `${rlmDraft}\n\n${r.text}` : r.text;
+        sandboxInfo = { used: true, host: r.host, ms: r.ms, reason: d.reason };
+        stage({ stage: 'sandbox', status: 'ran', reason: `${d.reason} — answered on ${r.host}; ${SANDBOX_NO_TOOLS_NOTE}`, ms: r.ms });
+      } else {
+        sandboxInfo = { used: false, host: r.host, ms: r.ms, reason: r.reason };
+        stage({ stage: 'sandbox', status: 'failed', reason: `${r.reason}${r.host ? ` (${r.host})` : ''} — answering from the retrieved context`, ms: r.ms });
+      }
+    }
   }
   const rlmUsed = rlmDraft.length > 0 || rlmEvidence.length > 0;
 
@@ -1596,6 +1765,11 @@ export async function answerCodeQuestion(
   }
 
   marks.synthesisDone = Date.now();
+  stage(usedProvider === 'none'
+    ? { stage: 'answer', status: 'failed', reason: 'synthesis unavailable — sources only', ms: Math.max(0, marks.synthesisDone - marks.rlmDone) }
+    : /final synthesis was unavailable/.test(answer)
+      ? { stage: 'answer', status: 'failed', reason: 'synthesis unavailable — showing the RLM draft', ms: Math.max(0, marks.synthesisDone - marks.rlmDone) }
+      : { stage: 'answer', status: 'ran', reason: `${usedProvider}${usedModel ? ` · ${usedModel}` : ''}`, ms: Math.max(0, marks.synthesisDone - marks.rlmDone) });
   progress('done', `answered in ${((marks.synthesisDone - startedAt) / 1000).toFixed(1)}s`, 4);
   return {
     answer,
@@ -1621,6 +1795,10 @@ export async function answerCodeQuestion(
     complexity,
     ...(finalWarnings.length ? { warnings: finalWarnings } : {}),
     rlm: { used: rlmUsed, model: rlmModel, rounds: rlmRounds, toolCalls: rlmToolCalls, citations: promoted.length },
+    stages,
+    settingsLine,
+    sandbox: sandboxInfo,
+    ...(opts.includeHits ? { hits: results } : {}),
     ...(jevDecision ? {
       jev: {
         route: jevDecision.route,

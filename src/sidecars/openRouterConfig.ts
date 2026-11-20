@@ -37,18 +37,16 @@
  */
 
 import * as path from 'path';
-import { storeSecret, secretSource, type SecretSource } from '../config/secretsStore.js';
-import type { VirtualRole, VirtualRoutingMode } from './virtualContainers.js';
-import { VIRTUAL_ROLES, DEFAULT_OR_RERANK_MODEL } from './virtualContainers.js';
+import type { VirtualRole, VirtualRoutingMode } from '../openrouter/roleTypes.js';
+import { VIRTUAL_ROLES, DEFAULT_OR_RERANK_MODEL } from '../openrouter/roleTypes.js';
 import {
-  DEFAULT_CODE_ASSISTANT_MODEL, DEFAULT_RLM_SANDBOX_MODEL, isRlmFallbackMode, parseDirectRlmModel, type RlmFallbackMode,
+  DEFAULT_CODE_ASSISTANT_MODEL, RETIRED_CHAT_MODELS, isRlmFallbackMode, type RlmFallbackMode,
 } from './openRouterModels.js';
 import {
   modesFromPolicies, sanitizePolicies, policyFromMode,
   type PolicyByRole,
 } from './routingPolicy.js';
-import { listSidecars } from './registry.js';
-import { pushConfigToSidecar, isSoundSuiteSidecarConnected } from './soundsuiteMaster.js';
+import { sanitizeRlmPipeline, type RlmPipelineSettings } from '../embedding/rlmPipeline.js';
 import { atomicWriteConfigFile, readConfigFileWithRecovery } from '../config/index.js';
 
 const CONFIG_PATH = path.join(process.cwd(), 'config', 'fantomMcpServer-config.json');
@@ -76,18 +74,6 @@ export interface OpenRouterSettings {
    * so the two can never drift apart in config.
    */
   policyByRole?: PolicyByRole;
-  /** Whether a key has ever been pushed from here. Never the key itself. */
-  keyPushed?: boolean;
-  /**
-   * The last 4 characters of the pushed key, so the field can say WHICH key is
-   * stored — "Configured (••••498a)" — instead of a bare "a key exists".
-   * Four trailing characters identify a key to someone who already has it and
-   * are useless to someone who does not; the key itself is never written.
-   */
-  keyLast4?: string;
-  lastPushedAt?: string;
-  /** Sidecars the last push reached. */
-  lastPushedTo?: string[];
   /**
    * ── This master's RLM sandbox settings ──────────────────────────────────
    *
@@ -105,6 +91,9 @@ export interface OpenRouterSettings {
    */
   rlmSandboxModel?: string;
   rlmFallbackMode?: RlmFallbackMode;
+  /** Which engines an ask runs (Fantom RLM, Jev checks, ss-rlm-sandbox) and
+   *  its time budget. Always present when read; see embedding/rlmPipeline.ts. */
+  rlmPipeline?: RlmPipelineSettings;
 }
 
 /** The defaults Fantom proposes: the qwen embedder it already uses at 2560d,
@@ -149,7 +138,7 @@ export function getOpenRouterSettings(): OpenRouterSettings {
     // defaults are what we would propose. Returning empty modeByRole here is
     // what previously produced 15 providers the sidecars read as local-only.
     const policies = sanitizePolicies(undefined);
-    return { allowedModels: {}, modeByRole: modesFromPolicies(policies), policyByRole: policies };
+    return { allowedModels: {}, modeByRole: modesFromPolicies(policies), policyByRole: policies, rlmPipeline: sanitizeRlmPipeline(undefined) };
   }
   return {
     allowedModels: sanitizeAllowedModels(raw.allowedModels),
@@ -157,27 +146,44 @@ export function getOpenRouterSettings(): OpenRouterSettings {
     // is migrated by reading the policy back out of the modes.
     policyByRole: policiesFrom(raw),
     modeByRole: modesFromPolicies(policiesFrom(raw)),
-    keyPushed: raw.keyPushed === true,
-    keyLast4: typeof raw.keyLast4 === 'string' ? raw.keyLast4.slice(-4) : undefined,
-    lastPushedAt: typeof raw.lastPushedAt === 'string' ? raw.lastPushedAt : undefined,
-    lastPushedTo: Array.isArray(raw.lastPushedTo) ? raw.lastPushedTo.map(String) : undefined,
     // A stored model that is no longer in the catalogue is kept, not silently
     // swapped: the panel prepends it to the options labelled as such, so the
     // control can never display a different model than the one on file.
     rlmSandboxModel: typeof raw.rlmSandboxModel === 'string' && raw.rlmSandboxModel.trim()
-      ? raw.rlmSandboxModel.trim()
+      ? (RETIRED_CHAT_MODELS.includes(raw.rlmSandboxModel.trim()) ? DEFAULT_CODE_ASSISTANT_MODEL : raw.rlmSandboxModel.trim())
       : undefined,
     rlmFallbackMode: isRlmFallbackMode(raw.rlmFallbackMode) ? raw.rlmFallbackMode : undefined,
+    rlmPipeline: sanitizeRlmPipeline(raw.rlmPipeline),
   };
 }
 
-function saveOpenRouterSettings(next: OpenRouterSettings): void {
-  const cfg = readAll();
+/** Keys from the sidecar-push era, dropped on the next save (2026-11-19). */
+const DROPPED_KEYS = ['apiKey', 'keyPushed', 'keyLast4', 'lastPushedAt', 'lastPushedTo'];
+/** Worker-pool keys live in the same object but are written by their own save. */
+const POOL_KEYS = ['workerCount', 'interactiveSlots', 'requestTimeoutMs', 'maxPendingRows', 'writeBatchRows', 'masterServerUrl'];
+
+export function saveOpenRouterSettings(next: OpenRouterSettings): void {
+  const cfg = readAll() ?? {};
   cfg.semanticSearch = cfg.semanticSearch ?? {};
-  // Defensive: whatever the caller hands us, an apiKey never lands on disk.
-  const { ...safe } = next;
-  delete (safe as Record<string, unknown>).apiKey;
+  const prev = (cfg.semanticSearch.openRouter ?? {}) as Record<string, unknown>;
+  const safe: Record<string, unknown> = { ...next, allowedModels: sanitizeAllowedModels(next.allowedModels) };
+  if (typeof next.rlmSandboxModel === 'string' && RETIRED_CHAT_MODELS.includes(next.rlmSandboxModel)) {
+    safe.rlmSandboxModel = DEFAULT_CODE_ASSISTANT_MODEL;
+  }
+  for (const k of POOL_KEYS) if (prev[k] !== undefined && safe[k] === undefined) safe[k] = prev[k];
+  for (const k of DROPPED_KEYS) delete safe[k];
   cfg.semanticSearch.openRouter = safe;
+  // The virtual-container switch no longer exists: Fantom calls OpenRouter
+  // itself and the routing policy alone decides whether a role uses it.
+  delete cfg.semanticSearch.virtualContainers;
+  atomicWriteConfigFile(CONFIG_PATH, cfg);
+}
+
+/** Save worker-pool numbers (already validated) without touching the rest. */
+export function saveOpenRouterPoolSettings(values: Partial<Record<'workerCount' | 'interactiveSlots' | 'requestTimeoutMs' | 'maxPendingRows' | 'writeBatchRows', number>>): void {
+  const cfg = readAll() ?? {};
+  cfg.semanticSearch = cfg.semanticSearch ?? {};
+  cfg.semanticSearch.openRouter = { ...(cfg.semanticSearch.openRouter ?? {}), ...values };
   atomicWriteConfigFile(CONFIG_PATH, cfg);
 }
 
@@ -188,8 +194,11 @@ function sanitizeAllowedModels(raw: unknown): Partial<Record<VirtualRole, OpenRo
     if (!(VIRTUAL_ROLES as string[]).includes(role)) continue;
     const o = typeof v === 'string' ? { model: v } : (v as Record<string, unknown> | null);
     if (!o || typeof o.model !== 'string' || !o.model) continue;
+    // A model OpenRouter no longer serves reads as the current default, so the
+    // page shows a working choice and a save does not fail on it.
+    const model = RETIRED_CHAT_MODELS.includes(o.model) ? DEFAULT_CODE_ASSISTANT_MODEL : o.model;
     out[role as VirtualRole] = {
-      model: o.model,
+      model,
       provider: typeof o.provider === 'string' && o.provider ? o.provider : undefined,
       dims: typeof o.dims === 'number' && o.dims > 0 ? o.dims : undefined,
       note: typeof o.note === 'string' && o.note ? o.note : undefined,
@@ -233,8 +242,8 @@ export function validateOpenRouterSettings(
   opts: { hasKey: boolean; codeDimensions?: number },
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  if (!opts.hasKey && !s.keyPushed) {
-    issues.push({ message: 'No OpenRouter API key has been pushed to the fleet yet, and none was supplied. The first push to a slot must carry a key or the sidecar ignores it.' });
+  if (!opts.hasKey && Object.values(s.modeByRole).some(m => m && m !== 'local-only')) {
+    issues.push({ message: 'No OpenRouter API key is stored on this server and none was supplied. Fantom calls OpenRouter itself, so a role routed to OpenRouter needs one.' });
   }
   for (const [role, mode] of Object.entries(s.modeByRole) as Array<[VirtualRole, VirtualRoutingMode]>) {
     if (mode === 'local-only') continue;
@@ -255,7 +264,7 @@ export function validateOpenRouterSettings(
     }
     const m = s.allowedModels[role];
     if (!m) {
-      issues.push({ role, message: `Role "${role}" is ${mode} but no OpenRouter model is mapped for it — the sidecar will fall back to local and log a misconfiguration.` });
+      issues.push({ role, message: `Role "${role}" is ${mode} but no OpenRouter model is mapped for it.` });
       continue;
     }
     // Only the EMBEDDING roles pin an upstream and declare a width. Testing
@@ -264,7 +273,7 @@ export function validateOpenRouterSettings(
     // pin from a chat model that has no vector space to split.
     const isEmbeddingRole = role === 'embedding' || role === 'code-embedding';
     if (isEmbeddingRole && !m.provider) {
-      issues.push({ role, message: `Embedding role "${role}" has no pinned upstream provider. Two upstreams serving "${m.model}" can return different vectors, so an unpinned route can split the vector space between requests — the sidecar refuses it and falls back to local.` });
+      issues.push({ role, message: `Embedding role "${role}" has no pinned upstream provider. Two upstreams serving "${m.model}" can return different vectors, so an unpinned route can split the vector space between requests — Fantom refuses to embed through it.` });
     }
     // Compare against the CONFIGURED table width, not a literal: the literal
     // was the 4B's 2560 and blocked the 2026-09-29 switch to the 8B (4096d)
@@ -277,183 +286,4 @@ export function validateOpenRouterSettings(
     }
   }
   return issues;
-}
-
-export interface PushResult {
-  sidecarId: string;
-  name: string;
-  pushed: boolean;
-  reason?: string;
-}
-
-// ── Key source for automatic pushes ──────────────────────────────────────
-//
-// The sidecar keeps its config, key included, in memory and per master URL.
-// A sidecar restart, or Fantom moving to a new URL (the Docker deployment),
-// leaves Fantom's slot "unset", and a push WITHOUT a key does not fix that:
-// the sidecar drops it ("pushed with no apiKey (and none on file)"). So an
-// automatic re-push has to carry the key, which means Fantom must have one.
-// The key lives in the shared secrets store (`src/config/secretsStore.ts`):
-// a key pasted on the dashboard is saved to `<cache>/secrets/` (the persistent
-// volume in Docker) and applied to process.env; at boot a stored key wins
-// over `FANTOM_OPENROUTER_API_KEY` from the env file. Never written to the
-// config file, never logged, never returned.
-export type PushKeySource = SecretSource;
-
-export function availablePushKey(): { key: string; source: Exclude<PushKeySource, null> } | null {
-  const key = process.env.FANTOM_OPENROUTER_API_KEY?.trim();
-  const source = secretSource('FANTOM_OPENROUTER_API_KEY');
-  return key && source ? { key, source } : null;
-}
-
-/**
- * Push the config to every enabled sidecar with an open WS tunnel.
- *
- * `apiKey` is optional. When given it goes on the outgoing frame and is stored
- * on the server (secrets store, never the config file) so
- * automatic re-pushes can re-key a slot that a sidecar restart emptied — see
- * `openRouterAutoPush.ts`. Omit it to update models or modes without
- * re-sending the key — the sidecar merges partial pushes.
- */
-export function pushOpenRouterConfig(
-  settings: OpenRouterSettings,
-  apiKey?: string,
-): { results: PushResult[]; pushedCount: number } {
-  if (apiKey) {
-    try {
-      storeSecret('FANTOM_OPENROUTER_API_KEY', apiKey);
-    } catch (err) {
-      // Still push it; only the server-side copy failed.
-      process.env.FANTOM_OPENROUTER_API_KEY = apiKey;
-      console.warn(`[openrouter] could not store the API key on the server: ${(err as Error).message}`);
-    }
-  }
-  const { payload, resolved } = buildOpenRouterPushPayload(settings, apiKey);
-  settings = resolved;
-  return deliverAndRecord(settings, payload, apiKey);
-}
-
-/**
- * The `config` frame payload for a push. Pure: no I/O, no stored state. Shared
- * by the operator push and the per-sidecar automatic re-push.
- */
-export function buildOpenRouterPushPayload(
-  settings: OpenRouterSettings,
-  apiKey?: string,
-): { payload: Record<string, unknown>; resolved: OpenRouterSettings } {
-  // Derive the wire modes HERE rather than trusting what the caller put in
-  // `modeByRole`. The policy is the stored truth and the mode is a projection
-  // of it; every other reader already recomputes it, and this was the last
-  // place a hand-authored mode could have reached the fleet and disagreed with
-  // the dropdown the operator is looking at. It matters more now that three
-  // different policies project onto `cloud-only`.
-  const modeByRole = modesFromPolicies(sanitizePolicies(settings.policyByRole));
-  const resolved: OpenRouterSettings = { ...settings, modeByRole };
-  // ── The two-master contract ────────────────────────────────────────────
-  //
-  // `domain` tells the sidecar which retrieval tools to inject into the
-  // ss-rlm-sandbox session: Fantom is 'code' (search_code / search_symbols /
-  // search_files), Sound Suite is 'legal'. HARDCODED on purpose — which domain
-  // a codebase retrieves over is a fact about the software, not an operator
-  // preference, and a toggle would only create a way to misclick legal tools
-  // onto a code caller. It is also never inferred from the port: :3000 and
-  // :3848 are a deployment detail, and a master that declares no domain is
-  // treated as unconfigured rather than defaulting to either side, because the
-  // failure mode of guessing is a confidently wrong answer instead of an error.
-  //
-  // `rlm-sandbox` is the MODEL key and is deliberately not the same string as
-  // the `rlm` policy role: the role says which endpoint runs the session, the
-  // model key says which hosted model the sandbox calls. The sidecar answers
-  // 503 for a master it knows but that has no model under this key.
-  const allowedModels: Record<string, unknown> = { ...resolved.allowedModels };
-  // The `rlm` POLICY role carries no model of its own — it chooses an endpoint.
-  // Anything auto-filled under that key is a chat model nothing reads, and it
-  // shows up in the sidecar's `rolesWithModel` as if it were configured.
-  delete allowedModels['rlm'];
-  if (settings.rlmSandboxModel) {
-    // A `direct:<provider>:<model>` id runs on that provider's own API and is
-    // not an OpenRouter model. Pushing it made the OpenRouter fallback 400
-    // ("direct:gemini:gemini-3.8-flash is not a valid model ID", 2026-11-03),
-    // so when Gemini ran out of credits there was no fallback at all. The
-    // sidecar gets a real OpenRouter model for that fallback instead.
-    allowedModels['rlm-sandbox'] = {
-      model: parseDirectRlmModel(settings.rlmSandboxModel) ? DEFAULT_RLM_SANDBOX_MODEL : settings.rlmSandboxModel,
-    };
-  }
-
-  // Mode under BOTH keys. Fantom decides the endpoint itself
-  // (`resolveRlmEndpoint` reads the local policy), so this is informational for
-  // us — but the sidecar files it per master and Sound Suite's verified slot
-  // keys it `rlm-sandbox`, while 01-how-it-works documents `mode.rlm`. Writing
-  // one and not the other leaves a slot that disagrees with the reference
-  // shape, and whichever the sidecar grows to read, it finds the same answer.
-  const modeByRoleOut: Record<string, string> = { ...modeByRole };
-  if (modeByRoleOut.rlm) modeByRoleOut['rlm-sandbox'] = modeByRoleOut.rlm;
-
-  const payload: Record<string, unknown> = {
-    openrouter: {
-      ...(apiKey ? { apiKey } : {}),
-      allowedModels,
-      modeByRole: modeByRoleOut,
-      domain: 'code',
-    },
-  };
-  return { payload, resolved };
-}
-
-function deliverAndRecord(
-  settings: OpenRouterSettings,
-  payload: Record<string, unknown>,
-  apiKey?: string,
-): { results: PushResult[]; pushedCount: number } {
-
-  const results: PushResult[] = [];
-  for (const sc of listSidecars({ enabled: true })) {
-    if (!isSoundSuiteSidecarConnected(sc.id)) {
-      results.push({ sidecarId: sc.id, name: sc.name, pushed: false, reason: 'no open WS tunnel — the sidecar has not connected to Fantom\'s master slot' });
-      continue;
-    }
-    const ok = pushConfigToSidecar(sc.id, payload);
-    results.push({ sidecarId: sc.id, name: sc.name, pushed: ok, reason: ok ? undefined : 'send failed' });
-  }
-
-  // A send is not an outcome. pushConfigToSidecar only reports that the socket
-  // accepted the frame; the sidecar answers asynchronously and can reject the
-  // whole config — notably when the push carries no key and it has none on
-  // file, which it treats as "ignore everything", modes included. Reporting
-  // that as "pushed to 5/5" is how a fleet-wide rejection looked like success.
-  const pushedTo = results.filter(r => r.pushed).map(r => r.name);
-  const deliveredTo = pushedTo.length;
-  // Log modes and models, never the key — mirrors the sidecar's own hygiene.
-  console.log(
-    `[openrouter] delivered config to ${deliveredTo}/${results.length} sidecar(s): ${pushedTo.join(', ') || 'none'} · `
-    + `modes ${Object.entries(settings.modeByRole).map(([r, m]) => `${r}=${m}`).join(', ') || '(none)'} · `
-    + `models for ${Object.keys(settings.allowedModels).join(', ') || '(none)'}`
-    + `${apiKey ? ' · key included' : ' · key unchanged (merge)'}`,
-  );
-
-  saveOpenRouterSettings({
-    ...settings,
-    keyPushed: settings.keyPushed || !!apiKey,
-    keyLast4: apiKey ? apiKey.slice(-4) : settings.keyLast4,
-    lastPushedAt: new Date().toISOString(),
-    lastPushedTo: pushedTo,
-  });
-
-  return { results, pushedCount: pushedTo.length };
-}
-
-/**
- * Re-push on demand. The sidecar holds the config in memory only, so it is
- * lost on a sidecar restart — this is what the "Re-push" button calls, and
- * what a future reconnect hook would call.
- */
-export function rePushStoredConfig(): { results: PushResult[]; pushedCount: number } | null {
-  const s = getOpenRouterSettings();
-  if (Object.keys(s.allowedModels).length === 0) return null;
-  // Carry the key when Fantom has one: a keyless push is dropped by a slot the
-  // sidecar restart emptied, which is exactly the case this button is for.
-  const key = availablePushKey()?.key;
-  const { payload, resolved } = buildOpenRouterPushPayload(s, key);
-  return deliverAndRecord(resolved, payload, key);
 }

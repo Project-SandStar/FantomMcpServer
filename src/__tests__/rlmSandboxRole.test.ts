@@ -20,7 +20,7 @@ import {
   POLICY_ROLES, modesFromPolicies, effectiveBehaviour,
   aggregateIsMeaningful, policiesFor,
 } from '../sidecars/routingPolicy.js';
-import { VIRTUAL_ROLES, isRoleServable } from '../sidecars/virtualContainers.js';
+import { VIRTUAL_ROLES } from '../openrouter/roleTypes.js';
 import { catalogueFor, RLM_CATALOGUE } from '../sidecars/openRouterModels.js';
 
 describe('rlm is a first-class routing role', () => {
@@ -34,14 +34,6 @@ describe('rlm is a first-class routing role', () => {
     // withholding it here would be the "stores cleanly, changes nothing"
     // failure the policySupported hook exists to prevent.
     expect(policiesFor('rlm')).toEqual(['aggregate', 'backup', 'local', 'cloud']);
-  });
-
-  it('is servable: something actually executes it', () => {
-    // No <PC>-OR-Rlm virtual provider exists — the sidecar runs the container
-    // and Fantom reaches it over HTTP — but the role is served, so the UI must
-    // not badge it "not wired up yet" the way it does code-assistant.
-    expect(isRoleServable('rlm')).toBe(true);
-    expect(isRoleServable('code-assistant')).toBe(false);
   });
 });
 

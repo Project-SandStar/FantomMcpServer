@@ -4,7 +4,6 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   api, Sidecar, SidecarContainerInfo, LoadedModelInfo,
-  VirtualContainer, MasterSlotStatus, VectorRefusal, VectorVerification,
 } from '@/lib/api';
 
 const ROLE_ORDER = ['embedding', 'completion', 'ocr', 'reranker', 'cuda'];
@@ -189,177 +188,17 @@ function FleetForSidecar({ sidecar }: { sidecar: Sidecar }) {
   );
 }
 
-function ModePill({ mode }: { mode: VirtualContainer['mode'] }) {
-  const style =
-    mode === 'cloud-only' ? 'bg-violet-100 text-violet-800'
-    : mode === 'local-first' ? 'bg-sky-100 text-sky-800'
-    : 'bg-gray-100 text-gray-600';
-  return <span className={`text-[10px] px-1.5 py-0.5 rounded ${style}`}>{mode}</span>;
-}
-
-/**
- * Cloud-backed providers. Kept visually distinct from the container tables
- * above because they are NOT that host's GPU — they have no VRAM and no
- * gpuPercent, and a reader who confuses the two will think a Mac grew a
- * second accelerator.
- */
-function VirtualContainersPanel({
-  virtual, slots, masterWsPort, lastRerank,
+/** Which path served the last rerank. Cloud calls go from Fantom to OpenRouter directly. */
+function LastRerankLine({
+  lastRerank,
 }: {
-  virtual: VirtualContainer[];
-  slots: MasterSlotStatus[];
-  masterWsPort?: number;
-  lastRerank?: { path: string; servedBy: string; model: string; at: string; ms: number } | null;
+  lastRerank: { path: string; servedBy: string; model: string; at: string; ms: number };
 }) {
-  const qc = useQueryClient();
-  const [reports, setReports] = useState<string | null>(null);
-
-  const { data: verification } = useQuery({
-    queryKey: ['virtual-verification'],
-    queryFn: () => api.getVirtualVerification(),
-    refetchInterval: 30_000,
-  });
-
-  const refreshMut = useMutation({
-    mutationFn: () => api.refreshVirtualContainers(),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['sidecars'] }),
-  });
-
-  const verifyMut = useMutation({
-    mutationFn: () => api.verifyVirtualContainers(),
-    onSuccess: (r) => {
-      qc.invalidateQueries({ queryKey: ['virtual-verification'] });
-      // The note is context for the reports, not a replacement for them — it
-      // only stood in for them when there were none to show.
-      setReports([
-        r.reports.length === 0 ? (r.note ?? '') : '',
-        r.reference
-          ? `reference: ${r.reference}${r.regime === 'cloud-ref' ? ' (a cloud peer — this role is on "OpenRouter only")' : ''}`
-          : '',
-        ...r.reports.map(x =>
-          `${x.providerName}: ${x.ok ? 'PASS' : 'REFUSED'} — ${x.reason}`
-          + (x.minCosine !== undefined ? ` (min cosine ${x.minCosine.toFixed(6)}, ${x.dims}d)` : '')),
-        r.reports.length > 0 ? (r.note ?? '') : '',
-      ].filter(Boolean).join('\n'));
-    },
-    onError: (e: unknown) => setReports(`Verification failed: ${(e as Error)?.message ?? e}`),
-  });
-
-  const refusedBy = new Map<string, VectorRefusal>((verification?.refusals ?? []).map(f => [f.providerName, f]));
-  const okBy = new Map<string, VectorVerification>((verification?.verified ?? []).map(v => [v.providerName, v]));
-  const unconfigured = slots.filter(s => s.openrouter !== 'configured');
-
   return (
-    <div className="border border-violet-200 rounded-md overflow-hidden">
-      <div className="px-3 py-2 bg-violet-50 border-b border-violet-200 flex items-center justify-between">
-        <div className="text-sm font-medium text-gray-900">
-          Cloud-backed providers <span className="text-xs font-normal text-gray-600">(OpenRouter · no GPU, no VRAM)</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => refreshMut.mutate()}
-            disabled={refreshMut.isPending}
-            className="text-xs px-2 py-1 bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 rounded disabled:opacity-50"
-          >{refreshMut.isPending ? '…' : 'Rediscover'}</button>
-          <button
-            onClick={() => verifyMut.mutate()}
-            disabled={verifyMut.isPending}
-            title="Embed 10 probe texts locally and on OpenRouter and compare. Touches no vector table and starts no job."
-            className="text-xs px-2 py-1 bg-violet-100 hover:bg-violet-200 text-violet-800 rounded disabled:opacity-50"
-          >{verifyMut.isPending ? 'Verifying…' : 'Verify vectors'}</button>
-        </div>
-      </div>
-
-      {virtual.length === 0 ? (
-        <div className="px-3 py-3 text-xs text-gray-600 space-y-1">
-          <div>No OpenRouter capacity is available to Fantom.</div>
-          {unconfigured.length > 0 && (
-            <div className="text-gray-500">
-              {unconfigured.length} sidecar(s) report <code>openrouter: &quot;unset&quot;</code> for Fantom&apos;s
-              master slot{masterWsPort ? ` (wsPort ${masterWsPort})` : ''}. The sidecar scopes its OpenRouter key and
-              allow-list <em>per master</em>, so capacity configured for another master is deliberately not usable
-              here. Push one from the OpenRouter page.
-            </div>
-          )}
-        </div>
-      ) : (
-        <table className="w-full text-sm">
-          <thead className="bg-violet-50/50 text-xs text-gray-600">
-            <tr>
-              <th className="text-left px-3 py-2 font-medium">Provider</th>
-              <th className="text-left px-3 py-2 font-medium">Role</th>
-              <th className="text-left px-3 py-2 font-medium">Model</th>
-              <th className="text-left px-3 py-2 font-medium">Upstream</th>
-              <th className="text-left px-3 py-2 font-medium">Mode</th>
-              <th className="text-left px-3 py-2 font-medium">Vectors</th>
-              <th className="text-right px-3 py-2 font-medium">Served</th>
-            </tr>
-          </thead>
-          <tbody>
-            {virtual.map(v => {
-              const refusal = refusedBy.get(v.providerName);
-              const ok = okBy.get(v.providerName);
-              const isEmbed = v.role !== 'reranker';
-              return (
-                <tr key={v.providerName} className="border-t border-gray-100">
-                  <td className="px-3 py-2 font-medium text-gray-900">
-                    {v.providerName}
-                    <div className="text-[10px] text-gray-500">
-                      via {v.sidecarName}{v.source === 'config' ? ' · declared locally' : ''}
-                    </div>
-                  </td>
-                  <td className="px-3 py-2 text-xs text-gray-700">{v.role}</td>
-                  <td className="px-3 py-2 text-xs font-mono text-gray-700">{v.model}</td>
-                  <td className="px-3 py-2 text-xs text-gray-600">{v.upstreamProvider ?? <span className="text-gray-400">unpinned</span>}</td>
-                  <td className="px-3 py-2"><ModePill mode={v.mode} /></td>
-                  <td className="px-3 py-2 text-xs">
-                    {!isEmbed ? (
-                      <span className="text-gray-400" title="Rerank is stateless — it shares no vector space, so there is nothing to verify.">n/a</span>
-                    ) : ok ? (
-                      // A sole cloud provider under "OpenRouter only" has no
-                      // peer to compare with, so there is no cosine to show.
-                      // Printing one anyway would claim a measurement that was
-                      // never taken.
-                      <span
-                        className="text-green-700"
-                        title={
-                          ok.minCosine !== undefined
-                            ? `min cosine ${ok.minCosine} vs ${ok.referenceName ?? 'the reference'}`
-                              + ` (${ok.reference ?? 'local-ref'}), ${ok.dims}d`
-                            : `${ok.dims}d, pinned upstream — sole cloud provider, so nothing was compared`
-                        }
-                      >
-                        {ok.minCosine !== undefined
-                          ? `verified ${ok.minCosine.toFixed(4)}`
-                          : 'verified · dims + pin'}
-                      </span>
-                    ) : refusal ? (
-                      <span className="text-red-700" title={refusal.reason}>refused · {refusal.kind}</span>
-                    ) : (
-                      <span className="text-amber-600" title="Not yet verified — it will not serve any text until it passes.">unverified</span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2 text-right text-xs text-gray-700">
-                    {v.served ?? 0}
-                    {v.failures ? <span className="text-red-600"> · {v.failures} failed</span> : null}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      )}
-
-      {lastRerank && (
-        <div className="px-3 py-2 text-xs border-t border-gray-100 bg-gray-50 text-gray-700">
-          Last rerank served by <span className="font-medium">{lastRerank.servedBy}</span>{' '}
-          <span className={lastRerank.path === 'local' ? 'text-green-700' : 'text-violet-700'}>({lastRerank.path})</span>{' '}
-          · {lastRerank.model} · {lastRerank.ms}ms
-        </div>
-      )}
-      {reports && (
-        <pre className="px-3 py-2 text-[11px] whitespace-pre-wrap border-t border-gray-100 bg-gray-50 text-gray-700">{reports}</pre>
-      )}
+    <div className="px-3 py-2 text-xs border border-gray-200 rounded-md bg-gray-50 text-gray-700">
+      Last rerank served by <span className="font-medium">{lastRerank.servedBy}</span>{' '}
+      <span className={lastRerank.path === 'local' ? 'text-green-700' : 'text-violet-700'}>({lastRerank.path})</span>{' '}
+      · {lastRerank.model} · {lastRerank.ms}ms
     </div>
   );
 }
@@ -373,20 +212,13 @@ export function SidecarFleetTable() {
 
   if (isLoading) return null;
   const sidecars = data?.sidecars ?? [];
-  const virtual = data?.virtual ?? [];
-  const slots = data?.slots ?? [];
-  if (sidecars.length === 0 && virtual.length === 0) return null;
+  if (sidecars.length === 0 && !data?.lastRerank) return null;
 
   return (
     <div className="space-y-3 mb-4">
       <h3 className="text-sm font-semibold text-gray-900">Fleet (live containers)</h3>
       {sidecars.map(s => <FleetForSidecar key={s.id} sidecar={s} />)}
-      <VirtualContainersPanel
-        virtual={virtual}
-        slots={slots}
-        masterWsPort={data?.masterWsPort}
-        lastRerank={data?.lastRerank}
-      />
+      {data?.lastRerank && <LastRerankLine lastRerank={data.lastRerank} />}
     </div>
   );
 }

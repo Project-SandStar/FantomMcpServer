@@ -62,9 +62,11 @@ COPY assets/grammars ./assets/grammars
 COPY config/*.example.json ./config/
 # Haxall build script (src/installers/haxall.ts runs it from the install root).
 COPY scripts/haxall ./scripts/haxall
+# Vector index builder: the server runs it as a child process (src/embedding/indexBuild.ts).
+COPY scripts/build-vector-index.mjs ./scripts/build-vector-index.mjs
 RUN mkdir -p /app/.cache/models /mirror
 VOLUME ["/app/.cache", "/app/.cache/models"]
 EXPOSE 3848
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.MCP_PORT||3848)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["sh", "-c", "npx prisma migrate deploy && exec node --expose-gc --max-old-space-size=4096 build/index.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy && exec node --expose-gc --max-old-space-size=12288 build/index.js"]

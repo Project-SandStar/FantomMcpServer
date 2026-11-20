@@ -111,6 +111,30 @@ export class EmbedCache {
     return out;
   }
 
+  /**
+   * Every vector stored under one text version (newest first, at most
+   * `limit`), as model → (text hash → vector). Used to load the small set of
+   * saved QUERY vectors into memory at boot, so the query path never scans
+   * the table.
+   */
+  async loadVersion(textVersion: number, limit: number): Promise<Map<string, Map<string, Float32Array>>> {
+    const out = new Map<string, Map<string, Float32Array>>();
+    if (!this.enabled() || limit <= 0) return out;
+    const table = await this.open(false);
+    if (!table) return out;
+    const rows = await table.query()
+      .where(`text_version = ${Math.trunc(textVersion)}`)
+      .select(['model', 'text_hash', 'vec', 'last_used_at'])
+      .toArray() as Array<{ model: string; text_hash: string; vec: Uint8Array; last_used_at: string }>;
+    rows.sort((a, b) => String(b.last_used_at).localeCompare(String(a.last_used_at)));
+    for (const r of rows.slice(0, limit)) {
+      const m = out.get(r.model) ?? new Map<string, Float32Array>();
+      m.set(r.text_hash, fromBytes(r.vec));
+      out.set(r.model, m);
+    }
+    return out;
+  }
+
   /** Mark hit keys as used now (LRU order for prune). Best effort, queued. */
   private touch(keys: string[]): void {
     const table = this.table;

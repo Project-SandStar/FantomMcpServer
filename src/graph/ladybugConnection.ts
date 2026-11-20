@@ -12,6 +12,7 @@ import { execSync } from 'child_process';
 import { Database, Connection } from '@ladybugdb/core';
 import { createLogger } from '../utils/index.js';
 import { getCachePath } from '../utils/installRoot.js';
+import { graphSetting } from './graphSettings.js';
 
 const logger = createLogger('ladybug-connection');
 
@@ -185,8 +186,8 @@ export async function getLadybugConnection(): Promise<InstanceType<typeof Connec
     // for cross-project queries (semantic search / RLM `ask` with no projectId
     // enrich against this DB) → "Buffer manager exception: buffer pool is full".
     // Give it an explicit, generous pool. Env: FANTOM_LADYBUG_BUFFER_MIB.
-    const mainBufMiB = Number(process.env.FANTOM_LADYBUG_BUFFER_MIB);
-    const MAIN_BUFFER_SIZE = (Number.isFinite(mainBufMiB) && mainBufMiB > 0 ? mainBufMiB : 512) * 1024 * 1024;
+    // Dashboard value > env > 512 (src/graph/graphSettings.ts); read once at open.
+    const MAIN_BUFFER_SIZE = graphSetting('mainBufferMiB') * 1024 * 1024;
     const MAIN_DB_MAX_SIZE = 8 * 1024 * 1024 * 1024; // 8 GiB sparse mmap cap
     // autoCheckpoint off for the same reason as the per-project stores: the
     // engine's in-query checkpoint is the writer in every SIGSEGV stack; we

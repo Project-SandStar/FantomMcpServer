@@ -3,8 +3,10 @@
 /**
  * The OpenRouter section of the config page.
  *
- * Four sections, in this order: Live Activity, Connection, Credits & Spend,
- * Model Selection. Deliberately NOT here: a curated-models panel and a chat
+ * Sections, in order: Live Activity, Connection (key + sandbox slots),
+ * Workers, Routing Policy, Credits & Spend, Model Selection, Decision model.
+ * Fantom calls OpenRouter itself; sidecars only hold the key for
+ * ss-rlm-sandbox. Deliberately NOT here: a curated-models panel and a chat
  * catalogue — Fantom has no chat role, and the model list is three dropdowns'
  * worth of information that does not need a second rendering.
  *
@@ -15,9 +17,12 @@
  */
 
 import { useState, useEffect } from 'react';
+import { RlmPipelineCard, type RlmCardDraft } from './RlmPipelineCard';
+import { OpenRouterWorkersCard, workersDraftFrom, workersPatch, type WorkersDraft } from './OpenRouterWorkersCard';
+import { DecisionModelCard } from './DecisionModelCard';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  api, VirtualRole, OpenRouterRoleActivity, CloudBudgetStats, OpenRouterCatalogueEntry,
+  api, VirtualRole, OpenRouterRoleActivity, OpenRouterCatalogueEntry, CompatibilityReport,
   RoutingPolicy, PolicyDrift, PolicyNote, OpenRouterProbeResult,
 } from '@/lib/api';
 
@@ -53,18 +58,18 @@ export function OpenRouterPanel() {
   });
 
   const [apiKey, setApiKey] = useState('');
-  const [enabled, setEnabled] = useState(false);
+  const [sandboxKey, setSandboxKey] = useState('');
   const [models, setModels] = useState<Partial<Record<VirtualRole, string>>>({});
   const [caps, setCaps] = useState<Partial<Record<VirtualRole, string>>>({});
-  const [budgetInput, setBudgetInput] = useState('');
+  const [workersDraft, setWorkersDraft] = useState<WorkersDraft | null>(null);
   const [policies, setPolicies] = useState<Partial<Record<VirtualRole, RoutingPolicy>>>({});
   const [note, setNote] = useState<string | null>(null);
+  const [rlmDraft, setRlmDraft] = useState<RlmCardDraft | null>(null);
 
   // Seed the form from the server once, and re-seed when the server's own
   // view changes. Never pre-fill the key field — see the helper text.
   useEffect(() => {
     if (!data) return;
-    setEnabled(data.enabled);
     setModels(Object.fromEntries(
       ROLES.map(r => [
         r,
@@ -77,9 +82,33 @@ export function OpenRouterPanel() {
       ]),
     ));
     setCaps(Object.fromEntries(ROLES.map(r => [r, data.dailyCaps[r] ? String(data.dailyCaps[r]) : ''])));
-    setBudgetInput(data.budget?.manualConcurrency ? String(data.budget.manualConcurrency) : '');
+    setWorkersDraft(workersDraftFrom(data));
     setPolicies({ ...data.policyByRole });
+    if (data.rlm?.pipeline) {
+      setRlmDraft({
+        pipeline: { ...data.rlm.pipeline },
+        jevPct: Math.round((data.rlm.jev?.minConfidence ?? 0.7) * 100),
+      });
+    }
   }, [data]);
+
+  // Only changed RLM fields are sent, so an untouched control never
+  // overwrites what is stored.
+  const rlmPatch = (() => {
+    const stored = data?.rlm?.pipeline;
+    if (!rlmDraft || !stored) return {};
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(rlmDraft.pipeline) as Array<keyof typeof rlmDraft.pipeline>) {
+      const v = rlmDraft.pipeline[k];
+      // A blank number field means "leave alone", not 0.
+      if (typeof v === 'number' && !Number.isFinite(v)) continue;
+      if (v !== stored[k] && v !== undefined) out[k] = v;
+    }
+    return out;
+  })();
+  const storedJevPct = Math.round((data?.rlm?.jev?.minConfidence ?? 0.7) * 100);
+  const jevPctChanged = !!rlmDraft && Number.isFinite(rlmDraft.jevPct) && rlmDraft.jevPct >= 1 && rlmDraft.jevPct <= 100 && rlmDraft.jevPct !== storedJevPct;
+  const rlmDirty = Object.keys(rlmPatch).length > 0 || jevPctChanged;
 
   const save = useMutation({
     mutationFn: async () => {
@@ -91,9 +120,8 @@ export function OpenRouterPanel() {
       for (const r of ROLES) if (r !== 'rlm' && models[r]) allowedModels[r] = { model: models[r]! };
       return api.pushOpenRouterConfig({
         apiKey: apiKey || undefined,
-        enabled,
-        // Saving the policy ALWAYS re-pushes. A stored mode that never reached
-        // the fleet is inert, and looks identical to one in effect.
+        sandboxKey: sandboxKey || undefined,
+        ...workersPatch(workersDraft, data),
         policyByRole: policies,
         allowedModels: allowedModels as never,
         dailyCaps: Object.fromEntries(
@@ -105,30 +133,34 @@ export function OpenRouterPanel() {
         // page, and the server treats blank as "no change" as a second line
         // of defence.
         ...(models['rlm'] && models['rlm'] !== data?.rlm?.model ? { rlmSandboxModel: models['rlm'] } : {}),
+        ...(Object.keys(rlmPatch).length ? { rlmPipeline: rlmPatch } : {}),
+        ...(jevPctChanged ? { jevMinConfidence: rlmDraft!.jevPct } : {}),
       });
     },
     onSuccess: (r) => {
       setApiKey(''); // never keep it in component state after the push
+      setSandboxKey('');
       setNote(r.note);
       void qc.invalidateQueries({ queryKey: ['openrouter-config'] });
+      void qc.invalidateQueries({ queryKey: ['openrouter-activity'] });
+      void qc.invalidateQueries({ queryKey: ['openrouter-credits'] });
     },
     onError: (e: Error) => setNote(e.message),
   });
 
-  const saveBudget = useMutation({
-    mutationFn: () => api.setOpenRouterBudget(budgetInput === '' ? '' : Number(budgetInput)),
-    onSuccess: () => { setNote('Call-limit ceiling updated.'); void qc.invalidateQueries({ queryKey: ['openrouter-config'] }); },
-    onError: (e: Error) => setNote(e.message),
+  // Live read from OpenRouter: not polled, refreshed by the button.
+  const creditsQ = useQuery({
+    queryKey: ['openrouter-credits'],
+    queryFn: api.getOpenRouterCredits,
+    enabled: !!data?.hasKey,
+    staleTime: 60_000,
   });
 
-  const refreshCredits = useMutation({
-    mutationFn: api.getOpenRouterCredits,
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ['openrouter-config'] }),
-  });
-
-  const repush = useMutation({
-    mutationFn: api.rePushOpenRouterConfig,
-    onSuccess: (r) => setNote(`Re-pushed to ${r.pushedCount} sidecar(s).`),
+  const [verifyResult, setVerifyResult] = useState<{ reports: CompatibilityReport[]; error?: string } | null>(null);
+  const verify = useMutation({
+    mutationFn: api.verifyOpenRouterVectors,
+    onSuccess: (r) => setVerifyResult({ reports: r.reports }),
+    onError: (e: Error) => setVerifyResult({ reports: [], error: e.message }),
   });
 
   // Live round trips. Each result replaces only its own role, so "Test all"
@@ -147,9 +179,11 @@ export function OpenRouterPanel() {
 
   if (isLoading || !data) return <div className="text-sm text-gray-500">Loading…</div>;
 
-  const budget: CloudBudgetStats = live?.budget ?? data.budget;
   const activity = live?.activity ?? data.activity;
-  const credits = budget?.credits;
+  const credits = creditsQ.data?.credits ?? null;
+  const remaining = credits?.limitRemaining ?? (
+    credits?.totalCredits !== undefined && credits?.totalUsage !== undefined ? credits.totalCredits - credits.totalUsage : null
+  );
   const nowMs = live?.nowMs ?? Date.now();
   const spendToday = live?.spendToday ?? data.spendToday;
 
@@ -183,58 +217,20 @@ export function OpenRouterPanel() {
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder={data.keyPushed ? `Configured (••••${data.keyLast4 ?? '????'})` : 'sk-or-v1-…'}
-              className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm font-mono"
+              placeholder={data.hasKey ? `Stored on this server (••••${data.keyLast4 ?? '????'})` : 'No key stored'}
+              className={`w-full px-3 py-2 border rounded-md text-sm font-mono ${!data.hasKey && !apiKey ? 'border-red-400' : 'border-gray-300'}`}
             />
-            {data.slotHealth && data.slotHealth.unset.length > 0 && (
-              <div className="mt-2 mb-1 px-3 py-2 text-xs rounded-md border border-amber-300 bg-amber-50 text-amber-900 space-y-1">
-                <div className="font-medium">
-                  {data.slotHealth.keyFlagStale
-                    ? `The key is NOT on ${data.slotHealth.unset.length} sidecar slot(s) for this server, although a key is marked as stored.`
-                    : `${data.slotHealth.unset.length} sidecar slot(s) for this server hold no OpenRouter config.`}
-                </div>
-                <ul className="list-disc ml-4">
-                  {data.slotHealth.unset.map(s => (
-                    <li key={s.sidecarId}>
-                      {s.name}
-                      {s.serverUrl ? <> — slot <code>{s.serverUrl}</code></> : null}
-                      {s.lastAutoPushAt ? ` · auto-pushed ${new Date(s.lastAutoPushAt).toLocaleTimeString()}` : ''}
-                    </li>
-                  ))}
-                </ul>
-                <div>
-                  {data.slotHealth.keySource
-                    ? `Fantom re-pushes the config with the ${data.slotHealth.keySource === 'env' ? 'FANTOM_OPENROUTER_API_KEY env' : 'saved'} key on each discovery poll (every 60 s, 5 min apart per sidecar).`
-                    : 'Fantom has no key to re-push, and a push without a key is ignored by an empty slot. Paste the key above and save (it is kept on the server), or set FANTOM_OPENROUTER_API_KEY in the server env.'}
-                </div>
-              </div>
-            )}
-            {data.slotHealth && data.slotHealth.unknown.length > 0 && (
-              <p className="text-xs text-gray-500 mt-1">
-                Slot state unknown (status probe failed): {data.slotHealth.unknown.map(s => s.name).join(', ')}.
+            {!data.hasKey && !apiKey && (
+              <p className="mt-1 text-xs text-red-700">
+                No key stored. Paste your key here, then press Save Settings.
               </p>
             )}
             <p className="text-xs text-gray-500 mt-1">
-              {data.keyPushed
-                ? `A key is stored (ends in ${data.keyLast4 ?? '????'}). Leave blank to keep it — this field is never pre-filled with the real value.`
-                : 'The key is sent to the sidecars and saved on this server in its own owner-only file, so Fantom can re-key a sidecar after a restart. It is never logged or returned.'}
+              {data.hasKey
+                ? `${data.keySource === 'env' ? 'The key comes from the server env.' : 'The key is stored on this server.'} Leave blank to keep it. Paste a new key to replace it.`
+                : 'Paste your key and press Save Settings. It is stored on this server only and is never shown again.'}
             </p>
           </div>
-
-          <label className="flex items-start gap-2">
-            <input
-              type="checkbox"
-              checked={enabled}
-              onChange={(e) => setEnabled(e.target.checked)}
-              className="mt-0.5"
-            />
-            <span className="text-sm text-gray-700">
-              Enable OpenRouter
-              <span className="block text-xs text-gray-500">
-                While off, nothing calls out to OpenRouter and every role stays local.
-              </span>
-            </span>
-          </label>
 
           <div className="flex items-center gap-3">
             <button
@@ -245,32 +241,38 @@ export function OpenRouterPanel() {
             >
               {save.isPending ? 'Saving…' : 'Save Settings'}
             </button>
-            <button
-              type="button"
-              onClick={() => repush.mutate()}
-              disabled={repush.isPending || !data.keyPushed}
-              title="Re-push sends the key only if Fantom holds one (last pasted key or FANTOM_OPENROUTER_API_KEY). An empty slot ignores a push without a key."
-              className="text-sm text-blue-600 hover:underline disabled:text-gray-400 disabled:no-underline"
-            >
-              Re-push to sidecars
-            </button>
           </div>
 
-          {note && <p className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded p-2">{note}</p>}
+          {note && <p className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded p-2 whitespace-pre-line">{note}</p>}
 
-          {/* Which hosts the push actually reached. A sidecar with no WS
-              tunnel to Fantom's master slot silently gets nothing, and that
-              is the single most common reason "it is configured" is false. */}
-          <div className="text-xs text-gray-500">
-            {data.sidecars.map(s => (
-              <span key={s.id} className="inline-block mr-3">
-                <span className={s.wsConnected ? 'text-green-700' : 'text-gray-400'}>●</span>{' '}
-                {s.name} {s.wsConnected ? '' : '(no tunnel — push will skip it)'}
-              </span>
-            ))}
+          {/* Sandbox slots: the only thing sidecars still hold for Fantom. */}
+          <div>
+            <h4 className="text-sm font-medium text-gray-700 mb-1">Sandbox slots</h4>
+            <p className="text-xs text-gray-500 mb-1">
+              Sidecars only hold Fantom&apos;s separate sandbox key for ss-rlm-sandbox. Everything else calls OpenRouter directly.
+            </p>
+            {data.slots.length === 0 ? (
+              <p className="text-xs text-gray-400">No sidecar reports a slot.</p>
+            ) : (
+              <ul className="text-xs text-gray-700 space-y-0.5">
+                {data.slots.map(s => (
+                  <li key={s.sidecarId}>
+                    <span className={s.openrouter === 'configured' ? 'text-green-700' : s.openrouter === 'unset' ? 'text-amber-600' : 'text-gray-400'}>●</span>{' '}
+                    {s.name} · {s.openrouter}
+                    {s.lastPushAt
+                      ? ` · last push ${s.lastPushOk ? 'ok' : 'failed'} ${fmtAgo(s.lastPushAt, nowMs)}`
+                      : ' · not pushed yet'}
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         </div>
       </section>
+
+      {workersDraft && (
+        <OpenRouterWorkersCard data={data} live={live} draft={workersDraft} setDraft={setWorkersDraft} />
+      )}
 
       {/* ── 3. ROUTING POLICY ────────────────────────────────────────── */}
       <section>
@@ -282,19 +284,8 @@ export function OpenRouterPanel() {
           it.
         </p>
 
-        {/* The same "stored but inert" failure arrives through this door too:
-            with OpenRouter disabled no container is discovered, so nothing
-            here is in effect and drift detection cannot see it either —
-            there is no fleet to disagree with. Say so rather than showing a
-            dropdown that reads as live. */}
-        {!data.enabled && (
-          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-3">
-            OpenRouter is <strong>disabled</strong> above, so none of these policies is in effect and every
-            role is running on the sidecars alone. They are stored and will apply once you enable it.
-          </p>
-        )}
         <div className="space-y-4">
-          {data.catalogue.map(c => {
+          {data.catalogue.filter(c => c.role !== 'rlm').map(c => {
             const localVectors = data.storedVectorOrigin?.local ?? { providers: [], texts: 0, projects: 0 };
             const drift = data.policyDrift.find((d: PolicyDrift) => d.role === c.role);
             const note = data.policyNotes.find((n: PolicyNote) => n.role === c.role);
@@ -397,13 +388,36 @@ export function OpenRouterPanel() {
                 )}
                 {dirty && (
                   <p className="text-xs text-blue-700 mt-1">
-                    Unsaved — press Save Settings to store and push this.
+                    Unsaved. Press Save Settings.
                   </p>
                 )}
               </div>
             );
           })}
         </div>
+        {/* RLM: route + model + Jev + sandbox + time limit, as one flow. */}
+        {rlmDraft && data.rlm && (() => {
+          const rlmCat = data.catalogue.find(c => c.role === 'rlm');
+          return (
+            <RlmPipelineCard
+              draft={rlmDraft}
+              setDraft={setRlmDraft}
+              policy={policies['rlm'] ?? 'local'}
+              setPolicy={(p) => setPolicies({ ...policies, rlm: p })}
+              policyOptions={data.policyOptionsByRole?.['rlm'] ?? data.policyOptions}
+              model={models['rlm'] ?? ''}
+              setModel={(m) => setModels({ ...models, rlm: m })}
+              modelOptions={rlmCat?.options ?? data.rlm.options}
+              jev={data.rlm.jev}
+              defaultBudgetSec={data.rlm.defaultBudgetSec ?? 120}
+              sandboxKey={sandboxKey}
+              setSandboxKey={setSandboxKey}
+              hasSandboxKey={!!data.hasSandboxKey}
+              sandboxKeyLast4={data.sandboxKeyLast4 ?? null}
+              dirty={!!sandboxKey || rlmDirty || (policies['rlm'] !== data.policyByRole['rlm']) || (!!models['rlm'] && models['rlm'] !== data.rlm.model)}
+            />
+          );
+        })()}
       </section>
 
       {/* ── 4. CREDITS & SPEND ───────────────────────────────────────── */}
@@ -412,27 +426,35 @@ export function OpenRouterPanel() {
           <h3 className="text-lg font-semibold text-gray-900">Credits &amp; Spend</h3>
           <button
             type="button"
-            onClick={() => refreshCredits.mutate()}
-            className="text-xs text-blue-600 hover:underline"
+            onClick={() => void creditsQ.refetch()}
+            disabled={!data.hasKey || creditsQ.isFetching}
+            className="text-xs text-blue-600 hover:underline disabled:text-gray-400 disabled:no-underline"
           >
-            {refreshCredits.isPending ? 'Refreshing…' : 'Refresh'}
+            {creditsQ.isFetching ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
-          <Stat label="Remaining" value={money(credits?.remaining)} />
+          <Stat label="Remaining" value={money(remaining)} />
           <Stat label="Total credits" value={money(credits?.totalCredits)} />
-          <Stat label="Total usage" value={money(credits?.totalUsage)} />
+          <Stat label="Total usage" value={money(credits?.totalUsage ?? credits?.usage)} />
           <Stat label="Spent today (all roles)" value={`$${spendToday.toFixed(4)}`} />
         </div>
-
-        {!budget.discovery.ok && (
+        {!data.hasKey && <p className="text-xs text-gray-500 mb-4">No key stored, so credits cannot be read.</p>}
+        {creditsQ.data && !creditsQ.data.ok && (
           <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-4">
-            Credits and the account call limit could not be read
-            {budget.discovery.reason ? `: ${budget.discovery.reason}` : '.'}{' '}
-            {budget.discovery.unsupported
-              ? 'The sidecar build does not answer virtual-key-info yet, so Fantom is using the conservative default rather than assuming headroom it could not read.'
-              : ''}
+            Credits could not be read{creditsQ.data.reason ? `: ${creditsQ.data.reason}` : '.'}
+          </p>
+        )}
+        {creditsQ.error && (
+          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-4">
+            Credits could not be read: {(creditsQ.error as Error).message}
+          </p>
+        )}
+        {credits?.rateLimit?.requests !== undefined && (
+          <p className="text-xs text-gray-500 mb-4">
+            Account rate limit: {credits.rateLimit.requests} requests per {credits.rateLimit.interval ?? '?'}
+            {credits.isFreeTier ? ' · free tier' : ''}
           </p>
         )}
 
@@ -460,57 +482,9 @@ export function OpenRouterPanel() {
             );
           })}
 
-          {/* The call-limit ceiling lives here, next to the spend caps: both
-              answer "how much of this shared key may Fantom take?". */}
-          <div>
-            <label className="block text-xs text-gray-600 mb-1">
-              Call limit (concurrent cloud requests)
-            </label>
-            <div className="flex gap-1">
-              <input
-                type="number"
-                min={1}
-                max={budget.maxAllowed ?? 256}
-                value={budgetInput}
-                onChange={(e) => setBudgetInput(e.target.value)}
-                placeholder={budget.ceilingConcurrency ? `detected: ${budget.ceilingConcurrency}` : 'blank = default'}
-                className="w-full px-2 py-1.5 border border-gray-300 rounded-md text-sm"
-              />
-              <button
-                type="button"
-                onClick={() => saveBudget.mutate()}
-                className="px-2 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-50"
-              >
-                Set
-              </button>
-            </div>
-            <p className="text-xs text-gray-500 mt-1">
-              in use: {budget.inFlight}/{budget.effectiveConcurrency} of {budget.ceilingConcurrency}
-              {budget.queued > 0 ? ` · ${budget.queued} queued` : ''}
-              {budget.state !== 'steady' ? ` · ${budget.state}` : ''}
-              {budget.rateLimitHits > 0 ? ` · ${budget.rateLimitHits}× 429` : ''}
-            </p>
-            {/* WHERE THE NUMBER CAME FROM. The budget used to show only the
-                figure, so `discoveredConcurrency: 1` on a $100 account read as
-                a fact about the account rather than a signal Fantom had
-                swallowed whole. */}
-            {budget.sourceDetail && (
-              <p className={`text-xs mt-1 ${budget.rateLimitTrusted === false ? 'text-amber-700' : 'text-gray-500'}`}>
-                {budget.rateLimitTrusted === false ? '⚠ ' : ''}
-                {budget.sourceDetail}
-              </p>
-            )}
-            {budget.rateLimitTrusted === false && budget.discovery.rawRateLimit != null && (
-              <p className="text-xs text-gray-400 mt-0.5">
-                <code>/key</code> returned <code>rate_limit {JSON.stringify(budget.discovery.rawRateLimit)}</code>
-              </p>
-            )}
-          </div>
         </div>
         <p className="text-xs text-gray-500 mt-3">
-          Every sidecar holds the same key and OpenRouter limits per key, so this ceiling is shared by all of
-          them. Sitting under the account limit leaves headroom for the Sound Suite master, which would
-          otherwise be starved by a Fantom rebuild. Local GPU providers never draw from it.
+          Fantom uses one OpenRouter key for all roles. The Workers card above sets how many requests run at once.
         </p>
       </section>
 
@@ -518,18 +492,43 @@ export function OpenRouterPanel() {
       <section>
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-lg font-semibold text-gray-900">Model Selection</h3>
-          <button
-            type="button"
-            onClick={() => test.mutate(undefined)}
-            disabled={test.isPending}
-            title="One live request per role, down the path the role really uses, with the key and model the sidecars hold."
-            className="px-3 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50"
-          >
-            {test.isPending && test.variables === undefined ? 'Testing all…' : 'Test all'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => verify.mutate()}
+              disabled={verify.isPending}
+              title="Embed up to 10 stored row texts per role and compare with the stored vectors. Writes nothing."
+              className="px-3 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50"
+            >
+              {verify.isPending ? 'Verifying…' : 'Verify vectors'}
+            </button>
+            <button
+              type="button"
+              onClick={() => test.mutate(undefined)}
+              disabled={test.isPending}
+              title="One live request per role, with the saved key and model."
+              className="px-3 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50"
+            >
+              {test.isPending && test.variables === undefined ? 'Testing all…' : 'Test all'}
+            </button>
+          </div>
         </div>
+        {verifyResult && (
+          <div className="text-xs mb-4 border border-gray-200 rounded p-2 bg-gray-50 space-y-0.5">
+            {verifyResult.error ? (
+              <div className="text-red-600">Verify failed: {verifyResult.error}</div>
+            ) : verifyResult.reports.length === 0 ? (
+              <div className="text-gray-600">Nothing to verify: no OpenRouter embedder is in use.</div>
+            ) : verifyResult.reports.map(r => (
+              <div key={r.key} className={r.ok ? 'text-green-700' : 'text-red-700'}>
+                {r.providerName}: {r.ok ? 'ok' : 'refused'}
+                {r.minCosine !== undefined ? ` · min cosine ${r.minCosine.toFixed(4)}` : ''} · {r.reason}
+              </div>
+            ))}
+          </div>
+        )}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          {data.catalogue.map((c: OpenRouterCatalogueEntry) => {
+          {data.catalogue.filter((c: OpenRouterCatalogueEntry) => c.role !== 'rlm').map((c: OpenRouterCatalogueEntry) => {
             const stored = storedModel(c.role);
             const unsaved = !!models[c.role] && models[c.role] !== stored;
             return (
@@ -572,13 +571,7 @@ export function OpenRouterPanel() {
         </p>
       </section>
 
-      {/* The RLM sandbox used to have its own section here with a model
-          picker and a "fallback mode" dropdown. Both are gone: `rlm` is now a
-          first-class routing role, so its endpoint choice is the same
-          four-option dropdown every other role uses (Routing Policy) and its
-          model is the same picker (Model Selection). One vocabulary, one place
-          per question — and the "not wired up yet" badge is retired, because
-          it is. */}
+      <DecisionModelCard />
     </div>
   );
 }

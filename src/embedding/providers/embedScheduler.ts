@@ -37,8 +37,8 @@ import type { EmbeddingProvider } from './embeddingProvider.js';
 export interface PipelineOptions {
   /** Called once per completed chunk, serialized in completion order; may be async (e.g. LanceDB write). */
   onChunk?: (indices: number[], vectors: Float32Array[], provider: EmbeddingProvider) => void | Promise<void>;
-  /** Attribution hook — which provider produced how many vectors. */
-  onServed?: (provider: EmbeddingProvider, count: number) => void;
+  /** Attribution hook — which provider produced how many vectors (and the vectors, for per-worker credit). */
+  onServed?: (provider: EmbeddingProvider, count: number, vectors?: Float32Array[]) => void;
   /** Checked before every dispatch; when true no further chunks start. */
   shouldCancel?: () => boolean;
   /** Max requests in flight for a provider close to the fastest one (default 3). */
@@ -288,7 +288,7 @@ export async function embedTextsPipelined(
         noteCompletion(s, chunk.length, ms);
         for (let j = 0; j < indices.length; j++) result.vectors[indices[j]] = vecs![j];
         result.servedBy[s.name] = (result.servedBy[s.name] ?? 0) + chunk.length;
-        opts.onServed?.(s.p, chunk.length);
+        opts.onServed?.(s.p, chunk.length, vecs!);
         if (opts.onChunk) {
           const cb = opts.onChunk;
           storeChain = storeChain

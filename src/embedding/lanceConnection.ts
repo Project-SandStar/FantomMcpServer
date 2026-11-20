@@ -7,7 +7,7 @@
  *   - docs_vectors: documentation embeddings (768d default, larger model)
  */
 
-import { connect, type Connection, type Table } from '@lancedb/lancedb';
+import { connect, Session, type Connection, type Table } from '@lancedb/lancedb';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createLogger } from '../utils/index.js';
@@ -66,8 +66,29 @@ function resolveDocsDims(): number {
 }
 
 let connection: Connection | null = null;
+/** LanceDB session cache caps in bytes (FANTOM_LANCE_INDEX_CACHE_MB, FANTOM_LANCE_METADATA_CACHE_MB). */
+export function lanceCacheBytes(env: NodeJS.ProcessEnv = process.env): { index: bigint; metadata: bigint } {
+  const mb = (v: string | undefined, d: number) => { const n = Number.parseInt(v ?? '', 10); return BigInt(Number.isFinite(n) && n > 0 ? n : d) * 1048576n; };
+  return { index: mb(env.FANTOM_LANCE_INDEX_CACHE_MB, 4096), metadata: mb(env.FANTOM_LANCE_METADATA_CACHE_MB, 256) };
+}
 let codeTable: Table | null = null;
 let codeTableName: string | null = null; // which slot the cached codeTable points at
+/** Bumped on every slot swap, reset or drop: result caches key on it, since
+ *  a dropped and re-created table can restart at a version seen before. */
+let codeTableGen = 0;
+export function codeTableGeneration(): number { return codeTableGen; }
+
+/** One cheap ANN query so the first real search finds the table handle and
+ *  index files open. Best effort; never throws. */
+export async function warmCodeTable(): Promise<number> {
+  const t0 = Date.now();
+  try {
+    const table = await getLanceTable();
+    if ((await table.countRows()) === 0) return Date.now() - t0;
+    await table.vectorSearch(new Array(resolveCodeDims()).fill(0.01)).limit(1).select(['node_id']).toArray();
+  } catch (e) { logger.debug(`[lance] warm-up query failed: ${(e as Error).message}`); }
+  return Date.now() - t0;
+}
 let docsTable: Table | null = null;
 
 function getLanceDbPath(): string {
@@ -213,7 +234,14 @@ export async function getLanceConnection(): Promise<Connection> {
   if (!connection) {
     const dbPath = getLanceDbPath();
     logger.debug(`Connecting to LanceDB at ${dbPath}`);
-    connection = await connect(dbPath);
+    const c = lanceCacheBytes();
+    // Bounded session caches. The library default (6 GB index + 1 GB metadata)
+    // sits outside the V8 heap. The index cache must hold the whole code
+    // vector index: IVF_HNSW_SQ on ~440k x 4096d is ~1.8 GB of SQ codes plus
+    // the HNSW graphs. With a 1 GB cap every search reloaded partitions from
+    // disk (ANN 2.3 s median, memory churn); 2 GB+ gave 0.1-0.18 s
+    // (2026-11-20, live table, 50 queries). 4 GB leaves room for growth.
+    connection = await connect(dbPath, { session: new Session(c.index, c.metadata) });
   }
   return connection;
 }
@@ -459,6 +487,16 @@ export async function promoteCodeTable(shadowName: string): Promise<void> {
   if (shadowName !== CODE_TABLE_NAME && shadowName !== CODE_TABLE_NAME_B) {
     throw new Error(`promoteCodeTable: invalid slot '${shadowName}'`);
   }
+  // Every promotion path (re-embed, promote-anyway) gets the indexes here,
+  // so the first query after the flip uses the ANN, BM25 and scalar indexes
+  // instead of scanning. Skips what already exists; never blocks the flip.
+  try {
+    const { buildCodeTableIndexes } = await import('./indexBuild.js');
+    const r = await buildCodeTableIndexes(shadowName);
+    logger.info(`[lance] indexes on ${shadowName} before promotion: built=[${r.built.join('; ')}] skipped=${r.skipped.length} failed=[${r.failed.join('; ')}]`);
+  } catch (e) {
+    logger.warn(`[lance] index build before promoting ${shadowName} failed (promoting anyway): ${(e as Error).message}`);
+  }
   const old = getActiveCodeTableName();
   writeActiveCodeTableName(shadowName);
   if (codeTable) { try { codeTable.close(); } catch { /* ignore */ } codeTable = null; codeTableName = null; }
@@ -466,7 +504,9 @@ export async function promoteCodeTable(shadowName: string): Promise<void> {
     try { const conn = await getLanceConnection(); await conn.dropTable(old); }
     catch (e) { logger.warn(`promoteCodeTable: dropping old slot '${old}' failed: ${(e as Error).message}`); }
   }
+  codeTableGen++;
   logger.info(`Promoted code-vector slot '${shadowName}' to active (was '${old}')`);
+  void warmCodeTable().then(ms => logger.info(`[lance] warm-up after promotion: ${ms}ms`));
 }
 
 /**
@@ -612,7 +652,17 @@ export async function closeLanceConnection(): Promise<void> {
 /**
  * Reset table references (e.g. after restore)
  */
+/**
+ * Move the cached code-table handle to the newest table version. A handle
+ * opened before another process (the index-build child) committed a change
+ * keeps reading the old version; this is non-destructive, unlike reset.
+ */
+export async function refreshCodeTableHandle(): Promise<void> {
+  if (codeTable && codeTable.isOpen()) await codeTable.checkoutLatest();
+}
+
 export function resetLanceTable(): void {
+  codeTableGen++;
   if (codeTable) {
     codeTable.close();
     codeTable = null;
@@ -629,6 +679,7 @@ export function resetLanceTable(): void {
  * (or back) requires recreating the table.
  */
 export async function dropCodeVectorsTable(): Promise<void> {
+  codeTableGen++;
   const conn = await getLanceConnection();
   if (codeTable) { try { codeTable.close(); } catch { /* ignore */ } codeTable = null; codeTableName = null; }
   // Drop the ACTIVE slot (which may be code_vectors or code_vectors_b after a

@@ -16,13 +16,17 @@ export interface AskEvent {
   /** ms since the ask started */
   t: number;
   /** 'warning': a provider problem the user should see (detail = warning kind, items[0] = provider). */
-  kind: 'stage' | 'plan' | 'round' | 'ask' | 'answer' | 'thought' | 'done' | 'error' | 'warning';
+  /** 'step': one pipeline stage's outcome (detail = stage name, status, text = reason).
+   *  'settings': the RLM settings this ask runs with (text = one-line summary). */
+  kind: 'stage' | 'plan' | 'round' | 'ask' | 'answer' | 'thought' | 'done' | 'error' | 'warning' | 'step' | 'settings';
   text: string;
   /** Pairs an 'answer' with its 'ask'. */
   id?: string;
   detail?: string;
   items?: string[];
   ms?: number;
+  /** For 'step': ran | skipped | off | failed. */
+  status?: 'ran' | 'skipped' | 'off' | 'failed';
 }
 
 interface AskLog { startedAt: number; events: AskEvent[]; done: boolean; endedAt: number | null }

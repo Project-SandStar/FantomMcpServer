@@ -5,8 +5,7 @@ import {
   cloudMayServe, isCloudOnlyPolicy, policiesFor, policySupported,
 } from '../sidecars/routingPolicy.js';
 import { POLICY_ROLES } from '../sidecars/routingPolicy.js';
-import { VIRTUAL_ROLES, isRoleServable } from '../sidecars/virtualContainers.js';
-import type { VirtualRole } from '../sidecars/virtualContainers.js';
+import { VIRTUAL_ROLES, type VirtualRole } from '../openrouter/roleTypes.js';
 
 describe('the operator vocabulary', () => {
   it('offers four choices, the fourth being "OpenRouter only"', () => {
@@ -313,8 +312,7 @@ describe('a stored policy that never reached the fleet is not in effect', () => 
 describe('the code-assistant role joins the policy machinery', () => {
   it('keeps POLICY_ROLES in step with VIRTUAL_ROLES', () => {
     // routingPolicy deliberately duplicates the role list rather than
-    // importing it — it sits on the rerank path and virtualContainers pulls in
-    // the registry and the WS master. This is what stops the copy rotting.
+    // importing it — it sits on the rerank path. This is what stops the copy rotting.
     expect([...POLICY_ROLES].sort()).toEqual([...VIRTUAL_ROLES].sort());
   });
 
@@ -332,14 +330,5 @@ describe('the code-assistant role joins the policy machinery', () => {
 
   it('honours "SideCar only" for it too', () => {
     expect(effectiveBehaviour('code-assistant', 'local').sidecarMode).toBe('local-only');
-  });
-
-  it('is reported as not yet servable, so the UI can say so', () => {
-    // The sidecar stores and reports the role, but ws-client has no chat
-    // action — the setting is real, the data path is not.
-    expect(isRoleServable('code-assistant')).toBe(false);
-    for (const role of ['embedding', 'code-embedding', 'reranker'] as VirtualRole[]) {
-      expect(isRoleServable(role)).toBe(true);
-    }
   });
 });

@@ -149,6 +149,7 @@ const navItems = [
   { href: '/graph-viewer', label: 'Graph Viewer', icon: GraphIcon },
   { href: '/graph-3d', label: '3D Graph', icon: GraphIcon },
   { href: '/vector-viewer', label: 'Vector Search', icon: VectorIcon },
+  { href: '/knowledge-cards', label: 'Knowledge Cards', icon: BookOpenIcon },
   { href: '/workflows', label: 'Workflows', icon: WorkflowIcon },
   { href: '/axon', label: 'Axon', icon: BeakerIcon },
   { href: '/tree-sitter-viewer', label: 'AST Viewer', icon: TreeIcon },

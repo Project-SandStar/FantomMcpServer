@@ -9,8 +9,15 @@ import { registerIndexingHookRoute, registerIndexingRoutes } from './indexingRou
 import { registerWorkflowRoutes } from './workflowRoutes.js';
 import { registerSidecarSyncRoutes } from './sidecarSyncRoutes.js';
 import { registerNetbirdRoutes } from './netbirdRoutes.js';
+import { registerKnowledgeCardRoutes } from './knowledgeCardRoutes.js';
+import { registerKnowledgeCardViewerRoutes } from './knowledgeCardViewerRoutes.js';
+import { registerKnowledgeCardBulkRoutes } from './knowledgeCardBulkRoutes.js';
+import { registerGraphSettingsRoutes } from './graphSettingsRoutes.js';
 import { registerPathMappingRoutes } from './pathMappingRoutes.js';
 import { registerFsBrowseRoutes } from './fsBrowseRoutes.js';
+import { createDecisionModelRouter } from './decisionModelRoutes.js';
+import { hasSandboxKey, sandboxKeyLast4, saveSandboxKey, clearSandboxKey, openRouterKey as openRouterKeyNow } from '../openrouter/key.js';
+import { sandboxOffReason } from '../sidecars/sandboxSlots.js';
 import { registerInstallerRoutes } from '../installers/routes.js';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -487,12 +494,23 @@ export function createAdminRouter(context: AdminContext): Router {
   registerSidecarSyncRoutes(router, { userStore });
   // NetBird page: /admin/netbird/* (src/admin/netbirdRoutes.ts)
   registerNetbirdRoutes(router);
+  // Knowledge Graph Cards tab: /admin/knowledge-cards/* (src/admin/knowledgeCardRoutes.ts)
+  registerKnowledgeCardRoutes(router);
+  // Knowledge Card viewer page: /admin/knowledge-cards/viewer/* (read-only)
+  registerKnowledgeCardViewerRoutes(router);
+  // Viewer bulk tools (admin only): rebuild / delete selected cards
+  registerKnowledgeCardBulkRoutes(router);
+  // Graph tab: /admin/graph/settings (src/admin/graphSettingsRoutes.ts)
+  registerGraphSettingsRoutes(router);
   // Path mappings (host prefix → container prefix): /admin/path-mappings
   registerPathMappingRoutes(router);
   // Server folder picker: /admin/fs/dirs (src/admin/fsBrowseRoutes.ts)
   registerFsBrowseRoutes(router);
   // Haxall/SkySpark installers: /admin/installers/* (src/installers/routes.ts)
   registerInstallerRoutes(router);
+  // Decision model (Jev or Clef via OpenRouter): /admin/decision-model/*.
+  // Basic Auth above already guards it, so no extra check here.
+  router.use(createDecisionModelRouter((_req, _res, next) => next()));
 
   // Pretty-print JSON for all admin routes
   router.use((_req: Request, res: Response, next: NextFunction) => {
@@ -3277,7 +3295,7 @@ export function createAdminRouter(context: AdminContext): Router {
 
   router.post('/search/semantic', async (req: Request, res: Response): Promise<void> => {
     try {
-      const { query, projectId, projectName, limit = 10, llmReranker, crossEncoderReranker, hybrid, rerank, minScore } = req.body || {};
+      const { query, projectId, projectName, limit = 10, llmReranker, crossEncoderReranker, hybrid, rerank, minScore, rerankCodeChars, rerankCodeMode, rerankXeWeight, groupVersions } = req.body || {};
       if (!query) {
         res.status(400).json({ error: 'query required' });
         return;
@@ -3328,6 +3346,11 @@ export function createAdminRouter(context: AdminContext): Router {
         ...(rerank === 'auto' || rerank === 'on' || rerank === 'off' ? { rerank } : {}),
         // Calibration/debug: see what the absolute score floor is hiding.
         ...(typeof minScore === 'number' && Number.isFinite(minScore) ? { minScore } : {}),
+        // A/B of the reranker reading chunk text (0 = off) without a settings change.
+        ...(typeof rerankCodeChars === 'number' && Number.isFinite(rerankCodeChars) && rerankCodeChars >= 0 ? { rerankCodeChars: Math.min(rerankCodeChars, 4000) } : {}),
+        ...(rerankCodeMode === 'all' || rerankCodeMode === 'body' || rerankCodeMode === 'missing-doc' ? { rerankCodeMode } : {}),
+        ...(typeof rerankXeWeight === 'number' && rerankXeWeight >= 0 && rerankXeWeight <= 1 ? { rerankXeWeight } : {}),
+        ...(typeof groupVersions === 'boolean' ? { groupVersions } : {}),
       });
       res.json({ count: Array.isArray(results) ? results.length : 0, projectId: pid, elapsedMs: Date.now() - t0, results });
     } catch (error) {
@@ -8335,7 +8358,7 @@ export function createAdminRouter(context: AdminContext): Router {
    */
   router.post('/vectors/search', async (req: Request, res: Response): Promise<void> => {
     try {
-      const { query, projectId, versionGroup, nodeType, limit = 20, includeGraphContext = true } = req.body;
+      const { query, projectId, versionGroup, nodeType, limit = 20, includeGraphContext = true, groupVersions } = req.body;
 
       if (!query || typeof query !== 'string') {
         res.status(400).json({ error: 'Query is required' });
@@ -8374,7 +8397,8 @@ export function createAdminRouter(context: AdminContext): Router {
         projectIds,
         nodeType,
         limit: Math.min(limit, 50),
-        includeGraphContext
+        includeGraphContext,
+        ...(typeof groupVersions === 'boolean' ? { groupVersions } : {}),
       });
 
       res.json({
@@ -8398,7 +8422,7 @@ export function createAdminRouter(context: AdminContext): Router {
    */
   router.post('/vectors/ask', async (req: Request, res: Response): Promise<void> => {
     try {
-      const { query, projectId, versionGroup, provider, model, topK, fast, rlm, rerank, askId } = req.body || {};
+      const { query, projectId, versionGroup, provider, model, topK, fast, rlm, rerank, askId, includeHits } = req.body || {};
       if (!query || typeof query !== 'string') {
         res.status(400).json({ error: 'query is required' });
         return;
@@ -8428,6 +8452,9 @@ export function createAdminRouter(context: AdminContext): Router {
         // Stage switches. Absent → defaults (RLM unless fast; rerank on).
         rlm: typeof rlm === 'boolean' ? rlm : undefined,
         rerank: typeof rerank === 'boolean' ? rerank : undefined,
+        // The vector viewer lists these hits instead of running the same
+        // search a second time next to the ask.
+        includeHits: includeHits === true,
       });
       if (feedId) endAsk(feedId);
       res.json(result);
@@ -9608,13 +9635,7 @@ export function createAdminRouter(context: AdminContext): Router {
           createProjectQueue, haltRequested, finalizeHalt, decidePromotion,
           resolveMaxConcurrentProjects,
         } = await import('./shadowRebuild.js');
-        const { runWithCloudBudgetProject, refreshCloudBudgetFromKey } =
-          await import('../embedding/providers/cloudBudget.js');
-        // Read the key's real limit once at the top of a rebuild. It never
-        // throws: a failed probe leaves the conservative default in place,
-        // which is the safe direction. A manual override on the admin page
-        // still wins over whatever comes back.
-        await refreshCloudBudgetFromKey(true).catch(() => undefined);
+        const { runWithOpenRouterProject } = await import('../openrouter/projectContext.js');
         const queue = createProjectQueue(projectIds);
         let halted: 'paused' | 'cancelled' | null = null;
 
@@ -9699,9 +9720,10 @@ export function createAdminRouter(context: AdminContext): Router {
               + 'local vectors that the cloud query encoder would no longer match.',
             );
           }
-          const credit = (p: unknown, n: number): void => {
-            const name = (p as { getSidecarName?: () => string }).getSidecarName?.() ?? 'in-process';
-            served.set(name, (served.get(name) ?? 0) + n);
+          const { servedAttribution } = await import('../openrouter/workerAttribution.js');
+          const credit = (p: unknown, n: number, vecs?: Float32Array[]): void => {
+            // Direct OpenRouter credits each pool worker (worker1 … workerN).
+            for (const [name, k] of servedAttribution(p, n, vecs)) served.set(name, (served.get(name) ?? 0) + k);
           };
           try {
             // Single-project re-embed deletes that project's live vectors first.
@@ -9773,10 +9795,19 @@ export function createAdminRouter(context: AdminContext): Router {
 
             const pipeline = embedPipelineSettings();
             const texts = workItems.map(it => it.text);
+            // Direct OpenRouter: latency barely grows with batch size (1 text
+            // ~1 s, 50 texts ~4.5 s), so the latency-tuned sidecar sizing
+            // shrinks chunks to ~10 texts and starves the pool. Send full
+            // chunks and keep every pool worker fed; the pool caps in-flight.
+            const { DirectOpenRouterEmbeddingProvider, MAX_TEXTS_PER_REQUEST } = await import('../openrouter/embeddingProvider.js');
+            const allDirect = fanout.length > 0 && fanout.every(p => p instanceof DirectOpenRouterEmbeddingProvider);
+            const directChunk = Math.min(MAX_TEXTS_PER_REQUEST, Math.max(32, batchSize));
+            const { getPoolSettings } = await import('../openrouter/settings.js');
             const run = await embedTextsPipelined(fanout, texts, {
-              depth: pipeline.depth,
+              depth: allDirect ? getPoolSettings().workerCount + 2 : pipeline.depth,
               targetChunkMs: pipeline.targetChunkMs,
-              maxChunk: Math.max(8, batchSize),
+              ...(allDirect ? { minChunk: directChunk, probeChunk: directChunk } : {}),
+              maxChunk: allDirect ? directChunk : Math.max(8, batchSize),
               // Both halts stop dispatching; which one it was decides whether
               // the shadow survives, and that is settled after the pool drains.
               shouldCancel: () => haltRequested(job.id) !== null,
@@ -9905,7 +9936,7 @@ export function createAdminRouter(context: AdminContext): Router {
             // Tag the async context so the global cloud permit pool can
             // round-robin permits BETWEEN projects: without this every waiter
             // lands in one FIFO and the largest project starves the rest.
-            try { await runWithCloudBudgetProject(pid, () => runProject(pid)); }
+            try { await runWithOpenRouterProject(pid, () => runProject(pid)); }
             finally {
               queue.release(pid);   // released on success AND failure
               const cur = getJob(job.id);
@@ -9941,14 +9972,8 @@ export function createAdminRouter(context: AdminContext): Router {
             // Indexes are a property of the table: build both on the shadow
             // BEFORE the flip so the first query after promotion is served by
             // the ANN and the BM25 leg, not by scans.
-            try {
-              const { ensureCodeVectorIndex, ensureCodeTextIndex } = await import('../embedding/lanceConnection.js');
-              const ann = await ensureCodeVectorIndex(writeTable, { label: shadowName, rows });
-              const fts = await ensureCodeTextIndex(writeTable, { label: shadowName });
-              console.log(`[reembed-job] shadow '${shadowName}' indexes: ann=${ann.reason}; fts=${fts.reason}`);
-            } catch (e) {
-              console.warn(`[reembed-job] index build on shadow failed (promoting anyway): ${(e as Error).message}`);
-            }
+            // promoteCodeTable builds them first, in a child process (the
+            // IVF_PQ training would trip this process's RSS guard).
             await promoteCodeTable(shadowName);
             promoted = true;
           } else {
@@ -9980,6 +10005,16 @@ export function createAdminRouter(context: AdminContext): Router {
         }
         if (isAll) setShadowReembedActive(false, liveAll ? 'live' : 'shadow');
         releaseHeavy?.();
+        // A live rebuild wrote straight into the active slot (no promotion):
+        // build its indexes now, in the background, in a child process.
+        if (liveAll) {
+          void (async () => {
+            const { getActiveCodeTableName } = await import('../embedding/lanceConnection.js');
+            const { buildCodeTableIndexes } = await import('../embedding/indexBuild.js');
+            const r = await buildCodeTableIndexes(getActiveCodeTableName(), { force: true });
+            console.log(`[reembed-job] live rebuild indexes: built=[${r.built.join('; ')}] failed=[${r.failed.join('; ')}]`);
+          })().catch(() => {});
+        }
       }
     });
 
@@ -10753,19 +10788,31 @@ export function createAdminRouter(context: AdminContext): Router {
    * whole life because nothing owned that step. Idempotent — returns what it
    * found when an index already exists. `{"force":true}` rebuilds.
    */
+  router.get('/vectors/index', async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const { getLanceTable, getActiveCodeTableName } = await import('../embedding/lanceConnection.js');
+      const { lastIndexBuild, indexBuildRunning } = await import('../embedding/indexBuild.js');
+      const t = await getLanceTable();
+      const indices = await t.listIndices();
+      res.json({ table: getActiveCodeTableName(), indices, running: indexBuildRunning(), last: lastIndexBuild() });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'index read failed' });
+    }
+  });
+
   router.post('/vectors/index', async (req: Request, res: Response): Promise<void> => {
     try {
-      const { getLanceTable, ensureCodeVectorIndex, getActiveCodeTableName } =
-        await import('../embedding/lanceConnection.js');
-      const table = await getLanceTable();
-      const out = await ensureCodeVectorIndex(table, {
-        label: getActiveCodeTableName(),
-        force: req.body?.force === true,
-      });
-      // v4: the BM25 index rides along; a no-op on a pre-v4 table.
-      const { ensureCodeTextIndex } = await import('../embedding/lanceConnection.js');
-      const fts = await ensureCodeTextIndex(table, { label: getActiveCodeTableName(), force: req.body?.force === true });
-      res.json({ table: getActiveCodeTableName(), ...out, fts });
+      // ANN + FTS + scalar indexes, built in a child process (in-process
+      // IVF_PQ training on 400k+ 4096d rows trips the RSS guard). Runs in
+      // the background unless {"wait":true}; GET shows progress and result.
+      const { getActiveCodeTableName } = await import('../embedding/lanceConnection.js');
+      const { buildCodeTableIndexes } = await import('../embedding/indexBuild.js');
+      const SLOTS = ['code_vectors', 'code_vectors_b'];
+      const table = typeof req.body?.table === 'string' && SLOTS.includes(req.body.table) ? req.body.table : getActiveCodeTableName();
+      const p = buildCodeTableIndexes(table, { force: req.body?.force === true });
+      if (req.body?.wait === true) { res.json(await p); return; }
+      void p;
+      res.status(202).json({ started: true, table });
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'index build failed' });
     }
@@ -11817,45 +11864,21 @@ export function createAdminRouter(context: AdminContext): Router {
     const capability = req.query.capability as SidecarCapabilityKind | undefined;
     const enabledStr = req.query.enabled as string | undefined;
     const enabled = enabledStr === undefined ? undefined : enabledStr === 'true';
-    const { isSidecarConnected } = await import('../sidecars/wsServer.js');
-    const { getEmbedFault } = await import('../embedding/providers/embedFaults.js');
-    // Sidecars ≥2.x connect to the Sound Suite master relay (ws://:3003/sidecar),
-    // not to /ws/sidecars, so ask that listener too: a peer whose last heartbeat
-    // over the relay is under 90 s old counts as WS-connected.
-    let relayPeers: Array<{ agentUrl: string; lastHeartbeatAgoMs: number | null }> = [];
-    try {
-      const { getMasterWsListenerStatus } = await import('../sidecars/soundsuiteMaster.js');
-      relayPeers = getMasterWsListenerStatus().peers;
-    } catch { /* relay not running */ }
-    const relayConnected = (host: string): boolean =>
-      relayPeers.some(p => p.agentUrl.includes(`//${host}:`) && p.lastHeartbeatAgoMs !== null && p.lastHeartbeatAgoMs < 90_000);
-    const sidecars = listSidecars({ capability, enabled }).map(s => ({
-      ...s,
-      wsConnected: isSidecarConnected(s.id) || relayConnected(s.host),
-      // Capability fault: up and heartbeating, but its runtime refuses to embed
-      // with the advertised model (see embedFaults.ts). null when none.
-      embedFault: getEmbedFault(s.id),
-    }));
-    // OpenRouter-backed providers. They hang off a host but are NOT that
-    // host's GPU — no VRAM, no gpuPercent — so they are returned as their own
-    // rows rather than folded into `capabilities`, and the Fleet panel marks
-    // them cloud-backed. `slots` reports, per sidecar, whether OpenRouter is
-    // configured for FANTOM's master slot specifically: capacity configured
-    // for another master is deliberately unusable here, and that is the single
-    // most likely reason this list is empty.
-    const { listAllVirtualContainers, getSlotStatus, readMasterWsPort } =
-      await import('../sidecars/virtualContainers.js');
+    // Shared with knowledge-card sidecar models (src/sidecars/fleetView.ts), so
+    // both show the same hosts and the same online state.
+    const { listFleetSidecars } = await import('../sidecars/fleetView.js');
+    const sidecars = await listFleetSidecars({ capability, enabled });
+    // OpenRouter is called by Fantom itself now (2026-11-19): no virtual
+    // rows hang off a host any more.
+    const { readMasterWsPort, getSandboxSlots } = await import('../sidecars/sandboxSlots.js');
     const { getLastRerankAttribution } = await import('../embedding/rerankRouter.js');
-    const virtual = listAllVirtualContainers().map(v => ({
-      ...v, cloudBacked: true, gpuPercent: null, vramMb: null,
-    }));
     res.json({
       sidecars,
       total: sidecars.length,
-      virtual,
-      virtualTotal: virtual.length,
+      virtual: [],
+      virtualTotal: 0,
       masterWsPort: readMasterWsPort(),
-      slots: getSlotStatus(),
+      slots: getSandboxSlots(),
       lastRerank: getLastRerankAttribution(),
     });
   });
@@ -11899,16 +11922,11 @@ export function createAdminRouter(context: AdminContext): Router {
   router.get('/openrouter', async (_req: Request, res: Response): Promise<void> => {
     const { getOpenRouterSettings, defaultOpenRouterSettings, validateOpenRouterSettings } =
       await import('../sidecars/openRouterConfig.js');
-    const { listAllVirtualContainers, getSlotStatus, readMasterWsPort, getVirtualContainersConfig } =
-      await import('../sidecars/virtualContainers.js');
+    const { readMasterWsPort, getSandboxSlots } = await import('../sidecars/sandboxSlots.js');
     const { isSoundSuiteSidecarConnected } = await import('../sidecars/soundsuiteMaster.js');
-    const { isRoleServable } = await import('../sidecars/virtualContainers.js');
-    const { cloudBudgetStats, hydrateCloudBudgetFromConfig, refreshCloudBudgetFromKey,
-      MAX_ALLOWED_CONCURRENCY, CONSERVATIVE_DEFAULT_CONCURRENCY } =
-      await import('../embedding/providers/cloudBudget.js');
-    await hydrateCloudBudgetFromConfig();
-    // TTL-cached (10 min); this only re-probes when it has gone stale.
-    await refreshCloudBudgetFromKey().catch(() => undefined);
+    const { hasOpenRouterKey, keyLast4, openRouterKeySource } = await import('../openrouter/key.js');
+    const { openRouterPoolStats } = await import('../openrouter/workerPool.js');
+    const { POOL_LIMITS } = await import('../openrouter/settings.js');
 
     const { catalogueFor, modelHint, optionLabel, ROLE_LOCAL, CODE_TABLE_DIMS,
       RLM_CATALOGUE, RLM_FALLBACK_MODES, DEFAULT_RLM_SANDBOX_MODEL, DEFAULT_RLM_FALLBACK_MODE,
@@ -11926,27 +11944,26 @@ export function createAdminRouter(context: AdminContext): Router {
     res.json({
       settings,
       isDefault: !hasAny,
-      keyPushed: stored.keyPushed === true,
-      keyLast4: stored.keyLast4 ?? null,
-      issues: validateOpenRouterSettings(settings, { hasKey: false, codeDimensions: context.getSettings()?.semanticSearch?.codeDimensions }),
+      // The key lives in Fantom's secrets store only; this says whether one
+      // is there and its last four characters, never the key.
+      hasKey: hasOpenRouterKey(),
+      keySource: openRouterKeySource(),
+      keyLast4: keyLast4() ?? null,
+      // Low-limit key for ss-rlm-sandbox only; same rules (never returned).
+      hasSandboxKey: hasSandboxKey(),
+      sandboxKeyLast4: sandboxKeyLast4() ?? null,
+      sandboxOff: sandboxOffReason(),
+      issues: validateOpenRouterSettings(settings, { hasKey: hasOpenRouterKey(), codeDimensions: context.getSettings()?.semanticSearch?.codeDimensions }),
       masterWsPort: readMasterWsPort(),
-      masterServerUrl: getVirtualContainersConfig().masterServerUrl ?? null,
-      slots: getSlotStatus(),
-      // Per-slot truth behind the global `keyPushed` flag: which sidecars hold
-      // no config for Fantom, and whether an automatic re-push has a key.
-      slotHealth: (await import('../sidecars/openRouterAutoPush.js')).describeSlotHealth(stored.keyPushed === true),
-      // The permit unit is ONE CONCURRENT CLOUD REQUEST — that is what the
-      // pool hands out and what `manualConcurrency` caps.
-      budget: {
-        ...cloudBudgetStats(),
-        unit: 'concurrent cloud requests',
-        maxAllowed: MAX_ALLOWED_CONCURRENCY,
-        conservativeDefault: CONSERVATIVE_DEFAULT_CONCURRENCY,
-      },
-      virtual: listAllVirtualContainers(),
-      // Cloud routing is OPT-IN: while this is false nothing calls out to
-      // OpenRouter and every role stays local.
-      enabled: getVirtualContainersConfig().enabled === true,
+      // Sandbox-only slots: which sidecars hold our key for ss-rlm-sandbox.
+      slots: getSandboxSlots(),
+      pool: openRouterPoolStats(),
+      poolLimits: POOL_LIMITS,
+      writeStats: await (async () => {
+        try { return (await import('../embedding/vectorWriteBuffer.js')).getVectorWriteStats(); } catch { return null; }
+      })(),
+      virtual: [],
+      enabled: true,
       // Dropdown options + the hint under each, which is where the re-index
       // consequence of a width mismatch becomes visible.
       // The operator-facing routing choice. The sidecar's
@@ -11969,7 +11986,7 @@ export function createAdminRouter(context: AdminContext): Router {
       // an inert setting is visible instead of silently believed.
       policyDrift: detectPolicyDrift(
         sanitizePolicies(stored.policyByRole),
-        listAllVirtualContainers().map(v => ({ role: v.role, mode: v.mode, providerName: v.providerName })),
+        [],
       ),
       policyNotes: (['code-embedding', 'embedding', 'reranker', 'code-assistant', 'rlm'] as const).map(role => ({
         role,
@@ -12005,7 +12022,7 @@ export function createAdminRouter(context: AdminContext): Router {
         // A role the sidecar can be CONFIGURED for but cannot yet SERVE. The
         // setting pushes and reports like any other; nothing issues the
         // request. Surfaced rather than left for someone to discover.
-        servable: isRoleServable(role),
+        servable: true,
       })),
       codeTableDims: CODE_TABLE_DIMS,
       // The width each embedding table is actually committed to. LanceDB locks
@@ -12016,15 +12033,20 @@ export function createAdminRouter(context: AdminContext): Router {
         'code-embedding': context.getSettings()?.semanticSearch?.codeDimensions ?? 2560,
         'embedding': context.getSettings()?.semanticSearch?.docsDimensions ?? 1024,
       },
-      // ── RLM sandbox fallback — THIS master's setting ────────────────────
-      // Stored per master and not pushed: Fantom's ss-rlm-sandbox half is not
-      // implemented (no `domain: 'code'` in the push, no HTTP exposure of
-      // search_code/search_symbols/search_files), so a control that looked
-      // live would be a setting that saves cleanly and does nothing. `wired`
-      // is false and the panel badges it, exactly as the code-assistant
-      // picker is badged.
+      // ── RLM — THIS master's settings (Sound Suite keeps its own) ────────
       rlm: {
-        wired: false,
+        // The ss-rlm-sandbox path is wired: Fantom pushes `domain: 'code'`
+        // and sends the whole question to a host's :8101 once per ask when
+        // `pipeline.sandboxMode` says so (embedding/rlmSandbox.ts).
+        wired: true,
+        pipeline: (await import('../embedding/rlmPipeline.js')).sanitizeRlmPipeline(stored.rlmPipeline),
+        sandboxModes: (await import('../embedding/rlmPipeline.js')).RLM_SANDBOX_MODES,
+        defaultBudgetSec: Math.round(Number((context.getSettings()?.semanticSearch?.answerSynthesis as { budgetMs?: number } | undefined)?.budgetMs ?? 120_000) / 1000),
+        jev: await (async () => {
+          const { getJevSettings } = await import('../embedding/providers/jevClient.js');
+          const j = getJevSettings();
+          return { providerEnabled: j.enabled, hasKey: j.hasKey, minConfidence: j.minConfidence };
+        })(),
         model: stored.rlmSandboxModel ?? DEFAULT_RLM_SANDBOX_MODEL,
         mode: stored.rlmFallbackMode ?? DEFAULT_RLM_FALLBACK_MODE,
         // A stored model outside the catalogue is offered rather than dropped,
@@ -12055,13 +12077,13 @@ export function createAdminRouter(context: AdminContext): Router {
   });
 
   router.post('/openrouter', async (req: Request, res: Response): Promise<void> => {
-    const { getOpenRouterSettings, pushOpenRouterConfig, validateOpenRouterSettings } =
+    const { getOpenRouterSettings, saveOpenRouterSettings, validateOpenRouterSettings } =
       await import('../sidecars/openRouterConfig.js');
-    const { refreshAllVirtualContainers } = await import('../sidecars/virtualContainers.js');
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     // Used once, in memory, then dropped. Never assigned into `settings`.
     const apiKey = typeof body.apiKey === 'string' && body.apiKey.trim() ? body.apiKey.trim() : undefined;
+    const sandboxApiKey = typeof body.sandboxKey === 'string' && body.sandboxKey.trim() ? body.sandboxKey.trim() : undefined;
     const { sanitizePolicies, modesFromPolicies } = await import('../sidecars/routingPolicy.js');
     const stored = getOpenRouterSettings();
     // `modeByRole` is DERIVED from the policy and is never accepted from the
@@ -12124,7 +12146,7 @@ export function createAdminRouter(context: AdminContext): Router {
     // The id is validated against the catalogue before it is stored. An id
     // that reaches a sidecar and does not resolve upstream fails at call time,
     // which is far from the dropdown that caused it.
-    const { isRlmCapable, isRlmFallbackMode } = await import('../sidecars/openRouterModels.js');
+    const { isRlmCapable, isRlmFallbackMode, DEFAULT_RLM_SANDBOX_MODEL } = await import('../sidecars/openRouterModels.js');
     const rlmModelRaw = typeof body.rlmSandboxModel === 'string' ? body.rlmSandboxModel.trim() : '';
     const rlmSandboxModel = rlmModelRaw
       ? (isRlmCapable(rlmModelRaw) ? rlmModelRaw : undefined)
@@ -12141,32 +12163,36 @@ export function createAdminRouter(context: AdminContext): Router {
       allowedModels: withPins(body.allowedModels ?? stored.allowedModels) as any,
       policyByRole,
       modeByRole: modesFromPolicies(policyByRole) as any,
-      keyPushed: stored.keyPushed,
-      keyLast4: stored.keyLast4,
-      rlmSandboxModel: rlmSandboxModel ?? stored.rlmSandboxModel,
+      // The GET shows DEFAULT_RLM_SANDBOX_MODEL when nothing is stored, and the
+      // page sends the model only when the user changes it. Without this
+      // fallback an untouched dropdown left RLM with no model, and every save
+      // with RLM on OpenRouter failed validation.
+      rlmSandboxModel: rlmSandboxModel ?? stored.rlmSandboxModel ?? DEFAULT_RLM_SANDBOX_MODEL,
       rlmFallbackMode: isRlmFallbackMode(body.rlmFallbackMode)
         ? body.rlmFallbackMode
         : stored.rlmFallbackMode,
+      // Only the fields the page sent override; the rest keep the stored value.
+      rlmPipeline: (await import('../embedding/rlmPipeline.js')).mergeRlmPipeline(
+        (await import('../embedding/rlmPipeline.js')).sanitizeRlmPipeline(stored.rlmPipeline), body.rlmPipeline),
     };
 
-    // Enable/disable cloud routing. Off is the safe state and the default:
-    // no key is spent and every role resolves locally.
-    if (typeof body.enabled === 'boolean') {
-      // `updateSettings` shallow-merges `semanticSearch`, so sending only this
-      // one key preserves every sibling (maxConcurrentProjects,
-      // codeDimensions, verificationReferenceSidecar, openRouter…) without
-      // this handler having to read and re-send them. `virtualContainers`
-      // itself IS replaced wholesale by that merge, so its own siblings do
-      // have to be read — but the stale-read window is one nested object
-      // instead of the whole subtree. This file has three co-writers and a
-      // history of losing dashboard settings; the narrower the write, the
-      // less a lost race can cost.
-      const cur = (await import('../config/index.js')).readConfigFileWithRecovery(
-        (await import('node:path')).join(process.cwd(), 'config', 'fantomMcpServer-config.json'),
-      ) ?? {};
-      const vc = { ...(cur?.semanticSearch?.virtualContainers ?? {}), enabled: body.enabled };
-      await context.updateSettings({ semanticSearch: { virtualContainers: vc } } as any);
+    // Jev's threshold has ONE home, `semanticSearch.jev.minConfidence` (read by
+    // getJevSettings). The RLM card edits it there, not in a copy. Sent as a
+    // whole percent, 1-100; blank, 0 (every answer decisive) or anything else
+    // leaves it alone.
+    {
+      const raw = body.jevMinConfidence;
+      const n = typeof raw === 'number' ? raw : (typeof raw === 'string' && raw.trim() ? Number(raw) : NaN);
+      const frac = Number.isFinite(n) && n >= 1 && n <= 100 ? n / 100 : NaN;
+      if (Number.isFinite(frac)) {
+        const cur = (await import('../config/index.js')).readConfigFileWithRecovery(
+          (await import('node:path')).join(process.cwd(), 'config', 'fantomMcpServer-config.json'),
+        ) ?? {};
+        const jev = { ...(cur?.semanticSearch?.jev ?? {}), minConfidence: Math.round(frac * 100) / 100 };
+        await context.updateSettings({ semanticSearch: { jev } } as any);
+      }
     }
+
 
     // Per-role daily spend caps, USD. 0/blank clears one.
     if (body.dailyCaps && typeof body.dailyCaps === 'object') {
@@ -12178,132 +12204,123 @@ export function createAdminRouter(context: AdminContext): Router {
       }
     }
 
-    const issues = validateOpenRouterSettings(settings, { hasKey: !!apiKey, codeDimensions: context.getSettings()?.semanticSearch?.codeDimensions });
+    // A key already on this server (secrets store or env file) counts. The
+    // check once looked only at a key typed into this request, so a server
+    // that held a key still refused every save with "no key".
+    const { hasOpenRouterKey, saveOpenRouterKey } = await import('../openrouter/key.js');
+    const issues = validateOpenRouterSettings(settings, { hasKey: !!apiKey || hasOpenRouterKey(), codeDimensions: context.getSettings()?.semanticSearch?.codeDimensions });
     if (issues.length > 0 && body.force !== true) {
       res.status(400).json({
-        error: 'Configuration would not work as written. Fix the issues, or re-send with {"force":true} to push anyway.',
+        error: 'Configuration would not work as written. Fix the issues, or re-send with {"force":true} to save anyway.',
         issues,
       });
       return;
     }
 
-    // Saving a policy ALWAYS re-pushes. A stored mode that never reached the
-    // fleet is inert: modes were once changed to cloud-only while all 15
-    // providers went on reporting local-only, because nothing re-pushed.
-    const { results, pushedCount } = pushOpenRouterConfig(settings, apiKey);
-    // The sidecar applies the push on receipt, but the frame is
-    // fire-and-forget — give it a beat before re-reading /api/status.
-    setTimeout(() => { void refreshAllVirtualContainers().catch(() => {}); }, 1500);
+    // The key goes to Fantom's secrets store only (never the config file,
+    // never a log, never a response). Fantom calls OpenRouter itself.
+    if (apiKey) {
+      try {
+        saveOpenRouterKey(apiKey);
+      } catch (err) {
+        res.status(500).json({ error: `The key could not be stored on this server: ${(err as Error).message}` });
+        return;
+      }
+    }
+    if (sandboxApiKey) {
+      if (apiKey ? sandboxApiKey === apiKey : sandboxApiKey === (openRouterKeyNow() ?? '')) {
+        res.status(400).json({ error: 'The sandbox key must be a different key from the main OpenRouter key.' });
+        return;
+      }
+      try {
+        saveSandboxKey(sandboxApiKey);
+      } catch (err) {
+        res.status(500).json({ error: `The sandbox key could not be stored on this server: ${(err as Error).message}` });
+        return;
+      }
+    } else if (body.clearSandboxKey === true) {
+      try { clearSandboxKey(); } catch { /* nothing stored */ }
+    }
+    saveOpenRouterSettings(settings);
+
+    // Worker pool settings ride on the same save.
+    const { validatePoolInput, invalidatePoolSettings } = await import('../openrouter/settings.js');
+    const poolIn: Record<string, unknown> = {};
+    for (const k of ['workerCount', 'interactiveSlots', 'requestTimeoutMs', 'maxPendingRows', 'writeBatchRows'] as const) if (body[k] !== undefined && body[k] !== '' && body[k] !== null) poolIn[k] = body[k];
+    if (Object.keys(poolIn).length > 0) {
+      const { VECTOR_WRITE_LIMITS } = await import('../embedding/vectorWriteSettings.js');
+      const bad = validatePoolInput(poolIn);
+      for (const [k, r] of Object.entries(VECTOR_WRITE_LIMITS)) {
+        if (poolIn[k] === undefined) continue;
+        const n = Number(poolIn[k]);
+        if (!Number.isInteger(n) || n < r.min || n > r.max) bad.push(`${k} must be a whole number from ${r.min} to ${r.max}`);
+      }
+      if (bad.length) { res.status(400).json({ error: bad.join('; ') }); return; }
+      const { saveOpenRouterPoolSettings } = await import('../sidecars/openRouterConfig.js');
+      saveOpenRouterPoolSettings(Object.fromEntries(Object.entries(poolIn).map(([k, v]) => [k, Number(v)])));
+      invalidatePoolSettings();
+    }
+
+    // ss-rlm-sandbox is the one thing a sidecar still runs for us: give it
+    // the key, the sandbox model and our domain (sandbox-only slot).
+    const { pushSandboxSlotsToAll, refreshAllSandboxSlots } = await import('../sidecars/sandboxSlots.js');
+    const sandboxPush = pushSandboxSlotsToAll();
+    setTimeout(() => { void refreshAllSandboxSlots().catch(() => {}); }, 1500);
 
     res.json({
-      ok: pushedCount > 0,
-      pushedCount,
-      results,
+      ok: true,
+      saved: true,
+      hasKey: hasOpenRouterKey(),
+      hasSandboxKey: hasSandboxKey(),
+      sandboxKeyLast4: sandboxKeyLast4() ?? null,
+      sandboxOff: sandboxOffReason(),
       issues,
       policyByRole,
-      note: pushedCount === 0
-        ? 'No sidecar has an open WS tunnel to Fantom\'s master slot, so nothing was pushed — the routing '
-          + 'policy is stored but NOT in effect. Register Fantom as a master on each sidecar, then re-push.'
-        : `Pushed to ${pushedCount} sidecar(s). The sidecar holds this config in memory only — it is lost on a `
-          + 'sidecar restart; re-push then.',
+      sandboxPush,
+      note: 'Saved. Fantom calls OpenRouter itself; sidecars only receive the ss-rlm-sandbox slot '
+        + `(${sandboxPush.filter(r => r.pushed).length} of ${sandboxPush.length} reached).`,
     });
   });
 
-  /**
-   * Set (or clear) the manual cloud-budget ceiling.
-   *
-   * The unit is CONCURRENT CLOUD REQUESTS against the OpenRouter key. Manual
-   * wins over the discovered limit, because the operator has a reason Fantom
-   * cannot see: capping spend, or leaving headroom for the Sound Suite
-   * master, which shares the same key and would otherwise be starved by a
-   * Fantom rebuild.
-   *
-   * `null`/`''` clears it and returns to the discovered value. Takes effect
-   * immediately — no restart, and raising it releases queued waiters on the
-   * spot, so `permits in use` moves on the page mid-rebuild.
-   */
-  router.post('/openrouter/budget', async (req: Request, res: Response): Promise<void> => {
-    const { setManualCloudConcurrency, cloudBudgetStats, isValidConcurrency,
-      hydrateCloudBudgetFromConfig, MAX_ALLOWED_CONCURRENCY } =
-      await import('../embedding/providers/cloudBudget.js');
-
-    const raw = (req.body ?? {}).maxConcurrent;
-    const clearing = raw === null || raw === undefined || raw === '';
-    let value: number | null = null;
-    if (!clearing) {
-      const n = typeof raw === 'string' ? Number(raw.trim()) : raw;
-      if (!isValidConcurrency(n)) {
-        // Refuse a typo rather than letting it saturate the account.
-        res.status(400).json({
-          error: `maxConcurrent must be a whole number between 1 and ${MAX_ALLOWED_CONCURRENCY}, `
-            + 'or blank to use the limit discovered from the key.',
-          got: raw,
-        });
-        return;
-      }
-      value = n;
+  router.get('/openrouter/rlm-sandbox-hosts', async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const { sandboxHostHealth } = await import('../embedding/rlmSandbox.js');
+      res.json({ hosts: await sandboxHostHealth() });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
     }
-
-    await context.updateSettings({ openRouterMaxConcurrent: value } as any);
-    setManualCloudConcurrency(value);
-    await hydrateCloudBudgetFromConfig(true);
-    res.json({ ok: true, budget: cloudBudgetStats() });
   });
 
-  /**
-   * The Live Activity poll (every 4s on the page). Small on purpose: it is
-   * the difference between "OpenRouter is configured" and "OpenRouter is
-   * actually serving requests", which otherwise look identical.
-   */
   router.get('/openrouter/activity', async (_req: Request, res: Response): Promise<void> => {
     const { allActivity, spendTodayTotal, getDailyCaps } = await import('../sidecars/openRouterActivity.js');
-    const { cloudBudgetStats } = await import('../embedding/providers/cloudBudget.js');
+    const { openRouterPoolStats } = await import('../openrouter/workerPool.js');
     const { getLastRerankAttribution } = await import('../embedding/rerankRouter.js');
+    const { getVectorWriteStats } = await import('../embedding/vectorWriteBuffer.js');
+    const { parsePoolStats } = await import('../openrouter/parsePool.js');
     res.json({
       nowMs: Date.now(),
       activity: allActivity(),
       spendToday: spendTodayTotal(),
       dailyCaps: getDailyCaps(),
-      budget: cloudBudgetStats(),
+      pool: openRouterPoolStats(),
+      writeStats: getVectorWriteStats(),
+      parse: parsePoolStats(),
       lastRerank: getLastRerankAttribution(),
     });
   });
 
   /** Credits and usage, read through a sidecar — Fantom holds no key. */
   router.get('/openrouter/credits', async (_req: Request, res: Response): Promise<void> => {
-    const { refreshCloudBudgetFromKey, cloudBudgetStats } = await import('../embedding/providers/cloudBudget.js');
+    const { keyInfo } = await import('../openrouter/client.js');
     const { spendTodayTotal } = await import('../sidecars/openRouterActivity.js');
-    const budget = await refreshCloudBudgetFromKey(true).catch(() => cloudBudgetStats());
-    res.json({
-      ok: budget.discovery.ok,
-      reason: budget.discovery.reason,
-      credits: budget.credits ?? null,
-      spendToday: spendTodayTotal(),
-      budget,
-    });
+    try {
+      const info = await keyInfo();
+      res.json({ ok: true, credits: info, spendToday: spendTodayTotal() });
+    } catch (err) {
+      res.json({ ok: false, reason: (err as Error).message, credits: null, spendToday: spendTodayTotal() });
+    }
   });
 
-  /** Re-probe the key's own rate limit through a sidecar, ignoring the TTL. */
-  router.post('/openrouter/budget/refresh', async (_req: Request, res: Response): Promise<void> => {
-    const { refreshCloudBudgetFromKey } = await import('../embedding/providers/cloudBudget.js');
-    const budget = await refreshCloudBudgetFromKey(true);
-    res.json({ ok: budget.discovery.ok, budget });
-  });
-
-  /** Re-push the stored config (models/modes only, no key) — for use after a
-   *  sidecar restart, which clears its in-memory copy. */
-  router.post('/openrouter/repush', async (_req: Request, res: Response): Promise<void> => {
-    const { rePushStoredConfig } = await import('../sidecars/openRouterConfig.js');
-    const out = rePushStoredConfig();
-    if (!out) { res.status(400).json({ error: 'Nothing stored to re-push. Configure and push first.' }); return; }
-    res.json({ ok: out.pushedCount > 0, ...out });
-  });
-
-  /**
-   * Live round trip per role, down the path the role really uses, with the
-   * key the sidecars hold. Body: `{ roles?: VirtualRole[] }`; omitted = all.
-   * Tests what is saved and pushed, never an unsaved dropdown choice.
-   */
   router.post('/openrouter/test', async (req: Request, res: Response): Promise<void> => {
     const { probeOpenRouterRoles, isOpenRouterProbeRole, OPENROUTER_PROBE_ROLES } = await import('./openRouterProbe.js');
     const body = req.body ?? {};
@@ -12313,7 +12330,7 @@ export function createAdminRouter(context: AdminContext): Router {
       res.status(400).json({ error: `unknown role(s): ${bad.map(String).join(', ')} — expected ${OPENROUTER_PROBE_ROLES.join(', ')}` });
       return;
     }
-    const results = await probeOpenRouterRoles(requested as import('../sidecars/virtualContainers.js').VirtualRole[]);
+    const results = await probeOpenRouterRoles(requested as import('../openrouter/roleTypes.js').VirtualRole[]);
     for (const r of results) {
       console.log(`[openrouter] test ${r.role} ${r.ok ? 'ok' : 'FAIL'} ${r.ms}ms model=${r.model ?? '-'} route=${r.route}: ${r.message}`);
     }
@@ -12321,86 +12338,21 @@ export function createAdminRouter(context: AdminContext): Router {
   });
 
   /** Force a virtual-container rediscovery poll (normally every 60s). */
-  router.post('/sidecars/virtual/refresh', async (_req: Request, res: Response): Promise<void> => {
-    const { refreshAllVirtualContainers, getSlotStatus } = await import('../sidecars/virtualContainers.js');
-    const rows = await refreshAllVirtualContainers();
-    res.json({ ok: true, virtual: rows, slots: getSlotStatus() });
-  });
-
-  /**
-   * Vector-compatibility verdicts for every OR embedding provider: which are
-   * cleared to join the fan-out, which are refused, and the cosine numbers
-   * behind each decision. Distinct from /sidecars' `embedFault`, which is a
-   * TTL-expiring RUNTIME fault — a vector-space verdict never expires.
-   */
   router.get('/sidecars/virtual/verification', async (_req: Request, res: Response): Promise<void> => {
     const { listRefusals, listVerifications } = await import('../embedding/providers/vectorCompatibility.js');
     res.json({ verified: listVerifications(), refusals: listRefusals() });
   });
 
   /**
-   * Run (or re-run) the compatibility gate for every OR code-embedding
-   * provider and report the cosine numbers. Embeds 10 short probe texts on
-   * each side — it does not touch the vector table and starts no job.
-   *
-   * The reference follows the policy, exactly as the fan-out's does. Under
-   * "OpenRouter only" the table holds no local rows, so agreement with a local
-   * Q4 host is not a property of it; the peer cloud provider is the reference
-   * and a sole provider is checked on dimension and upstream pin. Running this
-   * against a local host under that policy would report a failure that is not
-   * one, on the very configuration the policy exists to allow.
+   * Run the vector gate for Fantom's own OpenRouter embedding providers
+   * against rows already stored in the table (`stored-ref`). Embeds up to 10
+   * stored row texts per role; writes nothing and starts no job.
    */
-  router.post('/sidecars/virtual/verify', async (_req: Request, res: Response): Promise<void> => {
+  router.post('/openrouter/verify', async (_req: Request, res: Response): Promise<void> => {
     try {
-      const { listVirtualContainers } = await import('../sidecars/virtualContainers.js');
-      const { selectAllEmbeddingProviders, embeddingRoutingPolicy } =
-        await import('../embedding/providers/embeddingProvider.js');
-      const { verifyVectorCompatibility, localReference, cloudReference, selectCloudReferences } =
-        await import('../embedding/providers/vectorCompatibility.js');
-      const settings = context.getSettings();
-      const expectedDims = settings.semanticSearch?.codeDimensions ?? 2560;
-      const rows = listVirtualContainers('code-embedding');
-      if (rows.length === 0) {
-        res.json({ reports: [], note: 'No cloud-routable code-embedding provider for Fantom\'s master slot.' });
-        return;
-      }
-      const routing = await embeddingRoutingPolicy('code');
-      const reports = [];
-
-      if (!routing.localServes) {
-        // Anchor order, so this reports the same pairing the fan-out will use.
-        const ordered = [...rows].sort((a, b) => a.providerName.localeCompare(b.providerName));
-        for (const vc of ordered) {
-          const [peer, ...rest] = selectCloudReferences(vc, ordered);
-          reports.push(await verifyVectorCompatibility(
-            vc, peer ? cloudReference(peer) : null, expectedDims,
-            { regime: 'cloud-ref', fallbackReferences: rest.map(cloudReference) },
-          ));
-        }
-        res.json({
-          reports, expectedDims, policy: routing.policy, regime: 'cloud-ref',
-          reference: ordered[0].providerName,
-          note: ordered.length === 1
-            ? `${ordered[0].providerName} is the only cloud provider, so there is no peer to compare it with: `
-              + 'dimension and upstream pin are the whole check, and nothing here detects an upstream that '
-              + 'changes its serving stack behind the same pin.'
-            : `Checked against each other; ${ordered[0].providerName} is the anchor.`,
-        });
-        return;
-      }
-
-      const local = selectAllEmbeddingProviders('code', settings.semanticSearch?.codeModel);
-      if (local.length === 0) {
-        res.status(425).json({ error: 'No local embedder available to verify against — under this policy local and cloud vectors share one table, so comparing cloud to cloud proves nothing about the rows already in it.' });
-        return;
-      }
-      const refName = (settings.semanticSearch as any)?.verificationReferenceSidecar as string | undefined;
-      const referenceProvider = (refName ? local.find(p => p.getSidecarName() === refName) : undefined) ?? local[0];
-      const reference = localReference(referenceProvider);
-      for (const vc of rows) {
-        reports.push(await verifyVectorCompatibility(vc, reference, expectedDims, { regime: 'local-ref' }));
-      }
-      res.json({ reports, expectedDims, policy: routing.policy, regime: 'local-ref', reference: reference.name });
+      const { runReverify } = await import('../embedding/providers/cloudReverify.js');
+      const reports = await runReverify('verify button');
+      res.json({ reports, regime: 'stored-ref' });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
@@ -12575,7 +12527,7 @@ export function createAdminRouter(context: AdminContext): Router {
   /**
    * POST /admin/sidecars/:id/ws-probe
    * Does a SMALL frame make it back over this sidecar's WS tunnel?
-   * Sends `virtual-key-info` (a few hundred bytes each way) and reports the
+   * Sends `health` (a few dozen bytes each way) and reports the
    * outcome. Built for BASWS34: its register frame arrives and then every
    * socket closes 1006 after ~25s with nothing else received. Whether a tiny
    * result frame returns separates "large frames are dropped on this path"
@@ -12593,7 +12545,7 @@ export function createAdminRouter(context: AdminContext): Router {
     const t0 = Date.now();
     let ok = false; let bytes = 0; let error: string | null = null;
     try {
-      const raw = await sendCommandToSidecar(sc.id, 'virtual-key-info', {}, timeoutMs);
+      const raw = await sendCommandToSidecar(sc.id, 'health', {}, timeoutMs);
       ok = raw !== null && raw !== undefined;
       bytes = raw ? JSON.stringify(raw).length : 0;
     } catch (err) {

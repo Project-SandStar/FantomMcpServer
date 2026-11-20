@@ -200,7 +200,7 @@ async function defaultChat(system: string, user: string): Promise<{ text: string
     return { text, costUsd: null };
   }
   const { openRouterChat } = await import('../sidecars/openRouterChat.js');
-  const out = await openRouterChat(system, user, { maxTokens: REPLY_MAX_TOKENS, timeoutMs: 120_000, temperature: 0.1, role: 'rlm-sandbox' });
+  const out = await openRouterChat(system, user, { maxTokens: REPLY_MAX_TOKENS, timeoutMs: 120_000, temperature: 0.1, lane: 'bulk' });
   return { text: out.text, costUsd: out.costUsd };
 }
 

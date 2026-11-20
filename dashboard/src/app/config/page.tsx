@@ -11,6 +11,9 @@ import { AdvancedSearchPanel } from '@/components/config/AdvancedSearchPanel';
 import { RunFromSidecarToggle } from '@/components/config/RunFromSidecarToggle';
 import { DebugLogPanel } from '@/components/config/DebugLogPanel';
 import { NetbirdPanel } from '@/components/config/NetbirdPanel';
+import { KnowledgeCardsPanel } from '@/components/config/KnowledgeCardsPanel';
+import { GraphPanel } from '@/components/config/GraphPanel';
+import { GraphStorageCard } from '@/components/config/GraphStorageCard';
 import { PathMappingsPanel } from '@/components/config/PathMappingsPanel';
 import { InstallerSourcesPanel } from '@/components/config/InstallerSourcesPanel';
 import { PathInput } from '@/components/ui/FolderPicker';
@@ -40,6 +43,8 @@ type SettingsGroup =
   | 'semantic'
   | 'sidecars'
   | 'openrouter'
+  | 'knowledge-cards'
+  | 'graph'
   | 'llm-providers'
   | 'fantom-source'
   | 'code-index'
@@ -57,6 +62,8 @@ const GROUPS: { id: SettingsGroup; label: string; icon: string }[] = [
   { id: 'semantic', label: 'Semantic Search', icon: '🧠' },
   { id: 'sidecars', label: 'Sidecars', icon: '🛰' },
   { id: 'openrouter', label: 'OpenRouter', icon: '☁' },
+  { id: 'knowledge-cards', label: 'Knowledge Graph Cards', icon: '🃏' },
+  { id: 'graph', label: 'Graph', icon: '🕸' },
   { id: 'llm-providers', label: 'LLM Providers', icon: '🤖' },
   { id: 'fantom-source', label: 'Fantom Source', icon: '📁' },
   { id: 'code-index', label: 'Code Index', icon: '🗂' },
@@ -253,6 +260,28 @@ const DOCS: Record<SettingsGroup, { title: string; content: React.ReactNode }> =
           <p>Groq, Anthropic Claude, Google Gemini.</p>
           <p>Pick a default; the semantic-search reranker calls it when enabled.</p>
         </div>
+      </div>
+    ),
+  },
+  'knowledge-cards': {
+    title: 'Knowledge Graph Cards',
+    content: (
+      <div className="space-y-3 text-sm text-gray-600">
+        <p>One card per project, pod, main class and public function. A writer model builds each card only from the source lines and the code graph (callers, callees, containment). Every claim names its file:line; claims without a source are cut.</p>
+        <p>The <b>check pass</b> asks a second model whether each claim matches the source. A failed card is rewritten once, then flagged.</p>
+        <p>When a source file changes, its cards turn <b>stale</b> and are never served. Callers of a changed node get <b>check</b>.</p>
+        <p><b>Use cards to answer asks</b> (default off) answers from the best fresh cards and falls back to the normal ask path when they do not match well enough.</p>
+        <p>Building uses the OpenRouter bulk lane, so it shares the Workers limit with re-embeds and never blocks search.</p>
+      </div>
+    ),
+  },
+  graph: {
+    title: 'Graph',
+    content: (
+      <div className="space-y-3 text-sm text-gray-600">
+        <p>Each project has its own graph store. Only a few stay open at once (the <b>open stores cap</b>); the least recently used idle one closes when a new one opens.</p>
+        <p>Each open store costs memory (about 100 MB). A high cap with a high memory guard can make the process exit. The tab warns when a full pool comes near the guard.</p>
+        <p>A value saved here beats the env var. <b>Reset</b> goes back to the env var or the default.</p>
       </div>
     ),
   },
@@ -883,6 +912,7 @@ export default function ConfigPage() {
       case 'storage':
         return (
           <div className="space-y-5">
+            <GraphStorageCard onOpenGraphTab={() => setActiveGroup('graph')} />
             {storageLoading ? <p className="text-gray-500">Loading storage info...</p> : storageData && storageData.length > 0 ? (
               <>
                 {/* Total size summary */}
@@ -894,7 +924,8 @@ export default function ConfigPage() {
 
                 {/* Storage entries grouped by type */}
                 {(['lancedb', 'sqlite', 'json-cache'] as const).map(sType => {
-                  const items = storageData.filter((c: CacheInfo) => c.storageType === sType);
+                  // fantom-graph.db* is the legacy LadybugDB store (shown in the graph card), not SQLite.
+                  const items = storageData.filter((c: CacheInfo) => c.storageType === sType && !c.name.startsWith('fantom-graph.db'));
                   if (items.length === 0) return null;
                   const typeLabel = sType === 'lancedb' ? 'Vector Database (LanceDB)' : sType === 'sqlite' ? 'SQLite Databases' : 'JSON Caches';
                   return (
@@ -1287,6 +1318,12 @@ export default function ConfigPage() {
 
       case 'openrouter':
         return <OpenRouterPanel />;
+
+      case 'knowledge-cards':
+        return <KnowledgeCardsPanel />;
+
+      case 'graph':
+        return <GraphPanel />;
 
       case 'llm-providers':
         return <LLMProvidersPanel />;

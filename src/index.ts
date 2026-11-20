@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 // ═══════ CRASH FORENSICS — must be first, before any other code ═══════
+import { resolveRssGuardMb, rssGuardStatus } from './utils/rssGuard.js';
 import { SERVER_INSTRUCTIONS } from './utils/serverInstructions.js';
 import * as nodeFs from 'node:fs';
 import * as v8 from 'node:v8';
@@ -120,28 +121,7 @@ setInterval(() => {
 //
 // Resolution order: env var → runtime config (rssGuardMb in
 // config/fantomMcpServer-config.json) → 4000 default.
-function resolveRssGuardMb(): number {
-  const fromEnv = process.env.FANTOM_RSS_GUARD_MB;
-  if (fromEnv !== undefined) {
-    const n = Number(fromEnv);
-    if (Number.isFinite(n)) return n;
-  }
-  try {
-    const cfgPath = require('node:path').join(process.cwd(), 'config', 'fantomMcpServer-config.json');
-    if (nodeFs.existsSync(cfgPath)) {
-      const cfg = JSON.parse(nodeFs.readFileSync(cfgPath, 'utf-8'));
-      if (typeof cfg?.rssGuardMb === 'number' && Number.isFinite(cfg.rssGuardMb)) return cfg.rssGuardMb;
-    }
-  } catch { /* fallthrough */ }
-  // In a container, scale with the cgroup memory limit (75%), so an 8 GB
-  // limit does not trip a fixed 4000 MB guard while indexing runs.
-  try {
-    const raw = nodeFs.readFileSync('/sys/fs/cgroup/memory.max', 'utf-8').trim();
-    const bytes = Number(raw);
-    if (Number.isFinite(bytes) && bytes > 0) return Math.max(4000, Math.round(bytes / 1024 / 1024 * 0.75));
-  } catch { /* not cgroup v2 or not a container */ }
-  return 4000;
-}
+// Shared with the dashboard Graph tab: src/utils/rssGuard.ts.
 const RSS_GUARD_MB = resolveRssGuardMb();
 /** Shared description for the `versionGroup` argument of the project-scoped tools. */
 const VERSION_GROUP_ARG_DOC =
@@ -340,7 +320,7 @@ class FantomMCPServer {
     this.server = new Server(
       {
         name: 'mcp-fantom',
-        version: '1.1.8',
+        version: '1.1.9',
       },
       {
         capabilities: {
@@ -1565,10 +1545,12 @@ class FantomMCPServer {
           heapTotal: memUsage.heapTotal,
           rss: memUsage.rss,
           external: memUsage.external,
+          // RSS against the guard that restarts the process (dashboard card).
+          rssGuard: rssGuardStatus(memUsage.rss),
         };
       })(),
       initialized: this.initializationComplete,
-      version: '1.1.8',
+      version: '1.1.9',
       serverPath: path.resolve(dirname(fileURLToPath(import.meta.url)), 'index.js'),
       port: getServerPort(),
       stats: {
@@ -2877,7 +2859,7 @@ class FantomMCPServer {
 
           // Create a NEW Server instance for this session
           const sessionServer = new Server(
-            { name: 'mcp-fantom', version: '1.1.8' },
+            { name: 'mcp-fantom', version: '1.1.9' },
             { capabilities: { tools: {}, resources: {} }, instructions: SERVER_INSTRUCTIONS }
           );
 
@@ -3182,11 +3164,12 @@ class FantomMCPServer {
       // master-side handler (so multi-master sidecars can register us).
       void import('./sidecars/wsServer.js').then(m => m.attachSidecarWsServer(httpServer));
       void import('./sidecars/soundsuiteMaster.js').then(m => m.attachSoundSuiteMaster(httpServer, app));
-      // Discover OpenRouter-backed "virtual containers". This polls each
-      // sidecar's HTTP /api/status rather than mining the WS heartbeat: the
-      // heartbeat's statusData is a trimmed snapshot with no `masters` key, so
-      // heartbeat-based discovery would silently find nothing forever.
-      void import('./sidecars/virtualContainers.js').then(m => m.startVirtualContainerDiscovery());
+      // Learn which master URL each sidecar files us under and keep the
+      // ss-rlm-sandbox slot keyed (the only OpenRouter config a sidecar
+      // still holds for Fantom).
+      void import('./sidecars/sandboxSlots.js').then(m => m.startSandboxSlotPoll());
+      // Code vector table without its ANN / scalar indexes: build them (child process).
+      void import('./embedding/indexBuild.js').then(m => m.scheduleActiveTableIndexCheck());
     });
   }
 
@@ -3201,6 +3184,12 @@ class FantomMCPServer {
       // HTTP mode: Start HTTP server first, then initialize
       await this.startHttpServer();
       this.log('StreamableHTTP MCP Server started - clients can connect to /mcp');
+      // Search warm-up (query encoder choice + saved query vectors) now, not
+      // after init (~200 s): searches arrive in that window. Retries while
+      // providers or the vector db are not ready; never blocks or throws.
+      void import('./embedding/semanticSearchService.js')
+        .then(m => m.startSearchWarmup(msg => this.log(msg)))
+        .catch(() => undefined);
       this.log('Initialization starting...');
       // Axon: load the tree-sitter grammar up front so the SYNC parse paths
       // (search, the functions/sample-text preview routes) see statement-shaped
@@ -3220,6 +3209,15 @@ class FantomMCPServer {
           this.initializationComplete = true;
           const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
           this.log(`Critical initialization complete in ${elapsed}s - server is responsive`);
+          // Open the code vector table and its index files before the first search.
+          void import('./embedding/lanceConnection.js')
+            .then(m => m.warmCodeTable())
+            .then(ms => this.log(`Code vector table warm-up: ${ms}ms`))
+            .catch(() => undefined);
+          // Search warm-up again in case the early run (at HTTP start) gave up; no-op once done.
+          void import('./embedding/semanticSearchService.js')
+            .then(m => m.startSearchWarmup(msg => this.log(msg)))
+            .catch(() => undefined);
 
           // Start all background initialization tasks (code indexing, AST caches, doc caches)
           this.startBackgroundInitialization();
@@ -4042,10 +4040,13 @@ class FantomMCPServer {
               versionGroup: { type: 'string', description: VERSION_GROUP_ARG_DOC },
               nodeType: { type: 'string', description: 'Filter by node type (function, method, type)' },
               limit: { type: 'number', description: 'Max results (default: 10)', default: 10 },
+              groupVersions: { type: 'boolean', description: 'All-projects / version-group searches: fold the same symbol from other versions of a pod under the best hit ("Also in"). Default true; false lists every copy.', default: true },
             },
             required: ['query'],
           },
         },
+        // Knowledge cards (read-only; never calls a model)
+        ...(await import('./knowledge/cardMcpTools.js')).KNOWLEDGE_CARD_TOOL_DEFS,
         // Ask Codebase (RLM grounded Q&A)
         {
           name: 'askCodebase',
@@ -6186,13 +6187,14 @@ class FantomMCPServer {
 
         case 'semanticCodeSearch': {
           const ssConfig = this.config.semanticSearch || {};
-          const { query, projectId: pidIn, projectName, versionGroup, nodeType, limit = ssConfig.defaultLimit || 10 } = args as {
+          const { query, projectId: pidIn, projectName, versionGroup, nodeType, limit = ssConfig.defaultLimit || 10, groupVersions } = args as {
             query: string;
             projectId?: number;
             projectName?: string;
             versionGroup?: string;
             nodeType?: string;
             limit?: number;
+            groupVersions?: boolean;
           };
 
           const prisma = getPrismaClient();
@@ -6210,6 +6212,7 @@ class FantomMCPServer {
             minScore: ssConfig.minScore,
             graphWeight: ssConfig.graphWeight,
             includeGraphContext: ssConfig.includeGraphContext ?? true,
+            ...(typeof groupVersions === 'boolean' ? { groupVersions } : {}),
           });
 
           if (results.length === 0) {
@@ -6228,6 +6231,7 @@ class FantomMCPServer {
             }
             lines.push(`   Type: ${result.nodeType}`);
             lines.push(`   File: ${result.filePath}:${result.lineStart}`);
+            if (result.alsoIn?.length) lines.push(`   Also in: ${result.alsoIn.map(a => a.label).join(', ')}`);
             if (result.signature) {
               lines.push(`   Signature: ${result.signature}`);
             }
@@ -6295,6 +6299,13 @@ class FantomMCPServer {
               }, null, 2),
             }],
           };
+        }
+
+        case 'getKnowledgeCard':
+        case 'listKnowledgeCards': {
+          const out = await (await import('./knowledge/cardMcpTools.js')).handleKnowledgeCardTool(name, args as Record<string, unknown>);
+          await trackTool(!out.isError);
+          return out;
         }
 
         case 'askCodebase': {

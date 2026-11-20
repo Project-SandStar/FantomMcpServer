@@ -17,6 +17,7 @@
 
 import * as fs from 'fs';
 import * as os from 'os';
+import { getSavedGraphSettings, resolveGraphKnob } from './graphSettings.js';
 
 /** "buffer pool is full and no memory could be freed" and its variants. */
 export function isBufferPoolError(err: unknown): boolean {
@@ -24,11 +25,8 @@ export function isBufferPoolError(err: unknown): boolean {
   return /buffer pool is full|Buffer manager exception|Unable to allocate memory/i.test(m);
 }
 
-function envNumber(name: string): number | undefined {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return undefined;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : undefined;
+function knob(name: Parameters<typeof resolveGraphKnob>[0]): number {
+  return resolveGraphKnob(name, getSavedGraphSettings()).value;
 }
 
 /** Memory limit in MiB: the cgroup v2 limit in a container, else total RAM. */
@@ -80,10 +78,11 @@ export function resolveProjectBufferPoolMiB(fileMiB: number, maxOpen: number): n
     fileMiB,
     maxOpen,
     memLimitMiB: readMemoryLimitMiB(),
-    fixedMiB: envNumber('FANTOM_GRAPH_DB_BUFFER_MIB'),
-    minMiB: envNumber('FANTOM_GRAPH_DB_BUFFER_MIN_MIB'),
-    maxMiB: envNumber('FANTOM_GRAPH_DB_BUFFER_MAX_MIB'),
-    memFraction: envNumber('FANTOM_GRAPH_POOL_MEM_FRACTION'),
+    // Dashboard value > env > default (src/graph/graphSettings.ts).
+    fixedMiB: knob('bufferFixedMiB') || undefined,
+    minMiB: knob('bufferMinMiB'),
+    maxMiB: knob('bufferMaxMiB'),
+    memFraction: knob('poolMemFraction'),
   });
 }
 
@@ -91,9 +90,8 @@ export const DEFAULT_QUERY_THREADS = 4;
 
 /** Threads per graph query: FANTOM_GRAPH_QUERY_THREADS, else min(CPUs, 4). */
 export function resolveGraphQueryThreads(cpus: number = os.availableParallelism?.() ?? os.cpus().length): number {
-  const env = envNumber('FANTOM_GRAPH_QUERY_THREADS');
-  if (env) return Math.floor(env);
-  return Math.max(1, Math.min(cpus || 1, DEFAULT_QUERY_THREADS));
+  // Dashboard value > FANTOM_GRAPH_QUERY_THREADS > min(CPUs, 4).
+  return resolveGraphKnob('queryThreads', getSavedGraphSettings(), process.env, cpus).value;
 }
 
 /** Minimal connection surface used by `runWithPoolFullRetry`. */

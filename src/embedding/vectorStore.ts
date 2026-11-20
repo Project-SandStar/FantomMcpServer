@@ -9,7 +9,6 @@
  */
 
 import { readMinScore } from './hybridSearch.js';
-import { recordEmbedTextVersion } from './embedTextVersions.js';
 import type { PrismaClient } from '@prisma/client';
 import { createLogger } from '../utils/index.js';
 import { crashWrite } from '../utils/logSink.js';
@@ -17,12 +16,18 @@ import { EmbeddingService } from './embeddingService.js';
 import { selectEmbeddingProvider, type EmbeddingProvider } from './providers/embeddingProvider.js';
 import { getLanceTable, getActiveCodeTableName, codeTableHasV3Columns, codeTableHasV4Columns, openCodeSlotReadonly } from './lanceConnection.js';
 import { ladybugQuery } from '../graph/ladybugConnection.js';
-import { EMBED_TEXT_VERSION, EMBED_TEXT_V3, EMBED_TEXT_V4 } from './embeddingText.js';
+import { EMBED_TEXT_V3, EMBED_TEXT_V4 } from './embeddingText.js';
 
-/** Partitions probed when a project/type filter narrows an IVF_PQ search.
- *  ~460 partitions on the 212k-row code table; 20 (the default) misses whole
- *  projects. Tunable: FANTOM_VECTOR_NPROBES. */
-const FILTERED_NPROBES = (() => { const n = Number(process.env.FANTOM_VECTOR_NPROBES); return Number.isFinite(n) && n > 0 ? Math.round(n) : 96; })();
+/** IVF partitions probed per search. The code table uses IVF_HNSW_SQ with a
+ *  handful of partitions (rows/100k); probing them ALL measured recall@10
+ *  0.998 vs 0.71 for the old IVF_PQ at the same median latency
+ *  (2026-11-20, 50 real queries vs exact search). A value above the
+ *  partition count is clamped by LanceDB. Tunable: FANTOM_VECTOR_NPROBES. */
+const VECTOR_NPROBES = (() => { const n = Number(process.env.FANTOM_VECTOR_NPROBES); return Number.isFinite(n) && n > 0 ? Math.round(n) : 96; })();
+/** HNSW search width. Must be >= the rows the index returns (limit x refine
+ *  factor); recall barely moved between ef 100 and 400. Tunable: FANTOM_VECTOR_EF. */
+const VECTOR_EF = (() => { const n = Number(process.env.FANTOM_VECTOR_EF); return Number.isFinite(n) && n > 0 ? Math.round(n) : 100; })();
+const VECTOR_REFINE = 2;
 
 const logger = createLogger('vector-store');
 
@@ -53,7 +58,14 @@ export interface VectorSearchResult {
   /** Denormalised on the row — the only source for file:/project: rows. */
   qualifiedName?: string;
   filePath?: string;
+  /** The winning chunk's stored embed text, first RESULT_TEXT_MAX_CHARS
+   *  chars. Only set when the search asked for it (includeText) and the
+   *  table has the v4 text column. Used by the reranker (fix A). */
+  text?: string;
 }
+
+/** Cap on VectorSearchResult.text. */
+export const RESULT_TEXT_MAX_CHARS = 1500;
 
 /** One row to store. Chunk/line fields come from buildEmbeddingItems (v3);
  *  legacy callers pass just nodeId + embedding and metadata is looked up in
@@ -79,6 +91,9 @@ export interface VectorSearchOptions {
   nodeType?: string;
   limit?: number;
   minScore?: number;
+  /** Also return each hit's chunk text (v4 tables). Off by default: reading
+   *  the text column costs I/O on every search. */
+  includeText?: boolean;
 }
 
 // ============================================
@@ -121,12 +136,7 @@ export class VectorStore {
       return;
     }
 
-    // Delete existing record if any
-    try {
-      await table.delete(`node_id = '${escSql(nodeId)}'`);
-    } catch { /* ignore if not exists */ }
-
-    await table.add([{
+    const row = {
       node_id: nodeId,
       vector: Array.from(embedding),
       project_id: node.projectId,
@@ -134,7 +144,15 @@ export class VectorStore {
       model: this.embeddingService.getModelName(),
       dimensions: this.embeddingService.getDimensions(),
       created_at: new Date().toISOString(),
-    }]);
+    };
+    // Single writer per table: delete + add as one job on the table's chain.
+    const { enqueueTableWrite } = await import('./vectorWriteQueue.js');
+    await enqueueTableWrite(table, async () => {
+      try {
+        await table.delete(`node_id = '${escSql(nodeId)}'`);
+      } catch { /* ignore if not exists */ }
+      await table.add([row]);
+    });
   }
 
   /**
@@ -167,156 +185,22 @@ export class VectorStore {
     // explicitly must not reuse the active slot's cached answer, so the key is
     // undefined for it. Resolved here while we still know which case this is.
     const v3CacheKey = targetTable ? undefined : getActiveCodeTableName();
-    const { enqueueTableWrite } = await import('./vectorWriteQueue.js');
-    return enqueueTableWrite(table, () => this.storeEmbeddingsSerialized(items, projectId, table, v3CacheKey, producedBy));
-  }
-
-  private async storeEmbeddingsSerialized(
-    items: StoreEmbeddingItem[],
-    projectId: number | undefined,
-    table: import('@lancedb/lancedb').Table,
-    v3CacheKey: string | undefined,
-    producedBy?: EmbeddingProvider,
-  ): Promise<number> {
     const t0 = Date.now();
-    // What produced these vectors, recorded on each row.
-    //
-    // `this.embeddingService` is the single-pick LOCAL selector, and it THROWS
-    // under strict-sidecar mode when no local sidecar advertises the model —
-    // the permanent state under "OpenRouter only". So merely labelling a row
-    // used to kill a cloud rebuild from inside the scheduler's onChunk
-    // callback, after the vectors had already been computed. The scheduler
-    // knows which provider produced each chunk and now passes it in; callers
-    // that do not are the local paths, where the getter is both correct and
-    // safe to resolve.
+    // What produced these vectors, recorded on each row. `this.embeddingService`
+    // THROWS under strict-sidecar mode with no local sidecar ("OpenRouter
+    // only"), so the scheduler passes the provider that produced the chunk;
+    // callers that do not are the local paths, where the getter is safe.
     const stamp = producedBy
       ? { model: producedBy.getModelName(), dimensions: producedBy.getDimensions() }
       : { model: this.embeddingService.getModelName(), dimensions: this.embeddingService.getDimensions() };
     vsCrash(`storeEmbeddings ENTER items=${items.length} ${memTag()}`);
-    vsCrash(`storeEmbeddings TABLE_OK afterMs=${Date.now() - t0}`);
-    let stored = 0;
-
-    // v3 rows (chunks, line range, qualified_name/file_path) need the v3
-    // columns; a table created before EMBED_TEXT_VERSION 3 gets v2-shaped rows
-    // (chunk 0 only) and the project stays recorded at version 2 → model-status
-    // shows it stale until a full re-embed builds a fresh table.
-    const v3 = EMBED_TEXT_V3 && await codeTableHasV3Columns(table, v3CacheKey);
-    if (EMBED_TEXT_V3 && !v3) items = items.filter(i => !i.chunkIndex);
-    // v4 (`text` column) likewise only on a table created by a v4 build; an
-    // older table takes v3-shaped rows and the project is recorded at 3.
-    const v4 = EMBED_TEXT_V4 && v3 && await codeTableHasV4Columns(table, v3CacheKey);
-    // Text-layout bookkeeping for /admin/vectors/model-status (see embedTextVersions.ts).
-    if (items.length) recordEmbedTextVersion(projectId, v4 ? EMBED_TEXT_VERSION : v3 ? Math.min(EMBED_TEXT_VERSION, 3) : Math.min(EMBED_TEXT_VERSION, 2));
-
-    // Look up denormalized fields for nodes that did not bring their own
-    // (Ladybug-authoritative). Items with `nodeType` (built by
-    // buildEmbeddingItems / buildSyntheticItems) skip the lookup when the
-    // caller gave the projectId — file:/project: rows have no CodeNode at all.
-    // Chunk the WHERE-OR list so the query stays within parser limits.
-    const nodeIds = Array.from(new Set(items.filter(i => !i.nodeType || projectId == null).map(i => i.nodeId)));
-    const nodes: Array<{ id: string; projectId: number; nodeType: string }> = [];
-    const lookupStart = Date.now();
-    for (let i = 0; i < nodeIds.length; i += 500) {
-      const chunkNo = Math.floor(i / 500) + 1;
-      const totalChunks = Math.ceil(nodeIds.length / 500);
-      vsCrash(`LOOKUP_START chunk=${chunkNo}/${totalChunks} ids=${Math.min(500, nodeIds.length - i)} ${memTag()}`);
-      const conditions = nodeIds.slice(i, i + 500).map(id => `n.id = '${id}'`).join(' OR ');
-      try {
-        // CRITICAL: the embedder (buildProjectEmbeddings) reads its node set
-        // from the PER-PROJECT graph db (.cache/graph/<id>.db). The single-arg
-        // ladybugQuery hits the legacy SHARED db, which is stale/partial — so
-        // node-ids embedded from the per-project db were not found here and the
-        // resulting vectors were silently dropped (`if (!node) continue`),
-        // meaning resume/auto-embed could never converge. When the caller knows
-        // the projectId, route the metadata lookup to the SAME per-project db.
-        const rows = projectId != null
-          ? await ladybugQuery<{ id: string; pid: number; nt: string }>(
-              projectId,
-              `MATCH (n:CodeNode {project_id: ${projectId}}) WHERE ${conditions} RETURN n.id AS id, n.project_id AS pid, n.node_type AS nt`,
-            )
-          : await ladybugQuery<{ id: string; pid: number; nt: string }>(
-              `MATCH (n:CodeNode) WHERE ${conditions} RETURN n.id AS id, n.project_id AS pid, n.node_type AS nt`,
-            );
-        for (const r of rows) nodes.push({ id: r.id, projectId: Number(r.pid), nodeType: r.nt });
-        vsCrash(`LOOKUP_OK chunk=${chunkNo}/${totalChunks} rows=${rows.length}`);
-      } catch (err) {
-        vsCrash(`LOOKUP_FAIL chunk=${chunkNo}/${totalChunks} err=${err instanceof Error ? err.message : String(err)}`);
-        throw err;
-      }
-    }
-    vsCrash(`LOOKUP_DONE total=${nodes.length}/${nodeIds.length} ms=${Date.now() - lookupStart}`);
-    const nodeMap = new Map(nodes.map(n => [n.id, n]));
-
-    const batchSize = 100;
-    for (let i = 0; i < items.length; i += batchSize) {
-      const batch = items.slice(i, i + batchSize);
-      const records: Array<Record<string, unknown>> = [];
-      const deleteIds: string[] = [];
-
-      for (const item of batch) {
-        const node = nodeMap.get(item.nodeId);
-        const pid = node?.projectId ?? (item.nodeType ? projectId : undefined);
-        const nodeType = node?.nodeType ?? item.nodeType;
-        if (pid == null || !nodeType) continue;
-
-        if (!deleteIds.includes(item.nodeId)) deleteIds.push(item.nodeId);
-        const rec: Record<string, unknown> = {
-          node_id: item.nodeId,
-          vector: Array.from(item.embedding),
-          project_id: pid,
-          node_type: nodeType,
-          ...stamp,
-          created_at: new Date().toISOString(),
-        };
-        if (v3) {
-          const ci = item.chunkIndex ?? 0;
-          Object.assign(rec, {
-            row_id: ci === 0 ? item.nodeId : `${item.nodeId}#${ci}`,
-            chunk_index: ci,
-            chunk_count: item.chunkCount ?? 1,
-            line_start: item.lineStart ?? 0,
-            line_end: item.lineEnd ?? item.lineStart ?? 0,
-            qualified_name: item.qualifiedName ?? '',
-            file_path: item.filePath ?? '',
-          });
-        }
-        if (v4) rec.text = item.text ?? '';
-        records.push(rec);
-      }
-
-      if (records.length === 0) {
-        vsCrash(`SUBBATCH SKIP i=${i} reason=no-matched-nodes`);
-        continue;
-      }
-
-      const subBatchNo = Math.floor(i / batchSize) + 1;
-      const totalSubBatches = Math.ceil(items.length / batchSize);
-      vsCrash(`SUBBATCH START ${subBatchNo}/${totalSubBatches} records=${records.length} delete=${deleteIds.length}`);
-
-      // Delete existing records. node_id is the BASE id on every chunk row, so
-      // this also removes stale chunks of a node that got shorter.
-      if (deleteIds.length > 0) {
-        const delStart = Date.now();
-        const idList = deleteIds.map(id => `'${escSql(id)}'`).join(', ');
-        try {
-          await table.delete(`node_id IN (${idList})`);
-          vsCrash(`DELETE_OK ${subBatchNo}/${totalSubBatches} ids=${deleteIds.length} ms=${Date.now() - delStart}`);
-        } catch (err) {
-          vsCrash(`DELETE_FAIL ${subBatchNo}/${totalSubBatches} err=${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-
-      const addStart = Date.now();
-      try {
-        await table.add(records);
-        vsCrash(`ADD_OK ${subBatchNo}/${totalSubBatches} records=${records.length} ms=${Date.now() - addStart} ${memTag()}`);
-      } catch (err) {
-        vsCrash(`ADD_FAIL ${subBatchNo}/${totalSubBatches} err=${err instanceof Error ? err.message : String(err)}`);
-        throw err;
-      }
-      stored += records.length;
-    }
-
+    // ORDW-05: probes, graph lookup and row building run BEFORE the write
+    // slot; the buffer then waits for room (back-pressure) and the table's
+    // single writer commits up to writeBatchRows rows per delete + add.
+    const { prepareCodeRowGroups, commitCodeRowGroups } = await import('./codeVectorRows.js');
+    const groups = await prepareCodeRowGroups(items, projectId, table, v3CacheKey, stamp);
+    const { submitRows } = await import('./vectorWriteBuffer.js');
+    const stored = await submitRows(table, commitCodeRowGroups, groups);
     logger.debug(`Stored ${stored} embeddings`);
     vsCrash(`storeEmbeddings DONE stored=${stored} totalMs=${Date.now() - t0} ${memTag()}`);
     return stored;
@@ -346,9 +230,12 @@ export class VectorStore {
    */
   async deleteEmbedding(nodeId: string): Promise<void> {
     const table = await getLanceTable();
-    try {
-      await table.delete(`node_id = '${escSql(nodeId)}'`);
-    } catch { /* ignore if not exists */ }
+    const { enqueueTableWrite } = await import('./vectorWriteQueue.js');
+    await enqueueTableWrite(table, async () => {
+      try {
+        await table.delete(`node_id = '${escSql(nodeId)}'`);
+      } catch { /* ignore if not exists */ }
+    });
   }
 
   /**
@@ -397,18 +284,26 @@ export class VectorStore {
     // v3 tables hold several rows per node (chunks) plus file:/project: rows;
     // over-fetch and group by node_id below, keeping each node's best chunk.
     const v3 = EMBED_TEXT_V3 && await codeTableHasV3Columns(table, getActiveCodeTableName());
+    const withText = options.includeText === true && v3
+      && EMBED_TEXT_V4 && await codeTableHasV4Columns(table, getActiveCodeTableName());
     const columns = v3
-      ? ['node_id', 'project_id', 'node_type', 'chunk_index', 'chunk_count', 'line_start', 'line_end', 'qualified_name', 'file_path']
+      ? ['node_id', 'project_id', 'node_type', 'chunk_index', 'chunk_count', 'line_start', 'line_end', 'qualified_name', 'file_path', ...(withText ? ['text'] : [])]
       : ['node_id', 'project_id'];
 
     // Build vector search query with cosine distance
+    const fetchRows = limit * (v3 ? 4 : 2); // Get extra to collapse chunks (and for an opt-in minScore)
     let query = table.vectorSearch(Array.from(queryEmbedding))
       .distanceType('cosine')
       .select(columns)
-      // IVF_PQ distances are codebook estimates; re-score the top candidates
+      // Index distances are estimates (SQ / PQ); re-score the top candidates
       // against the stored vectors so the scores the caller sees are exact.
-      .refineFactor(2)
-      .limit(limit * (v3 ? 4 : 2)); // Get extra to collapse chunks (and for an opt-in minScore)
+      .refineFactor(VECTOR_REFINE)
+      // All IVF partitions: a filtered search only sees this project's rows
+      // inside the probed partitions, and too few probes returned nothing.
+      .nprobes(VECTOR_NPROBES)
+      // HNSW: ef must cover every row the index returns (ignored by IVF_PQ).
+      .ef(Math.max(VECTOR_EF, fetchRows * VECTOR_REFINE))
+      .limit(fetchRows);
 
     // Apply filters
     const filters: string[] = [];
@@ -418,14 +313,6 @@ export class VectorStore {
 
     if (filters.length > 0) {
       query = query.where(filters.join(' AND '));
-      // IVF_PQ + a project filter: the SDK prefilters, so the search only sees
-      // rows of THIS project inside the probed partitions. With the default
-      // 20 probes over ~460 partitions a 5,210-row project is often absent
-      // from all of them, and a perfectly good query returns NOTHING — the
-      // RLM logged "search_code: no results" for "open sax file" on a project
-      // whose loadAppSax scored 0.97 for a sibling phrasing. Probe wider when
-      // filtered; the per-project candidate set is small so this stays cheap.
-      query = query.nprobes(FILTERED_NPROBES);
     }
 
     let rawResults = await query.toArray();
@@ -470,6 +357,7 @@ export class VectorStore {
         r.lineEnd = row.line_end != null && Number(row.line_end) > 0 ? Number(row.line_end) : undefined;
         r.qualifiedName = row.qualified_name || undefined;
         r.filePath = row.file_path || undefined;
+        if (withText && typeof row.text === 'string') r.text = row.text.slice(0, RESULT_TEXT_MAX_CHARS);
       }
       results.push(r);
     }
@@ -500,7 +388,8 @@ export class VectorStore {
     if (projectId) filters.push(`project_id = ${projectId}`);
     else if (projectIds?.length) filters.push(`project_id IN (${projectIds.join(', ')})`);
     if (nodeType) filters.push(`node_type = '${escSql(nodeType)}'`);
-    const columns = ['node_id', 'project_id', 'node_type', 'chunk_index', 'chunk_count', 'line_start', 'line_end', 'qualified_name', 'file_path'];
+    const withText = options.includeText === true;
+    const columns = ['node_id', 'project_id', 'node_type', 'chunk_index', 'chunk_count', 'line_start', 'line_end', 'qualified_name', 'file_path', ...(withText ? ['text'] : [])];
     let rows: Array<Record<string, unknown>>;
     try {
       let fq = table.query().fullTextSearch(q, { columns: 'text' }).select(columns).limit(limit * 4);
@@ -532,6 +421,7 @@ export class VectorStore {
         lineEnd: row.line_end != null && Number(row.line_end) > 0 ? Number(row.line_end) : undefined,
         qualifiedName: (row.qualified_name as string) || undefined,
         filePath: (row.file_path as string) || undefined,
+        ...(withText && typeof row.text === 'string' ? { text: row.text.slice(0, RESULT_TEXT_MAX_CHARS) } : {}),
       });
       if (out.length >= limit) break;
     }

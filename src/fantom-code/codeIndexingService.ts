@@ -929,6 +929,8 @@ export class CodeIndexingService {
       lastIndexed: new Date(),
       podMeta
     });
+    // Knowledge cards: mark cards of changed files stale (not awaited).
+    void import('../knowledge/cardStaleness.js').then(m => m.onProjectReindexed(project.id)).catch(() => {});
 
     // ============================================
     // Diff against pre-state snapshot, record ApiChange + IndexedFile rows.
@@ -1401,6 +1403,7 @@ export class CodeIndexingService {
         where: { id: projectId },
         data: { lastIndexed: new Date() },
       });
+      void import('../knowledge/cardStaleness.js').then(m => m.onProjectReindexed(projectId)).catch(() => {});
 
       const durationMs = Date.now() - startTime;
       await this.prisma.indexRun.update({

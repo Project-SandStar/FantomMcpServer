@@ -11,6 +11,24 @@ import { createLogger } from '../utils/index.js';
 import { EmbeddingService } from './embeddingService.js';
 import { selectEmbeddingProvider, type EmbeddingProvider } from './providers/embeddingProvider.js';
 import { getDocsLanceTable } from './lanceConnection.js';
+import { enqueueTableWrite } from './vectorWriteQueue.js';
+import { submitRows, type RowGroup } from './vectorWriteBuffer.js';
+
+/**
+ * Write-buffer commit for the docs table (ORDW-05): one delete of every
+ * doc_id in the batch, then one add. A failed delete is ignored and a failed
+ * add throws, as before.
+ */
+async function commitDocRowGroups(table: unknown, groups: RowGroup[]): Promise<void> {
+  const t = table as import('@lancedb/lancedb').Table;
+  const records = groups.flatMap(g => g.rows);
+  if (records.length === 0) return;
+  const idList = groups.map(g => `'${escSql(g.key)}'`).join(', ');
+  try {
+    await t.delete(`doc_id IN (${idList})`);
+  } catch { /* ignore */ }
+  await t.add(records);
+}
 
 const logger = createLogger('docs-vector-store');
 
@@ -91,12 +109,7 @@ export class DocsVectorStore {
   ): Promise<void> {
     const table = await getDocsLanceTable();
 
-    // Delete existing record if any
-    try {
-      await table.delete(`doc_id = '${escSql(doc.docId)}'`);
-    } catch { /* ignore if not exists */ }
-
-    await table.add([{
+    const row = {
       doc_id: doc.docId,
       vector: Array.from(embedding),
       pod: doc.pod,
@@ -107,7 +120,14 @@ export class DocsVectorStore {
       language: doc.language ?? '',
       ...stampOf(producedBy ?? this.embeddingService),
       created_at: new Date().toISOString(),
-    }]);
+    };
+    // Single writer per table: delete + add as one job on the table's chain.
+    await enqueueTableWrite(table, async () => {
+      try {
+        await table.delete(`doc_id = '${escSql(doc.docId)}'`);
+      } catch { /* ignore if not exists */ }
+      await table.add([row]);
+    });
   }
 
   /**
@@ -118,18 +138,17 @@ export class DocsVectorStore {
     producedBy?: EmbeddingProvider,
   ): Promise<number> {
     const table = await getDocsLanceTable();
-    let stored = 0;
     const stamp = stampOf(producedBy ?? this.embeddingService);
 
-    const batchSize = 100;
-    for (let i = 0; i < items.length; i += batchSize) {
-      const batch = items.slice(i, i + batchSize);
-      const records: Array<Record<string, unknown>> = [];
-      const deleteIds: string[] = [];
-
-      for (const item of batch) {
-        deleteIds.push(item.doc.docId);
-        records.push({
+    // ORDW-05: rows go through the table's bounded write buffer; its single
+    // writer commits up to writeBatchRows rows per delete + add. One group
+    // per doc_id; a later item for the same doc replaces an earlier one.
+    const groups = new Map<string, RowGroup>();
+    for (const item of items) {
+      groups.delete(item.doc.docId);
+      groups.set(item.doc.docId, {
+        key: item.doc.docId,
+        rows: [{
           doc_id: item.doc.docId,
           vector: Array.from(item.embedding),
           pod: item.doc.pod,
@@ -140,22 +159,10 @@ export class DocsVectorStore {
           language: item.doc.language ?? '',
           ...stamp,
           created_at: new Date().toISOString(),
-        });
-      }
-
-      if (records.length === 0) continue;
-
-      // Delete existing records
-      if (deleteIds.length > 0) {
-        const idList = deleteIds.map(id => `'${escSql(id)}'`).join(', ');
-        try {
-          await table.delete(`doc_id IN (${idList})`);
-        } catch { /* ignore */ }
-      }
-
-      await table.add(records);
-      stored += records.length;
+        }],
+      });
     }
+    const stored = await submitRows(table, commitDocRowGroups, [...groups.values()]);
 
     logger.debug(`Stored ${stored} doc embeddings`);
     return stored;
@@ -260,7 +267,7 @@ export class DocsVectorStore {
     const table = await getDocsLanceTable();
     const countBefore = await table.countRows(`pod = '${escSql(pod)}'`);
     if (countBefore > 0) {
-      await table.delete(`pod = '${escSql(pod)}'`);
+      await enqueueTableWrite(table, () => table.delete(`pod = '${escSql(pod)}'`));
     }
     return countBefore;
   }
@@ -272,7 +279,7 @@ export class DocsVectorStore {
     const table = await getDocsLanceTable();
     const countBefore = await table.countRows(`instance_id = ${instanceId}`);
     if (countBefore > 0) {
-      await table.delete(`instance_id = ${instanceId}`);
+      await enqueueTableWrite(table, () => table.delete(`instance_id = ${instanceId}`));
     }
     return countBefore;
   }
@@ -282,9 +289,11 @@ export class DocsVectorStore {
    */
   async deleteEmbedding(docId: string): Promise<void> {
     const table = await getDocsLanceTable();
-    try {
-      await table.delete(`doc_id = '${escSql(docId)}'`);
-    } catch { /* ignore if not exists */ }
+    await enqueueTableWrite(table, async () => {
+      try {
+        await table.delete(`doc_id = '${escSql(docId)}'`);
+      } catch { /* ignore if not exists */ }
+    });
   }
 
   /**

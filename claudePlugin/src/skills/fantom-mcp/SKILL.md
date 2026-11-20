@@ -22,6 +22,8 @@ ToolSearch("fantom", 30)
 | Understand how something works, where it lives | `askCodebase` | `query`, `projectId`. Deep answer with citations, 60 to 120 s. `useRlm: false` for a 20 s answer. |
 | Find a function, type, field by name or words | `searchFantomCode` | `query`, `projectId` or `versionGroup`. Fast. |
 | Find code by meaning ("retry with backoff") | `semanticCodeSearch` | `query`, `projectId`. |
+| Get a short, checked summary of a symbol before editing it | `getKnowledgeCard` | `symbol` (or `file`), `projectId`. Fast, no model call. What it does, callers and callees, claims with file:line, source sha256. Stale / flagged cards are not shown as fact; then read the code. |
+| See which symbols have knowledge cards | `listKnowledgeCards` | `projectId`, optional `file`, `kind`, `status`. |
 | Read one symbol | `getFantomFunction`, `getFantomType` | `qualifiedName` like `pod::Type.method`. |
 | See everything in one file | `listFunctionsInFile` | `filePath`, `projectId`. Re-parses a changed focus file first. |
 | Know what breaks if you change a symbol | `getCallers` then `getCodeImpact` | Always before editing a shared function. |

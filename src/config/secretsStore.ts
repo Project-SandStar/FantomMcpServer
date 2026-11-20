@@ -20,6 +20,8 @@ import { getCacheDir } from '../utils/installRoot.js';
 /** The only names this store accepts — the API keys the dashboard can set. */
 export const SECRET_NAMES = [
   'FANTOM_OPENROUTER_API_KEY',
+  // Low-limit key only for ss-rlm-sandbox (it runs model-written code).
+  'FANTOM_OPENROUTER_SANDBOX_KEY',
   'GROQ_API_KEY',
   'ANTHROPIC_API_KEY',
   'GEMINI_API_KEY',

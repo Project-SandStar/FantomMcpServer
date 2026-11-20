@@ -83,7 +83,7 @@
     }
   },
   "sidecarMasterWsPort": 3003,
-  "rssGuardMb": 4000,
+  "rssGuardMb": 21600,
   "projectEmbeddingOverrides": {},
   "debug": {}
 }

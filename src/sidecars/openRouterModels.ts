@@ -149,37 +149,19 @@ export const RERANK_CATALOGUE: CatalogueModel[] = [
 
 /**
  * Chat models for the `code-assistant` role. Verified live against
- * `GET /api/v1/models` on 2026-09-15.
+ * `GET /api/v1/models` on 2026-11-19 (poolside/laguna-s-2.1, its :free tier
+ * and qwen/qwen3-coder-plus are no longer listed and were removed).
  *
- * WHY THE DEFAULT IS NOT THE REQUESTED MODEL. Fantom and Axon are not in any
+ * WHY THE DEFAULT IS NOT A CODER MODEL. Fantom and Axon are not in any
  * model's training data, so code specialisation buys much less here than it
  * would on Python or TypeScript — long context and in-context learning matter
  * more (see docs/reports/coder-llms-for-obscure-languages-2026-09-15.md).
- * `laguna-s-2.1` has four times the context of `qwen3-coder`, supports
- * reasoning, and costs a third of the price per input token. `qwen3-coder` is
- * listed because it was asked for, and it is one click away.
+ * `deepseek-v4-flash` has four times the context of `qwen3-coder`, supports
+ * tools and reasoning, costs under a third of its input price, has many
+ * upstreams, and is the model the RLM loop already uses. `qwen3-coder` is
+ * listed as the code-specialised choice, one click away.
  */
 export const CHAT_CATALOGUE: CatalogueModel[] = [
-  {
-    id: 'poolside/laguna-s-2.1',
-    label: 'Laguna S 2.1',
-    contextTokens: 1_050_000,
-    codeCapable: true,
-    tools: true,
-    reasoning: true,
-    priceIn: 0.09,
-    priceOut: 0.18,
-  },
-  {
-    id: 'poolside/laguna-s-2.1:free',
-    label: 'Laguna S 2.1 (free tier)',
-    contextTokens: 262_000,
-    codeCapable: true,
-    tools: true,
-    reasoning: true,
-    priceIn: 0,
-    priceOut: 0,
-  },
   {
     id: 'deepseek/deepseek-v4-flash',
     label: 'DeepSeek V4 Flash',
@@ -199,16 +181,6 @@ export const CHAT_CATALOGUE: CatalogueModel[] = [
     reasoning: false,
     priceIn: 0.30,
     priceOut: 1.00,
-  },
-  {
-    id: 'qwen/qwen3-coder-plus',
-    label: 'Qwen3 Coder Plus',
-    contextTokens: 1_000_000,
-    codeCapable: true,
-    tools: true,
-    reasoning: false,
-    priceIn: 0.65,
-    priceOut: 3.25,
   },
   {
     id: 'mistralai/devstral-2512',
@@ -242,7 +214,14 @@ export const CHAT_CATALOGUE: CatalogueModel[] = [
   },
 ];
 
-export const DEFAULT_CODE_ASSISTANT_MODEL = 'poolside/laguna-s-2.1';
+export const DEFAULT_CODE_ASSISTANT_MODEL = 'deepseek/deepseek-v4-flash';
+
+/** Ids OpenRouter no longer serves. A stored one reads as the default. */
+export const RETIRED_CHAT_MODELS: readonly string[] = [
+  'poolside/laguna-s-2.1',
+  'poolside/laguna-s-2.1:free',
+  'qwen/qwen3-coder-plus',
+];
 
 /**
  * ── RLM sandbox fallback ──────────────────────────────────────────────────
@@ -268,9 +247,8 @@ export const DEFAULT_CODE_ASSISTANT_MODEL = 'poolside/laguna-s-2.1';
 export const RLM_CATALOGUE: CatalogueModel[] = CHAT_CATALOGUE.filter(m => m.tools && m.reasoning);
 
 /**
- * Not `poolside/laguna-s-2.1`, which matches on price and capability but is
- * served by a single upstream — the same single-provider exposure that took
- * two Qwen rerankers dark. DeepSeek V4 Flash has 17.
+ * DeepSeek V4 Flash: tools + reasoning, 1M context, served by 17 upstreams,
+ * so one provider going dark does not take the sandbox with it.
  */
 export const DEFAULT_RLM_SANDBOX_MODEL = 'deepseek/deepseek-v4-flash';
 

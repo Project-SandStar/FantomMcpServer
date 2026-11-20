@@ -27,33 +27,54 @@ jest.unstable_mockModule('../sidecars/registry.js', () => ({
   sidecarUrl: jest.fn(() => 'http://gpu-01:8098'),
 }));
 
-const listVirtualContainers = jest.fn<(...a: any[]) => any[]>(() => []);
-jest.unstable_mockModule('../sidecars/virtualContainers.js', () => ({
-  listVirtualContainers,
-  listAllVirtualContainers: listVirtualContainers,
-  getVirtualContainersConfig: () => ({ enabled: true, rerankModel: 'qwen/qwen3-reranker-8b', strictRerankModel: false }),
-  DEFAULT_OR_RERANK_MODEL: 'qwen/qwen3-reranker-8b',
+// The key store must not read this machine's real secrets file.
+jest.unstable_mockModule('../config/secretsStore.js', () => ({
+  SECRET_NAMES: ['FANTOM_OPENROUTER_API_KEY'],
+  readStoredSecret: jest.fn(() => null),
+  secretSource: jest.fn(() => null),
+  storeSecret: jest.fn(),
+  deleteStoredSecret: jest.fn(() => false),
+  applyStoredSecretsToEnv: jest.fn(() => []),
+  __resetSecretsStoreForTest: jest.fn(),
 }));
 
-const virtualRerank = jest.fn<(...a: any[]) => Promise<any>>();
-jest.unstable_mockModule('../sidecars/virtualInferenceClient.js', () => ({
-  virtualRerank,
-  virtualEmbed: jest.fn(),
-  VirtualInferenceUnavailable: class extends Error {},
-}));
+// The cloud side is Fantom's own OpenRouter client now. "Cloud available" is
+// a stored key; the HTTP call goes through the client's fetch seam and lands
+// in `virtualRerank`, which receives the request body.
+const FAKE_KEY = 'sk-or-v1-FAKEKEY1234567890';
+const cloudOn = () => { process.env.FANTOM_OPENROUTER_API_KEY = FAKE_KEY; };
+const cloudOff = () => { delete process.env.FANTOM_OPENROUTER_API_KEY; };
+const virtualRerank = jest.fn<(body: any) => Promise<any>>();
 
 // The routing policy decides whether cloud may be reached at all. Default the
 // reranker to 'backup' — local serves, cloud covers the gap — which is the
 // policy every test below assumes unless it says otherwise. Mocked rather than
 // read from disk so these tests do not depend on the machine's config file.
-const getOpenRouterSettings = jest.fn<(...a: any[]) => any>(() => ({
+const DEFAULT_SETTINGS = () => ({
   allowedModels: {}, modeByRole: {},
   policyByRole: { reranker: 'backup', embedding: 'aggregate', 'code-embedding': 'aggregate' },
-}));
+});
+const getOpenRouterSettings = jest.fn<(...a: any[]) => any>(DEFAULT_SETTINGS);
 jest.unstable_mockModule('../sidecars/openRouterConfig.js', () => ({ getOpenRouterSettings }));
 
 const { rerankLocalFirst, parseRerankScores, __resetRerankPolicyCacheForTest } =
   await import('../embedding/rerankRouter.js');
+const { __setOpenRouterFetchForTest } = await import('../openrouter/http.js');
+const { __resetOpenRouterPoolForTest } = await import('../openrouter/workerPool.js');
+const { __setPoolSettingsForTest } = await import('../openrouter/settings.js');
+
+function installOpenRouterFetch(): void {
+  __setOpenRouterFetchForTest(async (url, init) => {
+    if (!url.endsWith('/rerank')) throw new Error(`unexpected OpenRouter call ${url}`);
+    const out = await virtualRerank(JSON.parse(init.body ?? '{}'));
+    const text = JSON.stringify(out);
+    return {
+      ok: true, status: 200, headers: { get: () => null },
+      text: async () => text,
+      arrayBuffer: async () => new TextEncoder().encode(text).buffer as ArrayBuffer,
+    };
+  });
+}
 
 const LOCAL_SIDECAR = {
   id: 'sc-gpu01',
@@ -62,15 +83,7 @@ const LOCAL_SIDECAR = {
   capabilities: { reranker: { available: true, models: ['Qwen/Qwen3-Reranker-8B'], loaded: 'Qwen/Qwen3-Reranker-8B' } },
 };
 
-const OR_RERANKER = {
-  sidecarId: 'sc-1',
-  sidecarName: 'BASWS35',
-  providerName: 'BASWS35-OR-Reranker',
-  role: 'reranker' as const,
-  model: 'qwen/qwen3-reranker-8b',
-  mode: 'local-first' as const,
-  source: 'sidecar' as const,
-};
+const OR_NAME = 'Fantom-OR-Reranker';
 
 const DOCS = ['alpha', 'beta', 'gamma'];
 
@@ -84,12 +97,17 @@ function failFetch(status: number) {
 beforeEach(() => {
   rerankerSidecarUsable.mockReset();
   resetRerankerCache.mockReset();
-  listVirtualContainers.mockReset().mockReturnValue([]);
   virtualRerank.mockReset();
+  getOpenRouterSettings.mockReset().mockImplementation(DEFAULT_SETTINGS);
+  __resetRerankPolicyCacheForTest();
+  __resetOpenRouterPoolForTest();
+  __setPoolSettingsForTest({});
+  installOpenRouterFetch();
+  cloudOff();
   jest.spyOn(console, 'log').mockImplementation(() => {});
   jest.spyOn(console, 'warn').mockImplementation(() => {});
 });
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => { jest.restoreAllMocks(); cloudOff(); __setOpenRouterFetchForTest(null); });
 
 describe('score parsing', () => {
   it('aligns Cohere-style results to the input order', () => {
@@ -107,7 +125,7 @@ describe('score parsing', () => {
 describe('local first', () => {
   it('uses the local reranker when one is healthy and never calls the cloud', async () => {
     rerankerSidecarUsable.mockReturnValue(LOCAL_SIDECAR);
-    listVirtualContainers.mockReturnValue([OR_RERANKER]);
+    cloudOn();
     global.fetch = okFetch({ results: DOCS.map((_, i) => ({ index: i, relevance_score: 1 - i * 0.1 })) });
 
     const out = await rerankLocalFirst('q', DOCS);
@@ -134,16 +152,15 @@ describe('local first', () => {
 describe('fallback to OpenRouter', () => {
   it('falls back when no local reranker is registered — the gpu-01 case', async () => {
     rerankerSidecarUsable.mockReturnValue(null);
-    listVirtualContainers.mockReturnValue([OR_RERANKER]);
+    cloudOn();
     virtualRerank.mockResolvedValue({
-      source: 'openrouter',
       results: DOCS.map((_, i) => ({ index: i, relevance_score: 0.5 + i * 0.1 })),
       model: 'qwen/qwen3-reranker-8b',
     });
 
     const out = await rerankLocalFirst('q', DOCS);
     expect(out!.path).toBe('openrouter');
-    expect(out!.servedBy).toBe('BASWS35-OR-Reranker');
+    expect(out!.servedBy).toBe(OR_NAME);
     expect(out!.model).toBe('qwen/qwen3-reranker-8b');
     expect(out!.localSkipReason).toMatch(/no usable sidecar advertises/);
   });
@@ -153,8 +170,8 @@ describe('fallback to OpenRouter', () => {
     // unhealthy, stale or embed-faulted host simply does not come back from
     // it — the router inherits those rules rather than re-implementing them.
     rerankerSidecarUsable.mockReturnValue(null);
-    listVirtualContainers.mockReturnValue([OR_RERANKER]);
-    virtualRerank.mockResolvedValue({ source: 'openrouter', results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b' });
+    cloudOn();
+    virtualRerank.mockResolvedValue({ results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b' });
 
     const out = await rerankLocalFirst('q', ['only']);
     expect(out!.path).toBe('openrouter');
@@ -163,26 +180,37 @@ describe('fallback to OpenRouter', () => {
 
   it('falls back when the local REQUEST fails, not just when local is absent', async () => {
     rerankerSidecarUsable.mockReturnValue(LOCAL_SIDECAR);
-    listVirtualContainers.mockReturnValue([OR_RERANKER]);
+    cloudOn();
     global.fetch = failFetch(500);
-    virtualRerank.mockResolvedValue({ source: 'openrouter', results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b' });
+    virtualRerank.mockResolvedValue({ results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b' });
 
     const out = await rerankLocalFirst('q', ['only']);
     expect(out!.path).toBe('openrouter');
     expect(out!.localSkipReason).toMatch(/500/);
   });
 
-  it('prefers the configured model when slots allow-list different ones', async () => {
+  it('sends the configured model, pin and top_n straight to OpenRouter', async () => {
     rerankerSidecarUsable.mockReturnValue(null);
-    listVirtualContainers.mockReturnValue([
-      // A names something else entirely; B names what Fantom is configured for.
-      { ...OR_RERANKER, providerName: 'A-OR-Reranker', model: 'some/other-reranker' },
-      { ...OR_RERANKER, providerName: 'B-OR-Reranker', model: 'qwen/qwen3-reranker-8b' },
-    ]);
-    virtualRerank.mockResolvedValue({ source: 'openrouter', results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b' });
+    cloudOn();
+    getOpenRouterSettings.mockReturnValue({
+      ...DEFAULT_SETTINGS(),
+      allowedModels: { reranker: { model: 'some/other-reranker', provider: 'DeepInfra' } },
+    });
+    virtualRerank.mockResolvedValue({ results: [{ index: 0, relevance_score: 1 }], model: 'some/other-reranker' });
 
     const out = await rerankLocalFirst('q', ['only']);
-    expect(out!.servedBy).toBe('B-OR-Reranker');
+    expect(out!.servedBy).toBe(OR_NAME);
+    expect(out!.model).toBe('some/other-reranker');
+    const body = virtualRerank.mock.calls[0][0];
+    expect(body).toMatchObject({ model: 'some/other-reranker', query: 'q', documents: ['only'], top_n: 1 });
+    expect(body.provider).toEqual({ order: ['DeepInfra'], allow_fallbacks: true });
+  });
+
+  it('does not reach the cloud without a stored key', async () => {
+    rerankerSidecarUsable.mockReturnValue(null);
+    cloudOff();
+    expect(await rerankLocalFirst('q', ['only'])).toBeNull();
+    expect(virtualRerank).not.toHaveBeenCalled();
   });
 });
 
@@ -193,8 +221,8 @@ describe('a failed local rerank drops the probe cache', () => {
   // that actually matters.
   it('invalidates on an HTTP failure', async () => {
     rerankerSidecarUsable.mockReturnValue(LOCAL_SIDECAR);
-    listVirtualContainers.mockReturnValue([OR_RERANKER]);
-    virtualRerank.mockResolvedValue({ source: 'openrouter', results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b' });
+    cloudOn();
+    virtualRerank.mockResolvedValue({ results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b' });
     global.fetch = failFetch(500);
 
     await rerankLocalFirst('q', ['only']);
@@ -203,7 +231,7 @@ describe('a failed local rerank drops the probe cache', () => {
 
   it('invalidates on an unparseable response', async () => {
     rerankerSidecarUsable.mockReturnValue(LOCAL_SIDECAR);
-    listVirtualContainers.mockReturnValue([]);
+    cloudOff();
     global.fetch = okFetch({ nonsense: true });
 
     await rerankLocalFirst('q', ['only']);
@@ -221,8 +249,8 @@ describe('a failed local rerank drops the probe cache', () => {
 
 describe('recovery — selection is re-evaluated per request', () => {
   it('takes local traffic back the moment gpu-01 registers again', async () => {
-    listVirtualContainers.mockReturnValue([OR_RERANKER]);
-    virtualRerank.mockResolvedValue({ source: 'openrouter', results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b' });
+    cloudOn();
+    virtualRerank.mockResolvedValue({ results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b' });
 
     // 1. gpu-01 absent → cloud.
     rerankerSidecarUsable.mockReturnValue(null);
@@ -242,13 +270,13 @@ describe('recovery — selection is re-evaluated per request', () => {
 describe('no backend at all', () => {
   it('returns null so the caller keeps its input order rather than failing', async () => {
     rerankerSidecarUsable.mockReturnValue(null);
-    listVirtualContainers.mockReturnValue([]);
+    cloudOff();
     expect(await rerankLocalFirst('q', DOCS)).toBeNull();
   });
 
   it('returns null when the cloud path also fails', async () => {
     rerankerSidecarUsable.mockReturnValue(null);
-    listVirtualContainers.mockReturnValue([OR_RERANKER]);
+    cloudOn();
     virtualRerank.mockRejectedValue(new Error('sidecar routed to local'));
     expect(await rerankLocalFirst('q', DOCS)).toBeNull();
   });
@@ -262,11 +290,6 @@ describe('no backend at all', () => {
 
 
 describe('the routing policy decides whether cloud may be reached at all', () => {
-  const OR = {
-    sidecarId: 'sc-gpu02', sidecarName: 'BASWS34', providerName: 'BASWS34-OR-Reranker',
-    role: 'reranker', mode: 'cloud-only', model: 'qwen/qwen3-reranker-8b',
-  };
-
   beforeEach(() => {
     jest.clearAllMocks();
     // The policy read is TTL-cached to keep a synchronous config read off the
@@ -275,14 +298,14 @@ describe('the routing policy decides whether cloud may be reached at all', () =>
     // No healthy local reranker — gpu-01 has roles [cuda, ocr] and never
     // registered one, so this is the real fleet's steady state.
     rerankerSidecarUsable.mockReturnValue(null);
-    listVirtualContainers.mockReturnValue([OR]);
+    cloudOn();
     virtualRerank.mockResolvedValue({
-      source: 'openrouter', results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b',
+      results: [{ index: 0, relevance_score: 1 }], model: 'qwen/qwen3-reranker-8b',
     });
   });
 
-  it('"SideCar only" keeps the request local even with a cloud-routable container registered', async () => {
-    getOpenRouterSettings.mockReturnValue({ policyByRole: { reranker: 'local' } });
+  it('"SideCar only" keeps the request local even with a key stored', async () => {
+    getOpenRouterSettings.mockReturnValue({ allowedModels: {}, policyByRole: { reranker: 'local' } });
     const out = await rerankLocalFirst('q', ['only']);
     expect(virtualRerank).not.toHaveBeenCalled();
     // No backend served it, so callers keep their input order rather than fail.
@@ -290,14 +313,14 @@ describe('the routing policy decides whether cloud may be reached at all', () =>
   });
 
   it('"as backup" lets the cloud cover an absent local reranker', async () => {
-    getOpenRouterSettings.mockReturnValue({ policyByRole: { reranker: 'backup' } });
+    getOpenRouterSettings.mockReturnValue({ allowedModels: {}, policyByRole: { reranker: 'backup' } });
     const out = await rerankLocalFirst('q', ['only']);
     expect(virtualRerank).toHaveBeenCalled();
     expect(out!.path).toBe('openrouter');
   });
 
   it('"SideCar + OpenRouter" behaves as backup here — one call has no fan-out to join', async () => {
-    getOpenRouterSettings.mockReturnValue({ policyByRole: { reranker: 'aggregate' } });
+    getOpenRouterSettings.mockReturnValue({ allowedModels: {}, policyByRole: { reranker: 'aggregate' } });
     const out = await rerankLocalFirst('q', ['only']);
     expect(virtualRerank).toHaveBeenCalled();
     expect(out!.path).toBe('openrouter');
@@ -311,7 +334,7 @@ describe('the routing policy decides whether cloud may be reached at all', () =>
   });
 
   it('an omitted reranker policy falls to the default rather than reading as disabled', async () => {
-    getOpenRouterSettings.mockReturnValue({ policyByRole: {} });
+    getOpenRouterSettings.mockReturnValue({ allowedModels: {}, policyByRole: {} });
     const out = await rerankLocalFirst('q', ['only']);
     // Default is aggregate, which for this role means cloud may cover the gap.
     expect(virtualRerank).toHaveBeenCalled();

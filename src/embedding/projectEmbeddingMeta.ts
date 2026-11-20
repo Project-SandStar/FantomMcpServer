@@ -89,6 +89,7 @@ export function getFleetEmbeddingSplit(): Array<{ provider: string; texts: numbe
     }
   }
   return [...totals.entries()]
-    .map(([provider, t]) => ({ provider, ...t, cloud: provider.includes('-OR-') }))
+    // `workerN` = a direct OpenRouter pool slot (src/openrouter/workerAttribution.ts).
+    .map(([provider, t]) => ({ provider, ...t, cloud: provider.includes('-OR-') || /^worker\d+$/.test(provider) }))
     .sort((a, b) => b.texts - a.texts);
 }

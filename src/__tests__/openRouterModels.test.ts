@@ -101,7 +101,7 @@ describe('catalogue integrity', () => {
 describe('the code-assistant role', () => {
   it('surfaces context and the reasoning flag the way embedders surface dims', () => {
     const labels = catalogueFor('code-assistant').map(m => optionLabel('code-assistant', m));
-    expect(labels).toContain('Laguna S 2.1 · 1.05M ctx · tools + reasoning');
+    expect(labels).toContain('DeepSeek V4 Flash · 1.05M ctx · tools + reasoning');
     expect(labels).toContain('Qwen3 Coder · 262K ctx · tools only');
   });
 
@@ -109,7 +109,7 @@ describe('the code-assistant role', () => {
     // Each of these reports tools:true, reasoning:false upstream, and
     // askCodebase is a multi-round plan/gather/synthesise loop — so this is
     // the flag that decides whether a choice quietly degrades it.
-    for (const id of ['qwen/qwen3-coder', 'qwen/qwen3-coder-plus', 'mistralai/devstral-2512']) {
+    for (const id of ['qwen/qwen3-coder', 'mistralai/devstral-2512']) {
       const m = findModel(id)!;
       expect(m.tools).toBe(true);
       expect(m.reasoning).toBe(false);
@@ -120,7 +120,8 @@ describe('the code-assistant role', () => {
   it('defaults to a long-context reasoning model, not the code-specialised one', () => {
     // Fantom and Axon are in no model's training data, so code specialisation
     // buys little and long context buys a lot.
-    expect(DEFAULT_CODE_ASSISTANT_MODEL).toBe('poolside/laguna-s-2.1');
+    expect(DEFAULT_CODE_ASSISTANT_MODEL).toBe('deepseek/deepseek-v4-flash');
+    expect(d0Tools(DEFAULT_CODE_ASSISTANT_MODEL)).toBe(true);
     const d = findModel(DEFAULT_CODE_ASSISTANT_MODEL)!;
     expect(d.reasoning).toBe(true);
     expect(d.contextTokens).toBeGreaterThan(findModel('qwen/qwen3-coder')!.contextTokens);
@@ -160,7 +161,7 @@ describe('the code-assistant role', () => {
     for (const role of ['code-embedding', 'embedding', 'reranker'] as const) {
       const ids = catalogueFor(role).map(m => m.id);
       expect(ids).not.toContain('qwen/qwen3-coder');
-      expect(ids).not.toContain('poolside/laguna-s-2.1');
+      expect(ids).not.toContain('deepseek/deepseek-v4-flash');
     }
   });
 
@@ -169,6 +170,8 @@ describe('the code-assistant role', () => {
   });
 });
 
+
+function d0Tools(id: string): boolean { return findModel(id)?.tools === true; }
 
 describe('chat pricing is carried per direction, ready for whoever wires it', () => {
   it('records input and output separately — they are up to 8x apart', () => {
@@ -185,9 +188,9 @@ describe('chat pricing is carried per direction, ready for whoever wires it', ()
     }
   });
 
-  it('the free tier really is free', () => {
-    const free = findModel('poolside/laguna-s-2.1:free')!;
-    expect(free.priceIn).toBe(0);
-    expect(free.priceOut).toBe(0);
+  it('no longer offers models OpenRouter stopped listing (2026-11-19)', () => {
+    for (const id of ['poolside/laguna-s-2.1', 'poolside/laguna-s-2.1:free', 'qwen/qwen3-coder-plus']) {
+      expect(findModel(id)).toBeUndefined();
+    }
   });
 });

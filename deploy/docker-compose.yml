@@ -37,6 +37,10 @@ services:
   fantom:
     build: ..
     restart: unless-stopped
+    # 24 GB: Node heap 12 GB (Dockerfile --max-old-space-size=12288) plus
+    # native memory (LanceDB IVF_HNSW_SQ index data, LadybugDB stores, child
+    # index builds). Set FANTOM_RSS_GUARD_MB=21600 (90%) with it.
+    mem_limit: 24g
     network_mode: "container:fantom-net"
     depends_on: [fantom-net]
     environment:

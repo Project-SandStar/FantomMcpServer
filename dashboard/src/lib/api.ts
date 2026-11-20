@@ -129,9 +129,18 @@ export async function readJsonResponse<T>(response: Response, fallbackMessage = 
     try { parsed = JSON.parse(text); } catch { /* not JSON */ }
   }
   if (!response.ok) {
-    const j = parsed as { error?: unknown; message?: unknown } | undefined;
+    const j = parsed as { error?: unknown; message?: unknown; issues?: unknown } | undefined;
     const serverMsg = typeof j?.error === 'string' ? j.error : typeof j?.message === 'string' ? j.message : '';
-    if (serverMsg) throw new Error(`${fallbackMessage}: ${serverMsg} (HTTP ${status})`);
+    // A validation 400 carries the reasons in `issues`; without them the user
+    // sees only "would not work as written" and cannot tell what to fix.
+    const issues = Array.isArray(j?.issues)
+      ? (j!.issues as Array<{ role?: unknown; message?: unknown }>)
+          .map(i => (typeof i?.message === 'string' ? `${typeof i.role === 'string' ? `[${i.role}] ` : ''}${i.message}` : ''))
+          .filter(Boolean)
+      : [];
+    if (serverMsg) {
+      throw new Error(`${fallbackMessage}: ${serverMsg} (HTTP ${status})${issues.length ? `\n• ${issues.join('\n• ')}` : ''}`);
+    }
     if (!text.trim()) throw new Error(`Server returned ${status} with no body. The server or the proxy in front of it may have dropped the request; try again.`);
     throw new Error(`Server returned ${status}: ${text.slice(0, 200)}`);
   }
@@ -232,7 +241,14 @@ export interface WorkflowDetail {
 export interface ServerStatus {
   status: 'running' | 'starting' | 'error';
   uptime: number;
-  memory: { used: number; total: number; percentage: number; heapTotal?: number; rss?: number; external?: number };
+  memory: {
+    used: number; total: number; percentage: number; heapTotal?: number; rss?: number; external?: number;
+    rssGuard?: {
+      percentage: number; basisMb: number; basis: 'guard' | 'container' | 'ram';
+      guardMb: number; guardSource: 'env' | 'config' | 'container' | 'default';
+      level: 'ok' | 'warn' | 'danger'; containerMb: number | null; containerLimitMb: number | null;
+    };
+  };
   initialized: boolean;
   version: string;
   serverPath: string;
@@ -595,91 +611,20 @@ export type VirtualRole = 'embedding' | 'code-embedding' | 'reranker' | 'code-as
 export type VirtualRoutingMode = 'local-only' | 'local-first' | 'cloud-only';
 
 /**
- * An OpenRouter-backed provider — cloud capacity a sidecar serves for a role
- * instead of its local model. It hangs off a host but is NOT that host's GPU:
- * no VRAM, no gpuPercent. Named `<PCName>-OR-<Role>`.
+ * A sidecar's ss-rlm-sandbox slot for Fantom. Sidecars hold Fantom's key only
+ * for the sandbox; every other role calls OpenRouter from Fantom directly.
  */
-export interface VirtualContainer {
+export interface SandboxSlot {
   sidecarId: string;
-  sidecarName: string;
-  providerName: string;
-  role: VirtualRole;
-  model: string;
-  /** Pinned upstream. Required for embedding roles; rerank needs none. */
-  upstreamProvider?: string;
-  dims?: number;
-  mode: VirtualRoutingMode;
-  source: 'sidecar' | 'config';
-  served?: number;
-  lastServedAt?: number | null;
-  failures?: number;
-  lastError?: string | null;
-  lastDurationMs?: number | null;
-  state?: 'idle' | 'serving' | 'failed';
-  /** Master slot this row belongs to — always Fantom's own. */
+  name: string;
   serverUrl?: string;
-  cloudBacked?: true;
-}
-
-/**
- * Whether a sidecar has OpenRouter configured for FANTOM's master slot.
- * `unset` is the usual reason the virtual list is empty: the sidecar scopes
- * its key and allow-list per master, so capacity configured for another
- * master is deliberately unusable here.
- */
-export interface OpenRouterSlotHealth {
-  /** Sidecars whose slot for Fantom holds no OpenRouter config. */
-  unset: Array<{ sidecarId: string; name: string; serverUrl?: string; lastAutoPushAt: number | null }>;
-  /** Connected sidecars whose slot could not be read. */
-  unknown: Array<{ sidecarId: string; name: string }>;
-  /** Key an automatic re-push would use; null = none, so no auto-push. */
-  keySource: 'stored' | 'env' | null;
-  /** `keyPushed` is true but some slots are unset. */
-  keyFlagStale: boolean;
-}
-
-export interface MasterSlotStatus {
-  sidecarId: string;
-  serverUrl?: string;
-  openrouter: string;
+  openrouter: 'configured' | 'unset' | 'unknown';
   at: number;
+  lastPushAt?: number;
+  lastPushOk?: boolean;
 }
 
-/**
- * A vector-space verdict. Distinct from `Sidecar.embedFault`, which is a
- * TTL-expiring RUNTIME fault — a vector verdict never expires, because
- * "these vectors are not interchangeable" does not become false after an hour.
- */
-export interface VectorVerification {
-  key: string;
-  providerName: string;
-  ok: true;
-  /** Absent for a SOLE cloud provider under "OpenRouter only": there was no
-   *  peer to compare it with, so no cosine was measured. */
-  minCosine?: number;
-  meanCosine?: number;
-  dims: number;
-  samples: number;
-  at: string;
-  /** What the verdict was reached against — a local host, or a cloud peer
-   *  under "OpenRouter only". The two are different claims. */
-  reference?: VerificationRegime;
-  referenceName?: string;
-}
-
-export type VerificationRegime = 'local-ref' | 'cloud-ref';
-
-export interface VectorRefusal {
-  key: string;
-  providerName: string;
-  kind: 'vector-incompatible' | 'dimension-mismatch' | 'no-provider-pin' | 'probe-failed';
-  reason: string;
-  at: string;
-  minCosine?: number;
-  dims?: number;
-  reference?: VerificationRegime;
-  referenceName?: string;
-}
+export type VerificationRegime = 'local-ref' | 'cloud-ref' | 'stored-ref';
 
 export interface CompatibilityReport {
   key: string;
@@ -706,11 +651,6 @@ export interface OpenRouterRoleConfig {
 export interface OpenRouterSettings {
   allowedModels: Partial<Record<VirtualRole, OpenRouterRoleConfig>>;
   modeByRole: Partial<Record<VirtualRole, VirtualRoutingMode>>;
-  /** Whether a key has ever been pushed. Never the key itself. */
-  keyPushed?: boolean;
-  keyLast4?: string;
-  lastPushedAt?: string;
-  lastPushedTo?: string[];
 }
 
 /** One role's live test from the OpenRouter page (POST /openrouter/test). */
@@ -750,46 +690,72 @@ export interface OpenRouterRoleActivity {
   capped: boolean;
 }
 
-/** The global permit pool. The unit is CONCURRENT CLOUD REQUESTS. */
-export interface CloudBudgetStats {
-  effectiveConcurrency: number;
-  ceilingConcurrency: number;
-  inFlight: number;
+/** Per-role counters of Fantom's OpenRouter worker pool. */
+export interface OpenRouterRoleStats {
   queued: number;
-  queuedProjects: number;
-  state: 'steady' | 'ramping' | 'backing-off';
-  rateLimitHits: number;
-  /** What `/key`'s `rate_limit` implied, verbatim — believable or not. */
-  discoveredRequestsPerMinute: number | null;
-  /** The RPM actually gated on. null when nothing was discovered, or when what
-   *  was discovered is not believed for a funded account. */
-  enforcedRequestsPerMinute?: number | null;
-  /** False when a reported RPM was discarded as implausible (a $100 account
-   *  reporting 1/min, which held the whole cloud fan-out to one request a
-   *  minute until it was distrusted). */
-  rateLimitTrusted?: boolean;
-  discoveredConcurrency: number | null;
-  /** Ceiling implied by the account holding credits, when no rate figure is
-   *  believable. */
-  creditsDerivedConcurrency?: number | null;
-  manualConcurrency: number | null;
-  source: 'manual' | 'discovered' | 'credits' | 'fallback';
-  /** One sentence naming where the ceiling came from. Render it — a budget
-   *  number with no stated provenance is how a 1/min limit survived. */
-  sourceDetail?: string;
-  meanLatencyMs: number;
-  requestsLastMinute: number;
-  backoffUntil: string | null;
-  discovery: {
-    ok: boolean; reason?: string; unsupported?: boolean; at: string | null;
-    /** `/key`'s `rate_limit` exactly as OpenRouter returned it. */
-    rawRateLimit?: unknown;
-    envelopeKeys?: string[];
-  };
-  credits: { remaining: number | null; totalCredits: number | null; totalUsage: number | null } | null;
-  unit?: string;
-  maxAllowed?: number;
-  conservativeDefault?: number;
+  running: number;
+  done: number;
+  failed: number;
+  rateLimited: number;
+  retried: number;
+  meanMs: number;
+  meanWaitMs: number;
+}
+
+/** Fantom's own OpenRouter worker pool (src/openrouter/workerPool.ts). */
+export interface OpenRouterPoolStats {
+  settings: { workerCount: number; interactiveSlots: number; requestTimeoutMs: number };
+  bulk: { running: number; queued: number; limit: number; projects: number };
+  interactive: { running: number; queued: number; limit: number };
+  rateLimit: { adaptiveLimit: number; hits: number; coolingDownMs: number; state: 'steady' | 'ramping' | 'backing-off' };
+  lag: { p95Ms: number; maxMs: number; lagLimit: number; stepsDown: number; lastChangeAt: number | null };
+  byRole: Record<string, OpenRouterRoleStats>;
+}
+
+export interface SettingRange { min: number; max: number; def: number }
+
+export interface OpenRouterPoolLimits {
+  workerCount: SettingRange;
+  interactiveSlots: SettingRange;
+  requestTimeoutMs: SettingRange;
+}
+
+/** One table's write buffer (src/embedding/vectorWriteBuffer.ts). */
+export interface VectorWriteTableStats {
+  table: string;
+  queued: number;
+  bufferRows: number;
+  waitingProducers: number;
+  pendingCalls: number;
+  commits: number;
+  failedCommits: number;
+  rowsWritten: number;
+  lastCommitMs: number;
+  meanCommitMs: number;
+  rowsPerSec: number;
+  producerWaitMs: number;
+}
+
+export interface VectorWriteStats {
+  maxPendingRows: number;
+  writeBatchRows: number;
+  writeConcurrency: number;
+  rateWindowSec: number;
+  tables: VectorWriteTableStats[];
+  totals: Omit<VectorWriteTableStats, 'table'>;
+}
+
+export interface OpenRouterParseStats { inline: number; offThread: number; fallbacks: number; mb: number }
+
+export interface OpenRouterKeyInfo {
+  label?: string;
+  limit?: number | null;
+  limitRemaining?: number | null;
+  usage?: number;
+  isFreeTier?: boolean;
+  totalCredits?: number;
+  totalUsage?: number;
+  rateLimit?: { requests?: number; interval?: string };
 }
 
 export interface OpenRouterActivityResponse {
@@ -797,11 +763,35 @@ export interface OpenRouterActivityResponse {
   activity: OpenRouterRoleActivity[];
   spendToday: number;
   dailyCaps: Partial<Record<VirtualRole, number>>;
-  budget: CloudBudgetStats;
+  pool: OpenRouterPoolStats;
+  writeStats: VectorWriteStats | null;
+  parse: OpenRouterParseStats;
   lastRerank: {
     path: 'local' | 'openrouter'; servedBy: string; model: string; at: string; ms: number;
     localProbeTtlMs: number; localProbeNote: string;
   } | null;
+}
+
+export type DecisionProvider = 'jev' | 'clef';
+
+/** GET /decision-model (src/embedding/providers/decisionModel.ts describeDecisionModel). */
+export interface DecisionModelResponse {
+  settings: { provider: DecisionProvider; clefModel: string };
+  providers: DecisionProvider[];
+  clefModels: string[];
+  jev: { enabled: boolean; hasKey: boolean; model: string };
+  clef: { hasKey: boolean };
+  active: { provider: DecisionProvider; model: string; ready: boolean; whyNot?: string };
+}
+
+export interface DecisionTestResult {
+  ok: boolean;
+  ms: number;
+  provider: DecisionProvider;
+  model: string;
+  /** Yes-probability for the probe statement (should be high). */
+  answer?: number;
+  error?: string;
 }
 
 /**
@@ -831,13 +821,20 @@ export interface PolicyNote {
 export interface OpenRouterConfigResponse {
   settings: OpenRouterSettings;
   isDefault: boolean;
-  keyPushed: boolean;
+  /** Whether Fantom holds a key. The key itself is never returned. */
+  hasKey: boolean;
+  keySource: 'stored' | 'env' | null;
   /** Last 4 chars of the stored key, for the masked placeholder. Never the key. */
   keyLast4: string | null;
-  /** Per-slot truth behind `keyPushed`; null before the first discovery poll. */
-  slotHealth?: OpenRouterSlotHealth | null;
-  /** Cloud routing is opt-in; while false everything stays local. */
+  /** Separate low-limit key pushed to ss-rlm-sandbox. Never returned. */
+  hasSandboxKey?: boolean;
+  sandboxKeyLast4?: string | null;
+  sandboxOff?: string | null;
+  /** Always true now: Fantom calls OpenRouter itself. */
   enabled: boolean;
+  pool: OpenRouterPoolStats;
+  poolLimits: OpenRouterPoolLimits;
+  writeStats: VectorWriteStats | null;
   catalogue: OpenRouterCatalogueEntry[];
   policyByRole: Partial<Record<VirtualRole, RoutingPolicy>>;
   policyOptions: Array<{ id: RoutingPolicy; label: string }>;
@@ -878,26 +875,30 @@ export interface OpenRouterConfigResponse {
     options: Array<{ id: string; label: string }>;
     modeOptions: Array<{ id: 'local-only' | 'local-first'; label: string }>;
     hint: string;
+    pipeline?: RlmPipelineSettings;
+    sandboxModes?: Array<{ id: RlmSandboxMode; label: string }>;
+    defaultBudgetSec?: number;
+    jev?: { providerEnabled: boolean; hasKey: boolean; minConfidence: number };
   };
   activity: OpenRouterRoleActivity[];
   spendToday: number;
   dailyCaps: Partial<Record<VirtualRole, number>>;
-  budget: CloudBudgetStats;
   issues: OpenRouterIssue[];
   masterWsPort: number;
-  masterServerUrl: string | null;
-  slots: MasterSlotStatus[];
-  virtual: VirtualContainer[];
+  slots: SandboxSlot[];
+  /** Always empty: there are no sidecar-proxied providers any more. */
+  virtual: never[];
   sidecars: Array<{ id: string; name: string; host: string; port: number; wsConnected: boolean }>;
 }
 
 export interface SidecarListResponse {
   sidecars: Sidecar[];
   total: number;
-  virtual?: VirtualContainer[];
+  /** Always empty: there are no sidecar-proxied providers any more. */
+  virtual?: never[];
   virtualTotal?: number;
   masterWsPort?: number;
-  slots?: MasterSlotStatus[];
+  slots?: SandboxSlot[];
   lastRerank?: { path: 'local' | 'openrouter'; servedBy: string; model: string; at: string; ms: number } | null;
 }
 
@@ -1724,6 +1725,172 @@ export interface SidecarAccountRow extends SidecarAccount {
 export interface SidecarAccountsView { configured: boolean; accounts: SidecarAccountRow[]; rootNames?: string[]; error: string | null }
 
 // ============================================
+// Knowledge Graph Cards (/admin/knowledge-cards)
+// ============================================
+export interface KnowledgeCardSettings {
+  enabled: boolean; writerModel: string; checkerModel: string; answerModel: string;
+  projectScope: 'all' | 'list'; projectIds: number[];
+  kinds: { projects: boolean; pods: boolean; classes: boolean; functions: boolean };
+  minLines: number; maxCardsPerProject: number; checkPass: boolean; minConfidence: number;
+  autoRefresh: boolean; useForAsks: boolean; matchThreshold: number; dailyCapUsd: number; concurrency: number; sidecarPerHostLimit: number;
+}
+export interface KnowledgeCardModel {
+  id: string; inPerM: number; outPerM: number; context: number; live: boolean;
+  /** 'sidecar' = local model on the sidecars (free); absent = OpenRouter. */
+  source?: 'openrouter' | 'sidecar';
+  /** Sidecar container (e.g. ss-completion) and the model(s) it serves, from the heartbeat. */
+  container?: string;
+  models?: string[];
+  /** Sidecar hosts that serve it now / that run it but are offline. */
+  hosts?: string[];
+  offline?: string[];
+  /** Why a sidecar option cannot be chosen now. */
+  reason?: string;
+}
+export interface KnowledgeCardStatus {
+  projectId: number; writerModel: string; total: number; fresh: number; stale: number; check: number;
+  flagged: number; lastBuilt: string; costUsd: number;
+}
+export interface KnowledgeCardRun {
+  projectId: number; writerModel: string; state: string; startedAt: string; finishedAt?: string;
+  targets: number; built: number; failedCalls: number; firstCheckFails: number; flagged: number; costUsd: number; ms?: number; error?: string;
+}
+export interface KnowledgeCardsView {
+  settings: KnowledgeCardSettings;
+  limits: Record<string, { min: number; max: number; def: number; step?: number }>;
+  models: KnowledgeCardModel[];
+  projects: Array<{ id: number; name: string }>;
+  status: KnowledgeCardStatus[];
+  runs: KnowledgeCardRun[];
+  spendToday: { day: string; usd: number; byModel: Record<string, number> };
+}
+export interface KnowledgeCardEstimate { projectId: number; writerModel: string; targets: number; byKind: Record<string, number>; estimateUsd: number }
+
+export const knowledgeCardsApi = {
+  get: () => apiRequest<KnowledgeCardsView>('/knowledge-cards'),
+  save: (s: Partial<KnowledgeCardSettings>) => apiRequest<{ settings: KnowledgeCardSettings }>('/knowledge-cards', { method: 'PUT', body: s }),
+  estimate: (projectId: number) => apiRequest<KnowledgeCardEstimate>('/knowledge-cards/estimate', { method: 'POST', body: { projectId } }),
+  build: (projectId: number) => apiRequest<{ run: KnowledgeCardRun }>('/knowledge-cards/build', { method: 'POST', body: { projectId } }),
+  stop: (projectId: number) => apiRequest<{ stopping: boolean }>('/knowledge-cards/stop', { method: 'POST', body: { projectId } }),
+};
+
+// Knowledge Card viewer (/admin/knowledge-cards/viewer/*, read-only)
+export type KnowledgeCardMark = 'good' | 'low' | 'stale' | 'failed';
+export interface KnowledgeCardListRow {
+  rowId: string; nodeId: string; projectId: number; kind: string; name: string; qualifiedName: string;
+  filePath: string; lineStart: number; lineEnd: number; snippet: string; writerModel: string; checkerModel: string;
+  builtAt: string; confidence: number; checkResult: string; firstCheck: string; attempts: number;
+  status: string; mark: KnowledgeCardMark; fanIn: number; claims: number; costUsd: number;
+}
+export interface KnowledgeCardList {
+  projectId: number | 'all'; writerModel: string | null; writers: string[]; minConfidence: number;
+  total: number; offset: number; limit: number; rows: KnowledgeCardListRow[]; kinds: Record<string, number>;
+  totals: { cards: number; good: number; low: number; stale: number; failed: number; fresh: number; check: number; flagged: number; spentUsd: number; lastBuilt: string };
+  /** Status counts under the kind / search filters (status buttons). */
+  marks?: { all: number; good: number; low: number; stale: number; failed: number };
+}
+export interface KnowledgeCardFull {
+  rowId: string; nodeId: string; projectId: number; kind: string; name: string; qualifiedName: string;
+  filePath: string; lineStart: number; lineEnd: number; text: string;
+  claims: Array<{ text: string; file: string; line: number }>;
+  links: Array<{ nodeId: string; name: string; relation: string }>;
+  sources: Array<{ file: string; hash: string; lineStart: number; lineEnd: number; symbol?: string }>;
+  writerModel: string; checkerModel: string; builtAt: string; confidence: number; checkResult: string;
+  firstCheck: string; attempts: number; writerCostUsd: number; checkerCostUsd: number; status: string;
+  mark: KnowledgeCardMark;
+}
+export interface KnowledgeCardDetail {
+  card: KnowledgeCardFull & { fanIn: number };
+  sources: Array<{ file: string; hash: string; lineStart: number; lineEnd: number; symbol?: string; index: number; readable: boolean; fresh: boolean }>;
+  links: Array<{ nodeId: string; name: string; relation: string; card: { rowId: string; mark: KnowledgeCardMark; writerModel: string; confidence: number } | null }>;
+  variants: KnowledgeCardFull[];
+  minConfidence: number;
+}
+export interface KnowledgeCardSource { file: string; lineStart: number; lineEnd: number; from: number; to: number; lines: string[] }
+export interface KnowledgeCardAskResult {
+  answered: boolean; reason?: string; answer?: string; model?: string; costUsd?: number | null; bestScore?: number; builtAt?: string;
+  cards?: Array<{ nodeId: string; projectId: number; qualifiedName: string; filePath: string; lineStart: number; score: number; builtAt: string; writerModel: string }>;
+  citations?: Array<{ nodeId: string; qualifiedName: string; filePath: string; lineStart: number }>;
+  timings: { searchMs: number; answerMs: number; totalMs: number };
+}
+export interface KnowledgeCardProjectCount {
+  projectId: number; name: string; total: number; good: number; low: number; stale: number; failed: number;
+  building: { built: number; targets: number } | null;
+}
+export interface KnowledgeCardCounts {
+  all: { total: number; good: number; low: number; stale: number; failed: number; building: boolean };
+  projects: KnowledgeCardProjectCount[];
+  rebuilds: number;
+}
+export interface KnowledgeCardRebuildJob {
+  id: string; state: 'queued' | 'running' | 'done' | 'stopped' | 'failed'; createdAt: string; startedAt?: string; finishedAt?: string;
+  requested: number; found: number; built: number; flagged: number; firstCheckFails: number; failedCalls: number; costUsd: number;
+  groups: Array<{ projectId: number; writerModel: string; cards: number; built: number; state: string; error?: string }>;
+  skippedCount: number; skipped: Array<{ rowId: string; reason: string }>; error?: string;
+}
+export const knowledgeCardViewerApi = {
+  counts: () => apiRequest<KnowledgeCardCounts>('/knowledge-cards/viewer/counts'),
+  ids: (p: { projectId: number | 'all'; writerModel?: string; kind?: string; mark?: string; q?: string }) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(p)) if (v !== undefined && v !== '') qs.set(k, String(v));
+    return apiRequest<{ total: number; truncated: boolean; rowIds: string[] }>(`/knowledge-cards/viewer/ids?${qs}`);
+  },
+  exportCards: (rowIds: string[]) =>
+    apiRequest<{ cards: Array<KnowledgeCardFull & { embedModel?: string }> }>('/knowledge-cards/viewer/export', { method: 'POST', body: { rowIds } }),
+  rebuild: (rowIds: string[]) => apiRequest<{ job: KnowledgeCardRebuildJob }>('/knowledge-cards/rebuild', { method: 'POST', body: { rowIds } }),
+  rebuildJob: (id: string) => apiRequest<{ job: KnowledgeCardRebuildJob }>(`/knowledge-cards/rebuild/${encodeURIComponent(id)}`),
+  rebuildJobs: () => apiRequest<{ jobs: KnowledgeCardRebuildJob[] }>('/knowledge-cards/rebuild/jobs'),
+  stopRebuild: (id: string) => apiRequest<{ stopping: boolean }>(`/knowledge-cards/rebuild/${encodeURIComponent(id)}/stop`, { method: 'POST', body: {} }),
+  deleteCards: (rowIds: string[]) => apiRequest<{ deleted: number }>('/knowledge-cards/delete', { method: 'POST', body: { rowIds } }),
+  list: (p: { projectId: number | 'all'; writerModel?: string; kind?: string; mark?: string; q?: string; sort?: string; offset?: number; limit?: number }) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(p)) if (v !== undefined && v !== '') qs.set(k, String(v));
+    return apiRequest<KnowledgeCardList>(`/knowledge-cards/viewer/list?${qs}`);
+  },
+  card: (rowId: string) => apiRequest<KnowledgeCardDetail>(`/knowledge-cards/viewer/card?rowId=${encodeURIComponent(rowId)}`),
+  source: (rowId: string, i: number) => apiRequest<KnowledgeCardSource>(`/knowledge-cards/viewer/source?rowId=${encodeURIComponent(rowId)}&i=${i}`),
+  // Card path only; never reads or changes the "use cards to answer asks" setting.
+  ask: (query: string, projectId?: number, writerModel?: string) =>
+    apiRequest<KnowledgeCardAskResult>('/knowledge-cards/ask', { method: 'POST', body: { query, projectId, writerModel } }),
+  build: (projectId: number, writerModel?: string, onlyStale?: boolean) =>
+    apiRequest<{ run: KnowledgeCardRun }>('/knowledge-cards/build', { method: 'POST', body: { projectId, writerModel, onlyStale } }),
+};
+
+// ============================================
+// Graph store settings (/admin/graph/settings)
+// ============================================
+export type GraphSettingSource = 'saved' | 'env' | 'default';
+export interface GraphKnobView {
+  name: string; env: string; label: string; help: string; apply: 'live' | 'next-open' | 'restart';
+  min: number; max: number; step?: number; integer: boolean; default: number | null; autoLabel: string | null;
+  saved: number | null; envValue: string | null; value: number; source: GraphSettingSource;
+}
+export interface GraphSettingsView {
+  knobs: GraphKnobView[];
+  pool: {
+    open: number; cap: number; opens: number; evictions: number; reopens: number; busy: number; poolMiBTotal: number;
+    closeFailures: { connection: number; database: number };
+    entries: Array<{ projectId: number; lastUsedAgoMs: number; inFlight: number; degraded: boolean; poolMiB: number | null }>;
+  };
+  memory: {
+    rssMb: number; containerMb: number | null; memLimitMb: number; guardMb: number; estMbPerStore: number;
+    approxMbPerOpenStore: number | null;
+    warning: { level: 'ok' | 'warn' | 'danger'; projectedMb: number; guardMb: number; message: string | null };
+  };
+}
+export interface GraphStorageView {
+  engine: string; package: string; version: string | null;
+  stores: { path: string; storeCount: number; totalBytes: number; walCount: number; corruptCount: number; corruptBytes: number; lastModified: string | null };
+  shared: { path: string; bytes: number } | null;
+  pool: { open: number; cap: number };
+}
+export const graphSettingsApi = {
+  get: () => apiRequest<GraphSettingsView>('/graph/settings'),
+  storage: () => apiRequest<GraphStorageView>('/graph/storage'),
+  save: (patch: Record<string, number | null>) => apiRequest<GraphSettingsView>('/graph/settings', { method: 'PUT', body: patch }),
+};
+
+// ============================================
 // NetBird (/admin/netbird)
 // ============================================
 
@@ -1847,13 +2014,15 @@ export const api = {
     return apiRequest<SidecarListResponse>(`/sidecars${q ? `?${q}` : ''}`);
   },
 
-  // OpenRouter virtual-inference config. The API key is write-only across
-  // this surface: it goes out on POST and is never returned by GET.
+  // OpenRouter config. Fantom calls OpenRouter itself. The API key is
+  // write-only: it goes out on POST, is stored on the server, and GET only
+  // says whether one is there.
   getOpenRouterConfig: () => apiRequest<OpenRouterConfigResponse>('/openrouter'),
+  getRlmSandboxHosts: () => apiRequest<{ hosts: RlmSandboxHost[] }>('/openrouter/rlm-sandbox-hosts'),
   pushOpenRouterConfig: (body: {
     apiKey?: string;
+    sandboxKey?: string;
     allowedModels?: Partial<Record<VirtualRole, OpenRouterRoleConfig>>;
-    enabled?: boolean;
     dailyCaps?: Partial<Record<VirtualRole, number | ''>>;
     /** modeByRole is DERIVED server-side and is never sent from here. */
     policyByRole?: Partial<Record<VirtualRole, RoutingPolicy>>;
@@ -1866,12 +2035,24 @@ export const api = {
      */
     rlmSandboxModel?: string;
     rlmFallbackMode?: 'local-only' | 'local-first';
+    /** Only the fields sent change; the rest keep their stored value. */
+    rlmPipeline?: Partial<RlmPipelineSettings>;
+    /** Jev route-gate threshold, percent (stored as semanticSearch.jev.minConfidence). */
+    jevMinConfidence?: number;
+    /** Worker pool and write buffer. Omit to leave the stored value alone. */
+    workerCount?: number;
+    interactiveSlots?: number;
+    requestTimeoutMs?: number;
+    maxPendingRows?: number;
+    writeBatchRows?: number;
     force?: boolean;
   }) =>
     apiRequest<{
-      ok: boolean; pushedCount: number; results: OpenRouterPushResult[];
+      ok: boolean; saved: boolean; hasKey: boolean;
       issues: OpenRouterIssue[]; note: string;
       policyByRole: Partial<Record<VirtualRole, RoutingPolicy>>;
+      /** Which sidecars got the ss-rlm-sandbox slot. */
+      sandboxPush: OpenRouterPushResult[];
     }>(
       '/openrouter', { method: 'POST', body },
     ),
@@ -1879,36 +2060,24 @@ export const api = {
   testOpenRouter: (body: { roles?: VirtualRole[] } = {}) =>
     apiRequest<{ results: OpenRouterProbeResult[] }>('/openrouter/test', { method: 'POST', body }),
   getOpenRouterActivity: () => apiRequest<OpenRouterActivityResponse>('/openrouter/activity'),
+  /** Live read from OpenRouter. `ok: false` comes back with HTTP 200 and a `reason`. */
   getOpenRouterCredits: () =>
-    apiRequest<{ ok: boolean; reason?: string; credits: CloudBudgetStats['credits']; spendToday: number; budget: CloudBudgetStats }>(
+    apiRequest<{ ok: boolean; reason?: string; credits: OpenRouterKeyInfo | null; spendToday: number }>(
       '/openrouter/credits',
     ),
-  /** The manual ceiling, in CONCURRENT CLOUD REQUESTS. '' clears it. */
-  setOpenRouterBudget: (maxConcurrent: number | '') =>
-    apiRequest<{ ok: boolean; budget: CloudBudgetStats }>(
-      '/openrouter/budget', { method: 'POST', body: { maxConcurrent } },
+  /** Check Fantom's OpenRouter embedders against rows already in the tables. Writes nothing. */
+  verifyOpenRouterVectors: () =>
+    apiRequest<{ reports: CompatibilityReport[]; regime: VerificationRegime }>(
+      '/openrouter/verify', { method: 'POST' },
     ),
-  rePushOpenRouterConfig: () =>
-    apiRequest<{ ok: boolean; pushedCount: number; results: OpenRouterPushResult[] }>(
-      '/openrouter/repush', { method: 'POST' },
+  getDecisionModel: () => apiRequest<DecisionModelResponse>('/decision-model'),
+  saveDecisionModel: (body: { provider?: DecisionProvider; clefModel?: string }) =>
+    apiRequest<{ ok: boolean; error?: string } & Partial<DecisionModelResponse>>(
+      '/decision-model', { method: 'POST', body },
     ),
-  refreshVirtualContainers: () =>
-    apiRequest<{ ok: boolean; virtual: VirtualContainer[]; slots: MasterSlotStatus[] }>(
-      '/sidecars/virtual/refresh', { method: 'POST' },
-    ),
-  getVirtualVerification: () =>
-    apiRequest<{ verified: VectorVerification[]; refusals: VectorRefusal[] }>('/sidecars/virtual/verification'),
-  verifyVirtualContainers: () =>
-    apiRequest<{
-      reports: CompatibilityReport[];
-      expectedDims?: number;
-      /** The local host, or the cloud peer, the candidates were measured against. */
-      reference?: string;
-      /** Which reference the policy selected — see src/embedding/providers/vectorCompatibility.ts. */
-      regime?: VerificationRegime;
-      policy?: RoutingPolicy;
-      note?: string;
-    }>('/sidecars/virtual/verify', { method: 'POST' }),
+  /** `ok: false` comes back with HTTP 200 and an `error`. */
+  testDecisionModel: (body: { provider: DecisionProvider; clefModel?: string }) =>
+    apiRequest<DecisionTestResult>('/decision-model/test', { method: 'POST', body }),
   listSidecarModels: (kind: SidecarCapabilityKind = 'embedding') =>
     apiRequest<{ kind: SidecarCapabilityKind; models: string[] }>(`/sidecars/models?kind=${kind}`),
   getMasterWsPort: () =>
@@ -2496,7 +2665,7 @@ export const api = {
    * calls answerCodeQuestion directly and keeps the full budget, so it still
    * gets the RLM-found citations.
    */
-  ask: (body: { query: string; projectId?: number; versionGroup?: string | string[]; provider?: string; model?: string; topK?: number; fast?: boolean; rlm?: boolean; rerank?: boolean; askId?: string }) =>
+  ask: (body: { query: string; projectId?: number; versionGroup?: string | string[]; provider?: string; model?: string; topK?: number; fast?: boolean; rlm?: boolean; rerank?: boolean; askId?: string; includeHits?: boolean }) =>
     apiRequest<AskAnswerResponse>('/vectors/ask', {
       method: 'POST',
       body,
@@ -2814,11 +2983,37 @@ export interface AskEvent {
   seq: number;
   t: number;
   /** 'warning': a provider problem (detail = warning kind, items[0] = provider). */
-  kind: 'stage' | 'plan' | 'round' | 'ask' | 'answer' | 'thought' | 'done' | 'error' | 'warning';
+  /** 'step': one pipeline stage's outcome (detail = stage, status, text = reason).
+   *  'settings': the RLM settings this ask runs with. */
+  kind: 'stage' | 'plan' | 'round' | 'ask' | 'answer' | 'thought' | 'done' | 'error' | 'warning' | 'step' | 'settings';
   text: string;
   id?: string;
   detail?: string;
   items?: string[];
+  ms?: number;
+  status?: AskStageStatus;
+}
+
+export type RlmSandboxMode = 'off' | 'backup' | 'always';
+export interface RlmPipelineSettings {
+  fantomRlm: boolean;
+  jevEnabled: boolean;
+  jevPlanCoverage: boolean;
+  jevEvidence: boolean;
+  sandboxMode: RlmSandboxMode;
+  budgetSec?: number;
+  retrievalCapSec: number;
+  sandboxMinSec: number;
+}
+export interface RlmSandboxHost {
+  id: string; name: string; hasRole: boolean; healthy: boolean; ms?: number; model?: string; error?: string;
+}
+
+export type AskStageStatus = 'ran' | 'skipped' | 'off' | 'failed';
+export interface AskStageReport {
+  stage: 'search' | 'jev' | 'fantom-rlm' | 'sandbox' | 'answer';
+  status: AskStageStatus;
+  reason: string;
   ms?: number;
 }
 
@@ -2855,6 +3050,11 @@ export interface AskAnswerResponse {
   rlm?: { used: boolean; model?: string | null; rounds?: number; toolCalls?: number; citations?: number };
   /** Provider problems, e.g. Gemini out of credits while OpenRouter answered. */
   warnings?: ProviderWarning[];
+  stages?: AskStageReport[];
+  settingsLine?: string;
+  sandbox?: { used: boolean; host?: string; ms?: number; reason: string };
+  /** Retrieval hits, when the request set includeHits. */
+  hits?: SemanticSearchResult[];
 }
 
 export interface ProviderWarning {

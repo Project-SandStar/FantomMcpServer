@@ -67,6 +67,16 @@ export function readMinScore(): number | null {
   return Number.isFinite(v) && v > 0 ? v : null;
 }
 
+/**
+ * Characters of each hit's chunk text the cross-encoder also reads
+ * (semanticSearch.rerankCodeChars). 0 = off (default): it reads only name,
+ * signature and doc comment, which scores ~0 on undocumented code.
+ */
+export function readRerankCodeChars(): number {
+  const v = Number((readRuntimeSemantic() as any)?.rerankCodeChars);
+  return Number.isFinite(v) && v > 0 ? Math.min(Math.round(v), 4000) : 0;
+}
+
 export function readRerankMode(): RerankMode {
   const v = readRuntimeSemantic()?.rerank;
   return v === 'on' || v === 'off' || v === 'auto' ? v : 'auto';

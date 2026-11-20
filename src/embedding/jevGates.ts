@@ -12,7 +12,9 @@
  * (`rlm` unless `fast`) stands. The decision and its confidence are logged and
  * returned so the ask feed and the MCP result can show why the loop ran or not.
  */
-import { jevAsk, getJevSettings, type JevQuestion, type JevChoiceAnswer, type JevNoulAnswer, type JevScoreAnswer, type JevFetch } from './providers/jevClient.js';
+import { type JevQuestion, type JevChoiceAnswer, type JevNoulAnswer, type JevScoreAnswer, type JevFetch } from './providers/jevClient.js';
+// Jev or Clef, per semanticSearch.decisionModel (default Jev).
+import { decisionAsk, getDecisionSettings } from './providers/decisionModel.js';
 
 export type AskRoute = 'direct' | 'rlm';
 
@@ -280,7 +282,7 @@ export function planDecisionFromAnswers(
  * the plan missed.
  */
 export async function checkPlan(input: PlanCheckInput, opts: { fetchImpl?: JevFetch } = {}): Promise<PlanCheckDecision | null> {
-  const settings = getJevSettings();
+  const settings = getDecisionSettings();
   if (!settings.enabled || !settings.hasKey) return null;
   const queries = input.subQuestions.map((s) => s.query);
   const identifiersNotSearched = identifiersNotInPlan(input.question, queries);
@@ -291,7 +293,7 @@ export async function checkPlan(input: PlanCheckInput, opts: { fetchImpl?: JevFe
     identifiersNotSearched,
     distinctQueries: new Set(queries.map((q) => q.toLowerCase().trim())).size,
   };
-  const res = await jevAsk(state, PLAN_CHECK_QUESTIONS, { fetchImpl: opts.fetchImpl });
+  const res = await decisionAsk(state, PLAN_CHECK_QUESTIONS, { fetchImpl: opts.fetchImpl });
   if (!res) return null;
   const d = planDecisionFromAnswers(res.answers, identifiersNotSearched, settings.minConfidence, res.model, res.ms);
   if (!d) { console.warn('[jev] plan answer unusable — keeping the plan as is'); return null; }
@@ -382,7 +384,7 @@ export function evidenceDecisionFromAnswers(
  * when Jev is off, has no key, fails, or answers something unusable.
  */
 export async function checkEvidence(input: EvidenceCheckInput, opts: { fetchImpl?: JevFetch } = {}): Promise<EvidenceCheckDecision | null> {
-  const settings = getJevSettings();
+  const settings = getDecisionSettings();
   if (!settings.enabled || !settings.hasKey) return null;
   const namedSymbolsMissing = identifiersNotInPlan(input.question, input.symbolsFound);
   const state = {
@@ -395,7 +397,7 @@ export async function checkEvidence(input: EvidenceCheckInput, opts: { fetchImpl
     round: input.round,
     maxRounds: input.maxRounds,
   };
-  const res = await jevAsk(state, EVIDENCE_CHECK_QUESTIONS, { fetchImpl: opts.fetchImpl });
+  const res = await decisionAsk(state, EVIDENCE_CHECK_QUESTIONS, { fetchImpl: opts.fetchImpl });
   if (!res) return null;
   const d = evidenceDecisionFromAnswers(res.answers, namedSymbolsMissing, settings.minConfidence, res.model, res.ms);
   if (!d) { console.warn('[jev] evidence answer unusable — keeping the loop as is'); return null; }
@@ -411,7 +413,7 @@ export async function checkEvidence(input: EvidenceCheckInput, opts: { fetchImpl
  * has no key, fails, or answers something unusable.
  */
 export async function decideAskRoute(input: AskRouteInput, opts: { fetchImpl?: JevFetch } = {}): Promise<AskRouteDecision | null> {
-  const settings = getJevSettings();
+  const settings = getDecisionSettings();
   if (!settings.enabled || !settings.hasKey) return null;
   const hits = input.hits.slice(0, 8);
   const state = {
@@ -423,7 +425,7 @@ export async function decideAskRoute(input: AskRouteInput, opts: { fetchImpl?: J
     // already among the hits. Jev gets the fact, not the job of matching.
     namedSymbolsFound: namedSymbolsInHits(input.question, hits.map((h) => h.qualifiedName)),
   };
-  const res = await jevAsk(state, ASK_ROUTE_QUESTIONS, { fetchImpl: opts.fetchImpl });
+  const res = await decisionAsk(state, ASK_ROUTE_QUESTIONS, { fetchImpl: opts.fetchImpl });
   if (!res) return null;
   const d = decisionFromAnswers(res.answers, settings.minConfidence, res.model, res.ms);
   if (!d) {

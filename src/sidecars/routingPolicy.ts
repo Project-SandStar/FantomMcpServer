@@ -71,7 +71,7 @@
  * virtual provider JOIN THE FAN-OUT, or is it held in reserve?
  */
 
-import type { VirtualRole } from './virtualContainers.js';
+import type { VirtualRole } from '../openrouter/roleTypes.js';
 
 export type RoutingPolicy = 'aggregate' | 'backup' | 'local' | 'cloud';
 export type VirtualRoutingMode = 'local-only' | 'local-first' | 'cloud-only';
